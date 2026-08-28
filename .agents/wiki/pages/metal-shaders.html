@@ -1,0 +1,25 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Metal 着色器与后端: h3_metal / h3_gpu.m</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>Metal 着色器与后端: h3_metal / h3_gpu.m</h1>
+<p><code>h3_metal.h</code> 声明 Metal 内核接口，<code>h3_metal.m</code> 以 Objective-C 实现这些内核并把 Metal 着色器源码（<code>.metal</code>）作为字符串常量内联，<code>h3_gpu.m</code> 则封装设备/缓冲/命令队列并把算子分派到内核或 MPS。二者共同构成引擎的 GPU 后端。</p>
+<h2>着色器源</h2>
+<p><code>h3_metal.m</code> 持有若干 <code>.metal</code> 源字符串（如 RMSNorm、量化 matmul、AdaLN 调制、patch embed、VAE 上采样与 BigVGAN 反卷积）。这些源在 <code>h3_gpu_create()</code> 时通过 <code>shader_source_path</code> 指定的库加载，或当未指定时回退到内联编译。把源内联的好处是单一可执行文件即可运行，无需随包携带 <code>.metal</code> 文件。</p>
+<h2>内核类别</h2>
+<ul><li><strong>归一化</strong>：<code>rms_norm_*</code>——BF16/F32 的逐通道 RMS 归一化，DiT 与编码器共用。</li><li><strong>量化矩阵乘</strong>：<code>qmatmul_*</code>（group / row 两种 int8 布局）——对应 <code>权重存储</code> 的 <code>int8_group</code>/<code>int8_row</code> 路径；在共享缓冲上做分组/逐行反量化的乘加。</li><li><strong>激活与调制</strong>：<code>silu_*</code>、<code>adaln_modulate_*</code>——把 <code>AdaLN 调度</code> 投影出的调制参数应用到输入张量。</li><li><strong>嵌入与采样</strong>：<code>patch_embed_*</code>、<code>vae_upsample_*</code>、<code>bigvgan_conv_transpose_*</code>——VAE 解码与音频合成的核心算子。</li></ul>
+<h2>命令调度</h2>
+<p><code>h3_gpu.m</code> 维护一个 <code>MTLCommandQueue</code>，并暴露：</p>
+<ul><li><code>h3_gpu_dispatch_kernel(name, tensors[], params)</code>：提交单个内核。</li><li><code>h3_gpu_commit()</code> / <code>h3_gpu_wait()</code>：刷盘与同步；去噪主循环在每个 Euler 步结束时等待，以保证 <code>on_frame</code> 预览的数据已就绪。</li><li><code>h3_gpu_profiling</code>：可选计时，用于 <code>--preview-denoise</code> 之外的性能分析。</li></ul>
+<h2>与 MPS 的关系</h2>
+<p>稳定算子（softmax、卷积转置、某些归一化）走 MPS（<code>h3_mps_*</code>），手写内核用于 MPS 不支持或性能更优的路径（如 int8 量化 matmul）。<code>--use-slower-*</code> 在前端层把部分算子强制切回 MPS 以获得可复现性。</p>
+<p>相关：设备抽象接口见 <code>Metal / MPS 设备封装</code>；这些内核被 <code>DiT 主干</code>、<code>视频 VAE</code> 与 <code>音频 VAE</code> 调用。</p></div></body></html>

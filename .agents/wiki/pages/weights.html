@@ -1,0 +1,22 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>权重存储: h3_weights</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>权重存储: h3_weights</h1>
+<p><code>h3_weights.c</code> / <code>h3_weights.h</code> 管理&quot;已解析的 safetensors 分片&quot;到&quot;持久化 Metal 张量&quot;的映射。它是引擎内存占用的核心控制点。</p>
+<h2>核心类型</h2>
+<ul><li><code>struct h3_weights</code>：一组已打开的 safetensors 分片集合，提供按名查张量。</li><li><code>enum h3_weight_type</code>：<code>H3_WEIGHT_BF16</code>（默认）、<code>H3_WEIGHT_INT8_GROUP</code>（分组量化）、<code>H3_WEIGHT_INT8_ROW</code>（逐行量化）。精度与量化方式由模型配置或运行时开关决定（int8 用于更激进的内存/带宽节省，配合 <code>h3_host</code> 的 <code>h3_linear_int8</code>）。</li></ul>
+<h2>关键函数</h2>
+<ul><li><code>h3_weights_open(paths[], n)</code>：打开一个或多个 safetensors 分片目录。</li><li><code>h3_weights_find(w, name)</code>：跨分片按名定位张量；支持&quot;懒加载&quot;——仅在第一次被 DiT/编码器引用时读取到共享缓冲。</li><li><code>h3_weights_load_bf16(w, entry, dst)</code>：把 BF16 张量提升到目标 GPU 缓冲（通常是 <code>h3_gpu</code> 的共享张量）。</li><li><code>h3_weights_set_streaming(w, model_size, dit_layers, core_reuse, ssd_streaming)</code>：配置流式策略——当 <code>ssd_streaming=1</code> 时仅保留 2 个 BF16 DiT 块在内存，重叠磁盘 I/O 与 GPU 执行；<code>core_reuse</code> 决定多少步重算一次 Transformer core。</li></ul>
+<h2>设计取舍</h2>
+<p>权重层刻意区分&quot;元数据（始终在内存）&quot;与&quot;张量数据（按需/流式）&quot;。这使得引擎在 24 GB 级别的模型上也能在低内存设备上运行：<code>h3_dit</code> 只请求它当前块需要的权重，<code>宿主逻辑</code> 在 <code>core_reuse</code> 周期外复用已加载块。量化路径（<code>int8_group</code> / <code>int8_row</code>）让整机权重带宽进一步下降，代价是精度（由 <code>--use-slower-*</code> 可回退到 BF16 对齐）。</p>
+<p>相关：张量最终驻留于 <code>Metal 设备</code> 的 <code>h3_gpu_tensor</code>；解析来自 <code>Safetensors 解析</code>。</p></div></body></html>

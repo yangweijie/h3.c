@@ -16,7 +16,7 @@ enum {
     FIRST_CHUNK_FRAMES = 22,
     FRAME_OFFSET = 3,
     HIDDEN = 2048,
-    LAYERS = 36,
+    LAYERS = H3_VIDEO_VAE_LAYERS, /* 与导出常量保持一致，单一来源 */
     HEADS = 32,
     HEAD_DIM = 64,
     INNER = HEADS * HEAD_DIM,
@@ -87,6 +87,10 @@ typedef struct {
     int latent_w;
     int latent_t;
     int output_frames;
+    /* When set, the transformer blocks are streamed (load -> run -> free) per
+     * tile instead of being preloaded resident for the whole session. Trades
+     * re-reads for a much smaller fixed memory footprint. */
+    int streaming;
 } vae_context;
 
 struct h3_video_vae_decoder {
@@ -520,16 +524,23 @@ static int load_resident_weights(vae_context *vae,
                                  void *progress_opaque, char *error,
                                  size_t error_size) {
     if (!load_input_weights(vae, error, error_size)) return 0;
-    for (int index = 0; index < LAYERS; index++) {
-        if (!load_block(vae, index, error, error_size)) return 0;
-        if (progress) progress(index + 1, LAYERS, progress_opaque);
+    if (!vae->streaming) {
+        /* Resident mode: preload every transformer block once and keep it for
+         * the whole session (fast, but ~9 GiB of fixed footprint). */
+        for (int index = 0; index < LAYERS; index++) {
+            if (!load_block(vae, index, error, error_size)) return 0;
+            if (progress) progress(index + 1, LAYERS, progress_opaque);
+        }
     }
     return load_output_weights(vae, error, error_size);
 }
 
-/* Tiled decoding keeps every VAE weight resident for the duration of the phase.
- * This uses about 9 GiB after the DiT has been retired, avoids rereading 9 GiB
- * per spatial tile, and permits one command-buffer chain per tile. */
+/* Resident tiled decode: keeps every VAE weight resident for the whole phase
+ * (~9 GiB after the DiT has been retired), avoids rereading 9 GiB per spatial
+ * tile, and permits one command-buffer chain per tile. This is the fast path
+ * used when vae->streaming is 0; when vae->streaming is 1 the caller instead
+ * uses run_stream_tile, which loads/frees each block per tile to trade re-reads
+ * for a much smaller fixed footprint. */
 static int run_resident_tile(vae_context *vae, char *error,
                              size_t error_size) {
     float zeros[HIDDEN];
@@ -571,6 +582,64 @@ static int run_resident_tile(vae_context *vae, char *error,
         vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
        "tiled video VAE output projection");
     OP(h3_gpu_submit(vae->gpu), "submit tiled video VAE decoder");
+    h3_gpu_tensor_free(zero);
+#undef OP
+    return 1;
+}
+
+/* Streaming tiled decode: exactly like run_resident, each transformer block is
+ * loaded, run, then freed immediately, so only ~1 block is resident at a time.
+ * Used when the decoder is opened with streaming=1 to avoid the ~9 GiB fixed
+ * VAE footprint. */
+static int run_stream_tile(vae_context *vae, char *error,
+                           size_t error_size) {
+    float zeros[HIDDEN];
+    memset(zeros, 0, sizeof(zeros));
+    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    if (!zero) {
+        fail(error, error_size, "cannot allocate video VAE suffix token");
+        return 0;
+    }
+#define OP(call, label) do {                                                    \
+    if (!gpu_op(vae, (call), error, error_size, label)) {                       \
+        h3_gpu_tensor_free(zero); return 0;                                    \
+    }                                                                           \
+} while (0)
+    OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE decoder");
+    OP(h3_gpu_linear_f32(vae->gpu, vae->post, vae->latent, vae->post_w,
+        vae->post_b, vae->patches, LATENT_CHANNELS, LATENT_CHANNELS),
+       "streamed video VAE post-quant projection");
+    OP(h3_gpu_linear_f32(vae->gpu, vae->patch_hidden, vae->post, vae->embed_w,
+        vae->embed_b, vae->patches, LATENT_CHANNELS, HIDDEN),
+       "streamed video VAE latent embedding");
+    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden, 0, vae->patch_hidden, 0,
+        (size_t)vae->patches * HIDDEN), "pack streamed video VAE patches");
+    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
+        (size_t)vae->patches * HIDDEN, vae->registers, 0,
+        REGISTERS * HIDDEN), "pack streamed video VAE registers");
+    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
+        (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
+       "pack streamed video VAE suffix");
+    for (int index = 0; index < LAYERS; index++) {
+        if (!load_block(vae, index, error, error_size)) {
+            h3_gpu_tensor_free(zero);
+            return 0;
+        }
+        OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE transformer block");
+        if (!run_block(vae, index, error, error_size)) {
+            h3_gpu_tensor_free(zero);
+            return 0;
+        }
+        OP(h3_gpu_submit(vae->gpu), "submit streamed video VAE block");
+        free_block(&vae->blocks[index]);
+    }
+    OP(h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
+        vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
+       "streamed video VAE output LayerNorm");
+    OP(h3_gpu_linear_f32(vae->gpu, vae->projected, vae->norm, vae->proj_w,
+        vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+       "streamed video VAE output projection");
+    OP(h3_gpu_submit(vae->gpu), "submit streamed video VAE decoder");
     h3_gpu_tensor_free(zero);
 #undef OP
     return 1;
@@ -866,7 +935,9 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
             ok = prepare_input(&decoder->vae, input,
                                decoder->latent_mean, decoder->latent_std,
                                error, error_size) &&
-                 run_resident_tile(&decoder->vae, error, error_size);
+                 (decoder->vae.streaming
+                    ? run_stream_tile(&decoder->vae, error, error_size)
+                    : run_resident_tile(&decoder->vae, error, error_size));
             free(input);
             if (!ok) break;
             h3_video_frames tile;
@@ -893,6 +964,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
                         const char *shader_source_path,
                         int latent_height, int latent_width,
                         h3_video_vae_progress progress, void *progress_opaque,
+                        int streaming,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!weight_directory || !shader_source_path || latent_height < 1 ||
@@ -923,6 +995,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
         fprintf(stderr, "h3: resident video VAE tiles %dx%d at %d pixels\n",
                 decoder->x_axis.count, decoder->y_axis.count, tile_pixels);
     vae_context *vae = &decoder->vae;
+    vae->streaming = streaming;
     if (ok) {
         vae->latent_h = decoder->y_axis.length / SPATIAL_RATIO;
         vae->latent_w = decoder->x_axis.length / SPATIAL_RATIO;
@@ -1049,7 +1122,7 @@ static int decode_chunked(const char *weight_directory,
                           const float *normalized_latent, int latent_time,
                           int latent_height, int latent_width,
                           const float *latent_mean, const float *latent_std,
-                          int tile_pixels,
+                          int tile_pixels, int streaming,
                           h3_video_vae_progress progress, void *progress_opaque,
                           h3_video_frames *output, char *error,
                           size_t error_size) {
@@ -1082,6 +1155,7 @@ static int decode_chunked(const char *weight_directory,
         vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu)
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");
+    vae.streaming = streaming; /* 与常驻解码器路径一致：启用时跳过块预载 */
     ok = vae.weights && vae.gpu &&
          load_resident_weights(&vae, progress, progress_opaque,
                                error, error_size) &&
@@ -1123,7 +1197,9 @@ static int decode_chunked(const char *weight_directory,
                 free_tensor(&vae.latent);
                 ok = prepare_input(&vae, input, latent_mean, latent_std,
                                    error, error_size) &&
-                     run_resident_tile(&vae, error, error_size);
+                     (vae.streaming
+                        ? run_stream_tile(&vae, error, error_size)
+                        : run_resident_tile(&vae, error, error_size));
                 free(input);
                 if (!ok) break;
                 h3_video_frames tile;
@@ -1186,6 +1262,7 @@ int h3_video_vae_decode(const char *weight_directory,
                         const float *normalized_latent, int latent_time,
                         int latent_height, int latent_width,
                         h3_video_vae_progress progress, void *progress_opaque,
+                        int streaming,
                         h3_video_frames *output,
                         char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
@@ -1228,7 +1305,7 @@ int h3_video_vae_decode(const char *weight_directory,
         int ok = decode_chunked(weight_directory, shader_source_path,
                                 normalized_latent, latent_time, latent_height,
                                 latent_width, latent_mean, latent_std,
-                                tile_pixels, progress,
+                                tile_pixels, streaming, progress,
                                 progress_opaque, output, error, error_size);
         if (!ok) h3_video_frames_free(output);
         return ok;

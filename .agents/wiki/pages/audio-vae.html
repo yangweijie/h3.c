@@ -1,0 +1,24 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>音频 VAE (BigVGAN): h3_audio_vae</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>音频 VAE (BigVGAN): h3_audio_vae</h1>
+<p><code>h3_audio_vae.c</code> / <code>h3_audio_vae.h</code> 实现音频潜变量的 BigVGAN 解码（以及参考音频的编码），把 <code>DiT 主干</code> 输出的音频潜变量还原为 32 kHz 立体声 PCM。</p>
+<h2>解码器</h2>
+<ul><li><code>h3_audio_vae_decoder_open(ctx, weights, params)</code> / <code>h3_audio_vae_decoder_close()</code>：加载 BigVGAN 反卷积权重（来自 <code>权重存储</code>）。</li><li><code>h3_audio_vae_decode(latent, params, &amp;pcm)</code>：输入音频潜变量 <code>[32, 2, T]</code>（32 通道、2 声道、T 帧），经多组反卷积（对应 <code>Metal 着色器</code> 的 <code>bigvgan_conv_transpose_*</code>）上采样为 F32 PCM，采样率固定 32000。</li><li><code>h3_audio_vae_decode_preview(...)</code>：与 <code>视频 VAE</code> 类似，支持逐块预览音频（在逐 Euler 步时仅合成最新一段）。</li></ul>
+<h2>编码器（参考路径）</h2>
+<ul><li><code>h3_audio_vae_encode(path, params, &amp;latent)</code>：把参考音频（经 <code>FFmpeg</code> 读入的 PCM）编码为 <code>[32,2,T]</code> 潜变量，作为 Ref2VA 的音频条件，进入 <code>多模态嵌入编排</code>。</li></ul>
+<h2>与 DiT 的耦合</h2>
+<p>音频潜变量的通道数（32）决定 DiT 音频分支的输入维度（<code>DIT_IN_AUDIO=32</code>）。与视频 VAE 一样，维度必须在 <code>h3_load_dir()</code> 阶段与权重校验一致。</p>
+<h2>实现要点</h2>
+<p>BigVGAN 的反卷积内核在 <code>h3_metal.m</code> 中以 Metal 着色器实现，运行于 BF16 共享缓冲；输出 PCM 直接交给 <code>FFmpeg</code> 的音频管道封装，不落中间文件。</p>
+<p>相关：视频侧对称实现见 <code>视频 VAE</code>；媒体写出见 <code>FFmpeg 媒体读写</code>。</p></div></body></html>

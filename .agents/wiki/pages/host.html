@@ -1,0 +1,22 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>宿主逻辑与张量布局: h3_host</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>宿主逻辑与张量布局: h3_host</h1>
+<p><code>h3_host.c</code> / <code>h3_host.h</code> 负责把&quot;模型能力 + 提示 + 参考&quot;翻译成确定性的张量排布，并作为条件缓存的拥有者。它不持有权重，只持有布局计划与中间嵌入缓冲。</p>
+<h2>核心职责</h2>
+<ul><li><strong>布局规划</strong>：<code>h3_layout_build()</code> 依据提示文本长度、图像/音频参考数量，计算序列分段、绝对位置 ID、以及图像/音频条件行数。它区分 <code>Text</code> / <code>Image</code> / <code>ReferenceImage</code> / <code>ReferenceAudio</code> / <code>Audio</code> 段，并记录每段的子段（subsegment）起止帧，供位置编码使用。</li><li><strong>条件缓存</strong>：<code>h3_host_cond</code> 结构持有文本嵌入（<code>text_embed</code>）、图像嵌入（<code>image_embed</code>）、音频条件（<code>audio_cond</code>）、以及提示参考条件（<code>pr_cond</code>）。对应函数 <code>h3_host_cond_create()</code> / <code>h3_host_cond_free()</code> / <code>h3_host_cond_set_*()</code> 在编码完成后填充，并可由 <code>h3_cache</code> 跨请求复用。</li><li><strong>线性层</strong>：<code>h3_linear_bf16()</code> 与 <code>h3_linear_int8()</code> 是本模块提供的两个基础投影算子，分别作用于 BF16 与 int8 权重；DiT 与编码器中的多数线性变换都最终落到这两个函数之一，便于统一调度到 GPU。</li></ul>
+<h2>与 DiT 的关系</h2>
+<p>DiT 去噪主循环需要三类输入：噪声潜变量、调度（由 <code>h3_dit_schedule</code> 提供）、以及本模块算好的条件与布局（段/位置）。<code>h3_host</code> 在每次请求开始时一次性算好布局，随后在多个去噪步之间复用（除非 <code>core_reuse</code>/<code>denoise_reuse</code> 要求重算某些部分）。这种&quot;布局一次算、张量多次用&quot;的设计是引擎低延迟的关键。</p>
+<h2>关键类型</h2>
+<ul><li><code>struct h3_layout</code>：序列分段、位置、条件行数。</li><li><code>struct h3_host_cond</code>：跨步复用的条件嵌入集合。</li><li>段枚举 <code>H3_SEG_*</code> 与 <code>h3_subsegment</code>：描述帧级子段，用以支持参考视频/音频的时序对齐。</li></ul>
+<p>相关：条件被送入 <code>DiT 主干</code>；图像/音频嵌入来自 <code>多模态嵌入编排</code> 与 <code>Qwen 视觉编码器</code>。</p></div></body></html>

@@ -1,0 +1,167 @@
+{
+  "language": "zh",
+  "sections": [
+    {
+      "name": "h3-metal 引擎总览",
+      "topics": [
+        {
+          "title": "项目总览 (Overview)",
+          "level": 1,
+          "slug": "overview",
+          "group": null
+        },
+        {
+          "title": "系统架构 (Architecture)",
+          "level": 1,
+          "slug": "architecture",
+          "group": null
+        },
+        {
+          "title": "构建与运行 (Build & Run)",
+          "level": 1,
+          "slug": "build-run",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "核心 API 与编排",
+      "topics": [
+        {
+          "title": "公共 API: h3.h / h3.c",
+          "level": 1,
+          "slug": "api-public",
+          "group": null
+        },
+        {
+          "title": "宿主逻辑与张量布局: h3_host",
+          "level": 1,
+          "slug": "host",
+          "group": null
+        },
+        {
+          "title": "命令行交互: h3_cli / main / terminal",
+          "level": 1,
+          "slug": "cli",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "权重与设备层",
+      "topics": [
+        {
+          "title": "Safetensors 解析: h3_safetensors",
+          "level": 1,
+          "slug": "safetensors",
+          "group": null
+        },
+        {
+          "title": "权重存储: h3_weights",
+          "level": 1,
+          "slug": "weights",
+          "group": null
+        },
+        {
+          "title": "Metal / MPS 设备封装: h3_gpu",
+          "level": 1,
+          "slug": "gpu",
+          "group": null
+        },
+        {
+          "title": "Metal 着色器与后端: h3_metal / h3_gpu.m",
+          "level": 1,
+          "slug": "metal-shaders",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "文本与多模态编码",
+      "topics": [
+        {
+          "title": "Tokenizer: h3_tokenizer",
+          "level": 1,
+          "slug": "tokenizer",
+          "group": null
+        },
+        {
+          "title": "Qwen3-VL 文本编码器: h3_text_encoder",
+          "level": 1,
+          "slug": "text-encoder",
+          "group": null
+        },
+        {
+          "title": "Qwen 视觉编码器: h3_vision_encoder",
+          "level": 1,
+          "slug": "vision-encoder",
+          "group": null
+        },
+        {
+          "title": "多模态嵌入编排: h3_multimodal",
+          "level": 1,
+          "slug": "multimodal",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "扩散 Transformer (DiT)",
+      "topics": [
+        {
+          "title": "DiT 主干与去噪: h3_dit",
+          "level": 1,
+          "slug": "dit",
+          "group": null
+        },
+        {
+          "title": "AdaLN 调度与门控剪枝: h3_dit_schedule",
+          "level": 1,
+          "slug": "dit-schedule",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "VAE 与媒体编解码",
+      "topics": [
+        {
+          "title": "视频 VAE 解码/编码: h3_video_vae / h3_video_encoder",
+          "level": 1,
+          "slug": "video-vae",
+          "group": null
+        },
+        {
+          "title": "音频 VAE (BigVGAN): h3_audio_vae",
+          "level": 1,
+          "slug": "audio-vae",
+          "group": null
+        },
+        {
+          "title": "FFmpeg 媒体读写: h3_ffmpeg",
+          "level": 1,
+          "slug": "ffmpeg",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "测试",
+      "topics": [
+        {
+          "title": "测试套件: tests/",
+          "level": 1,
+          "slug": "tests",
+          "group": null
+        }
+      ],
+      "groups": []
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FFmpeg 媒体读写: h3_ffmpeg</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>FFmpeg 媒体读写: h3_ffmpeg</h1>
+<p><code>h3_ffmpeg.c</code> / <code>h3_ffmpeg.h</code> 是引擎与磁盘媒体文件之间的唯一桥梁：读入参考图像/视频/音频，写出最终生成的视频与音频。它通过外部 <code>ffmpeg</code> / <code>ffprobe</code> 二进制（由 <code>H3_FFMPEG</code> / <code>H3_FFPROBE</code> 环境变量或 PATH 定位）以管道（pipe）方式通信，避免中间文件。</p>
+<h2>读取</h2>
+<ul><li><code>h3_ffmpeg_probe(path, &amp;info)</code>：调用 <code>ffprobe</code> 探测宽度、高度、帧数、时长、像素格式，供 <code>视觉编码器</code> 与 <code>视频编码器</code> 决定采样策略。</li><li><code>h3_ffmpeg_read_image(path, &amp;image)</code>：把图像解码为 channel-major F32（RGB，值范围 0..1），并交由 Accelerate vImage 做高质量缩放。</li><li><code>h3_ffmpeg_read_video(path, frame_indices[], n, &amp;frames)</code>：按关键帧索引解码视频帧为 F32 序列。</li><li><code>h3_ffmpeg_read_audio(path, &amp;pcm)</code>：解码音频为 F32 PCM（用于 <code>音频 VAE</code> 编码）。</li></ul>
+<h2>写出</h2>
+<ul><li><code>h3_ffmpeg_writer_open(params, &amp;writer)</code>：开启一个写入上下文，内部启动两条并发 <code>ffmpeg</code> 子进程管道——一条接收 RGB24 视频帧，一条接收 F32 PCM 音频。</li><li><code>h3_ffmpeg_writer_write_frame(writer, rgb, w, h)</code> / <code>h3_ffmpeg_writer_write_audio(writer, pcm, n)</code>：增量推送帧/样本；这使得 <code>公共 API</code> 的 <code>on_frame</code> 回调可以一边生成一边封装。</li><li><code>h3_ffmpeg_writer_close(writer)</code>：合并两条管道并收尾容器（如 MP4 + AAC），保证音视频时间轴对齐。</li></ul>
+<h2>设计取舍</h2>
+<p>用管道而非落盘，省去临时文件与额外的编解码往返，使端到端延迟更低、对 SSD 更友好（尤其在 <code>ssd_streaming</code> 模式下权重也在流式读取）。代价是依赖外部 <code>ffmpeg</code>/<code>ffprobe</code> 可用；引擎在 <code>h3_load_dir()</code> 时若找不到会报错提示安装。</p>
+<p>相关：读取结果喂给 <code>视觉/视频/音频编码器</code>；写出消费 <code>视频 VAE</code> 与 <code>音频 VAE</code> 的输出。</p></div></body></html>

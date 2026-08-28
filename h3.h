@@ -96,6 +96,18 @@ typedef struct {
     /* Keep only two original BF16 DiT blocks in memory and overlap reading the
      * next block from the checkpoint with execution of the current block. */
     int ssd_streaming;
+    /* Stream the video VAE decoder weights instead of keeping the whole decoder
+     * resident. Off by default; the auto memory planner (h3_memory_plan) turns
+     * it on when the device working set is tight. */
+    int video_vae_streaming;
+    /* Release the text/image encoder (Qwen3-VL first 50 layers) after condition
+     * building instead of keeping it resident through denoise. Off by default;
+     * turned on by the auto planner on tight budgets. */
+    int encoder_streaming;
+    /* When nonzero, auto-pick ssd_streaming / int8 / dit_layers from the device
+     * working set at load time (see h3_memory_plan). Overridden by explicit
+     * ssd_streaming / use_int8_row_fc2 settings. Default on. */
+    int memory_plan_auto;
     /* Optional lower internal model canvas. Both must be zero (exact output
      * canvas) or valid same-aspect dimensions no larger than width/height. */
     int render_width;
@@ -129,9 +141,13 @@ typedef struct {
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
-    H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    .width = H3_DEFAULT_WIDTH, .height = H3_DEFAULT_HEIGHT, \
+    .frames = H3_DEFAULT_FRAMES, .steps = H3_DEFAULT_STEPS, \
+    .seed = UINT64_C(42), \
+    .reference_image_size = H3_REFERENCE_IMAGE_MATCH, \
+    .denoise_reuse = 1, .dit_layers = H3_DEFAULT_DIT_LAYERS, \
+    .core_reuse = 1, \
+    .memory_plan_auto = 1, \
 }
 
 typedef struct {

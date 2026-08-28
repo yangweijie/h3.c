@@ -1,0 +1,24 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Metal / MPS 设备封装: h3_gpu</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>Metal / MPS 设备封装: h3_gpu</h1>
+<p><code>h3_gpu.h</code> 是 C 侧设备抽象（纯声明），实现分散在 <code>h3_gpu.m</code>（Objective-C 设备/缓冲/内核封装）与 <code>h3_metal.m</code>（Metal 着色器与 MPSGraph 调度）。这是引擎唯一直接触碰 Metal 框架的层。</p>
+<h2>设备与上下文</h2>
+<ul><li><code>h3_gpu_create(device_index, shader_source_path)</code> / <code>h3_gpu_destroy()</code>：创建/销毁 Metal 设备句柄。<code>shader_source_path</code> 指向编译好的 <code>.metal</code> 库（或在 <code>h3_metal.m</code> 中内联的源）。</li><li><code>h3_gpu_info</code>：返回设备名称、内存、支持的精度（BF16 / int8）等。</li></ul>
+<h2>张量与缓冲区</h2>
+<ul><li><code>h3_gpu_tensor</code>：跨算子的共享 Metal 缓冲包装，记录 <code>dtype</code>（<code>bf16</code>/<code>f32</code>/<code>int8</code>）、形状、以及&quot;是否是某 DiT 块的独占缓冲&quot;（用于 <code>ssd_streaming</code> 的内存复用）。</li><li><code>h3_gpu_tensor_create()</code> / <code>h3_gpu_tensor_free()</code> / <code>h3_gpu_tensor_upload()</code>（主机→设备）/<code>h3_gpu_tensor_download()</code>（设备→主机，用于取回潜变量与最终帧）。</li><li><code>h3_gpu_buffer_reuse()</code>：在去噪步之间复用临时缓冲，避免每步分配。</li></ul>
+<h2>算子调度</h2>
+<ul><li>手写 Metal 内核（<code>h3_gpu_*_kernel</code> 系列）：RMSNorm、量化 matmul、SiLU、AdaLN 调制、patch 嵌入等的 GPU 实现，定义在 <code>h3_metal.m</code>。</li><li>MPS 图（<code>h3_mps_*</code>，如 <code>h3_mps_softmax</code>、<code>h3_mps_conv_transpose</code>）：对稳定、可融合的算子使用 MPSGraph / MPSCNN，配合 BF16 路径。</li><li><code>h3_gpu_dispatch()</code>：把算子提交到命令队列，并管理 <code>core_reuse</code>/<code>denoise_reuse</code> 带来的部分重算。</li></ul>
+<h2>精度与回退</h2>
+<p><code>shader_source_path</code> 区分&quot;快速 Metal 内核&quot;与&quot;可移植 MPS/BF16 实现&quot;；<code>--use-slower-*</code> 开关在 CLI 层把某些算子切回 MPS，用于与参考实现对齐/诊断。相应的着色器源在 <code>h3_metal.m</code> 中以字符串常量存在，避免了外部 <code>.metal</code> 文件的依赖。</p>
+<p>相关：权重张量来自 <code>权重存储</code>；具体内核实现见 <code>Metal 着色器与后端</code>。</p></div></body></html>

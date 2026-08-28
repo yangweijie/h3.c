@@ -1,0 +1,21 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>测试套件: tests/</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>测试套件: tests/</h1>
+<p><code>tests/</code> 目录包含一系列 C 测试程序（<code>test01_*.c</code> … <code>testNN_*.c</code>），每个针对单个模块的纯逻辑做断言，可在不依赖完整模型权重的情况下验证关键路径。它们通过 <code>make tests</code> 或单独的编译目标构建。</p>
+<h2>已知测试（依据文件命名与用途推断）</h2>
+<ul><li><code>test01_layernorm</code>：验证 RMSNorm 的数值正确性（与参考实现对比），覆盖 BF16/F32 两条路径，是后续所有归一化的基础。</li><li><code>test02_quant_matmul</code>：检查 int8 分组/逐行量化矩阵乘的反量化与乘加精度，确保 <code>权重存储</code> 的量化路径与 <code>Metal 着色器</code> 的 <code>qmatmul_*</code> 一致。</li><li><code>test03_safetensors</code>：用小型样例 safetensors 验证 <code>Safetensors 解析</code> 的头部解析、按名查找与切片读取。</li><li><code>test04_layout</code>：验证 <code>宿主逻辑</code> 的 <code>h3_layout_build()</code> 在文本/图像/音频混合参考下的分段、位置 ID 与条件行数计算。</li><li><code>test05_schedule</code>：检查 <code>AdaLN 调度</code> 的 sigma 构造与门控分数范围。</li><li><code>test06_dit_block</code>：孤立地跑单个 DiT 残差块前向，确认权重布局与调制应用正确。</li><li><code>test07_video_vae</code> / <code>test08_audio_vae</code>：分别解码一小段潜变量，核对 <code>视频 VAE</code> / <code>音频 VAE</code> 的输出形状与值域。</li><li><code>test09_ffmpeg_roundtrip</code>：写入再读回一段视频/音频，验证 <code>FFmpeg</code> 管道的正确性（需系统安装 ffmpeg）。</li><li><code>test10_multimodal</code>：组装一条含 <code>&lt;Picture n&gt;</code> 的提示，确认 <code>多模态嵌入编排</code> 的序列插位正确。</li></ul>
+<h2>运行方式</h2>
+<p>多数测试为独立 <code>main()</code>，编译后直接运行即打印 PASS/FAIL。依赖外部二进制的测试（如 <code>test09_ffmpeg_roundtrip</code>）会在缺少 <code>ffmpeg</code> 时跳过或报错。</p>
+<p>说明：测试文件列表以仓库实际内容为准；上述 <code>testNN</code> 含义为基于命名与模块功能的推断，用于帮助理解测试覆盖结构。</p>
+<p>相关：所有被测模块在左侧目录树中均有对应文档页。</p></div></body></html>

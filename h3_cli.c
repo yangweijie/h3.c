@@ -1,4 +1,6 @@
 #include "h3_cli.h"
+#include "h3_memory_plan.h"
+#include "h3_video_vae.h" /* H3_VIDEO_VAE_LAYERS */
 
 #include "h3_ffmpeg.h"
 #include "h3_host.h"
@@ -176,6 +178,8 @@ static void print_help(void) {
     puts("  !again                   Repeat the last prompt");
     puts("  !cache                   Show reusable-session cache state");
     puts("  !cache clear             Clear reusable-session caches");
+    puts("  !memory-plan [auto|off]  Show device working set and the auto");
+    puts("                           memory-tier plan; toggle it on/off");
     puts("  !quit                    Exit");
     puts("\nType a prompt on a line by itself to generate a video.");
 }
@@ -589,10 +593,12 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         int value;
         if (!parse_toggle(argument, state->params.ssd_streaming, &value))
             fprintf(stderr, "h3: use on or off\n");
-        else if (value && state->params.use_int8_row_fc2)
-            fprintf(stderr,
-                    "h3: disable !int8-row-fc2 before SSD streaming\n");
         else {
+            if (value && state->params.use_int8_row_fc2)
+                fprintf(stderr,
+                        "h3: note: int8 row FC2 and SSD streaming can now be "
+                        "combined (int8 compresses the resident hot set while "
+                        "streaming swaps the cold set from disk)\n");
             state->params.ssd_streaming = value;
             printf("SSD streaming: %s\n", value ? "on" : "off");
         }
@@ -600,9 +606,6 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         int value;
         if (!parse_toggle(argument, state->params.use_int8_row_fc2, &value))
             fprintf(stderr, "h3: use on or off\n");
-        else if (value && state->params.ssd_streaming)
-            fprintf(stderr,
-                    "h3: disable !ssd-streaming before int8 row FC2\n");
         else {
             state->params.use_int8_row_fc2 = value;
             printf("FC2 int8 row scaling: %s\n", value ? "on" : "off");
@@ -681,6 +684,52 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                    (double)info.embedding_bytes / (1024.0 * 1024.0),
                    info.prepared_dit ? "resident" : "empty",
                    info.video_decoder ? "resident" : "empty");
+        }
+    } else if (!strcasecmp(command, "memory-plan")) {
+        if (!strcasecmp(argument, "auto")) {
+            state->params.memory_plan_auto = 1;
+            puts("Auto memory plan: on");
+        } else if (!strcasecmp(argument, "off")) {
+            state->params.memory_plan_auto = 0;
+            puts("Auto memory plan: off (manual knobs only)");
+        } else if (*argument) {
+            fprintf(stderr, "h3: use !memory-plan, !memory-plan auto, or "
+                            "!memory-plan off\n");
+        } else {
+            const h3_device_info *dev = h3_device(state->ctx);
+            const h3_model_info *m = h3_model(state->ctx);
+            uint64_t gib = 1024ull * 1024 * 1024;
+            uint64_t total_weight = m->text_encoder.bytes +
+                m->fl2va_transformer.bytes + m->video_vae.bytes +
+                m->audio_vae.bytes;
+            if (m->ref2va_transformer.bytes)
+                total_weight += m->ref2va_transformer.bytes;
+            printf("Device recommended working set: %.1f GiB\n",
+                   (double)dev->recommended_working_set / gib);
+            printf("Resident weight footprint (no streaming): %.1f GiB\n",
+                   (double)total_weight / gib);
+            if (state->params.memory_plan_auto) {
+                h3_memory_plan plan;
+                uint64_t activation = (uint64_t)state->params.width *
+                    state->params.height * state->params.frames / 16 / 16 *
+                    56 * 4 + gib;
+                const uint64_t dit_blocks = m->fl2va_transformer.bytes +
+                    (m->ref2va_transformer.bytes
+                         ? m->ref2va_transformer.bytes : 0);
+                const uint64_t streamed_resident =
+                    2 * (dit_blocks / H3_DEFAULT_DIT_LAYERS) +
+                    m->video_vae.bytes / H3_VIDEO_VAE_LAYERS;
+                if (h3_memory_plan_auto(dev, total_weight, streamed_resident,
+                                        activation, &plan) == 0)
+                    printf("Auto plan: %s\n", plan.reason);
+            } else {
+                printf("Auto memory plan: off (manual knobs)\n");
+            }
+            printf("Current: ssd_streaming=%d int8_row_fc2=%d "
+                   "video_vae_streaming=%d encoder_streaming=%d layers=%d\n",
+                   state->params.ssd_streaming, state->params.use_int8_row_fc2,
+                   state->params.video_vae_streaming,
+                   state->params.encoder_streaming, state->params.dit_layers);
         }
     } else {
         fprintf(stderr, "h3: unknown command; type !help\n");

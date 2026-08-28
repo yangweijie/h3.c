@@ -1,0 +1,47 @@
+<section>
+h3-metal 引擎总览
+<topic level="1" slug="overview">项目总览 (Overview)</topic>
+<topic level="1" slug="architecture">系统架构 (Architecture)</topic>
+<topic level="1" slug="build-run">构建与运行 (Build & Run)</topic>
+</section>
+
+<section>
+核心 API 与编排
+<topic level="1" slug="api-public">公共 API: h3.h / h3.c</topic>
+<topic level="1" slug="host">宿主逻辑与张量布局: h3_host</topic>
+<topic level="1" slug="cli">命令行交互: h3_cli / main / terminal</topic>
+</section>
+
+<section>
+权重与设备层
+<topic level="1" slug="safetensors">Safetensors 解析: h3_safetensors</topic>
+<topic level="1" slug="weights">权重存储: h3_weights</topic>
+<topic level="1" slug="gpu">Metal / MPS 设备封装: h3_gpu</topic>
+<topic level="1" slug="metal-shaders">Metal 着色器与后端: h3_metal / h3_gpu.m</topic>
+</section>
+
+<section>
+文本与多模态编码
+<topic level="1" slug="tokenizer">Tokenizer: h3_tokenizer</topic>
+<topic level="1" slug="text-encoder">Qwen3-VL 文本编码器: h3_text_encoder</topic>
+<topic level="1" slug="vision-encoder">Qwen 视觉编码器: h3_vision_encoder</topic>
+<topic level="1" slug="multimodal">多模态嵌入编排: h3_multimodal</topic>
+</section>
+
+<section>
+扩散 Transformer (DiT)
+<topic level="1" slug="dit">DiT 主干与去噪: h3_dit</topic>
+<topic level="1" slug="dit-schedule">AdaLN 调度与门控剪枝: h3_dit_schedule</topic>
+</section>
+
+<section>
+VAE 与媒体编解码
+<topic level="1" slug="video-vae">视频 VAE 解码/编码: h3_video_vae / h3_video_encoder</topic>
+<topic level="1" slug="audio-vae">音频 VAE (BigVGAN): h3_audio_vae</topic>
+<topic level="1" slug="ffmpeg">FFmpeg 媒体读写: h3_ffmpeg</topic>
+</section>
+
+<section>
+测试
+<topic level="1" slug="tests">测试套件: tests/</topic>
+</section>

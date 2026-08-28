@@ -1,0 +1,27 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DiT 主干与去噪: h3_dit</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>DiT 主干与去噪: h3_dit</h1>
+<p><code>h3_dit.c</code> / <code>h3_dit.h</code> 是引擎的计算核心：一个 50 块（block）的扩散 Transformer，负责从噪声潜变量逐步去噪出视频与音频潜变量。结构与权重布局由 <code>h3_dit_schedule.h</code> 中的宏固定。</p>
+<h2>结构常量（<code>h3_dit_schedule.h</code>）</h2>
+<ul><li><code>H3_DIT_BLOCKS = 50</code>：残差块数（对应默认 50 层 DiT；<code>H3_MIN_DIT_LAYERS=35</code> 为下限）。</li><li><code>HIDDEN = 5376</code>、<code>HEADS = 56</code>、<code>HEAD_DIM = 96</code>、<code>MLP = 21504</code>：隐藏/注意力/MLP 维度，与 Qwen3-VL 嵌入维度对齐。</li><li><code>DIT_IN = 24</code>（视频潜变量通道）、<code>DIT_IN_AUDIO = 32</code>（音频潜变量通道）：输入/输出潜变量的通道数。</li></ul>
+<h2>权重布局（每个残差块）</h2>
+<p>每个块包含 QKV 投影、输出投影、FC1/FC2、AdaLN 调制相关权重，按以下顺序排布（用于 <code>h3_safetensors</code> / <code>h3_weights</code> 的按需读取）：</p>
+<p><code>patch_embed</code> → <code>x_embedder</code> → <code>ada_embedder.1/ada_embedder.2</code> → 50×（QKV、proj_out、FC1、FC2、AdaLN 调制权重）→ <code>final_linear</code> → <code>final_norm</code> → <code>out_layers</code>。权重可在 BF16 与 int8（group/row）之间切换（<code>h3_weights</code> 控制）。</p>
+<h2>去噪主循环</h2>
+<ul><li><code>h3_dit_denoise(ctx, params, cond, layout, sigmas, schedule, out_latent, on_progress)</code>：通用去噪入口，按 <code>h3_sigma_schedule</code> 迭代。</li><li><code>h3_dit_denoise_euler(ctx, params, cond, layout, sigmas, schedule, out)</code>：Euler 积分实现，每步调用一次块堆叠的前向；若 <code>preview_denoise</code> 开启，每个 Euler 步后通过 <code>视频 VAE</code> 解码一帧并投递预览。</li><li>块前向内部顺序（每个残差块）：RMSNorm → QKV（量化 matmul）→ 注意力（56 头）→ 输出投影 → AdaLN 调制 → FC1（SiLU）→ FC2 → 残差加。AdaLN 调制参数来自 <code>AdaLN 调度</code> 的预计算。</li></ul>
+<h2>加速开关</h2>
+<ul><li><code>core_reuse</code>：每隔 N 步重算 Transformer core（其余步复用上一结果）。</li><li><code>denoise_reuse</code>：每 N 步评估一次去噪器。</li><li><code>token_reduction</code>：相邻水平视频 token 配对以减少注意力计算。</li><li>块剪枝：<code>h3_dit_schedule_gate_score()</code> 提供每块门控分数，低分块在部分步被跳过。</li></ul>
+<h2>输出</h2>
+<p>去噪结束得到视频潜变量（<code>[24, F/2, H/16, W/16]</code> 量级，patch=96）与音频潜变量（<code>[32,2,T]</code>），分别送入 <code>视频 VAE</code> 与 <code>音频 VAE</code> 还原为媒体。</p>
+<p>相关：条件来自 <code>宿主逻辑</code> 与 <code>多模态嵌入编排</code>；调度与剪枝见 <code>AdaLN 调度与门控剪枝</code>。</p></div></body></html>

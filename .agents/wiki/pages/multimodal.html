@@ -1,0 +1,22 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>多模态嵌入编排: h3_multimodal</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>多模态嵌入编排: h3_multimodal</h1>
+<p><code>h3_multimodal.c</code> / <code>h3_multimodal.h</code> 站在 <code>Tokenizer</code>、<code>Qwen3-VL 文本编码器</code> 与 <code>Qwen 视觉编码器</code> 之上，负责把异构输入（文本 + 图像/视频/音频参考 + 角色文本）编排成一条可直接喂入 DiT 的联合序列。</p>
+<h2>核心函数</h2>
+<ul><li><code>h3_multimodal_build(params, tokenizer, prompt, refs, n_refs, &amp;mm, cond, layout)</code>：主入口。解析提示中的 <code>&lt;Picture n&gt;</code> 占位符与参考列表，决定哪些参考是图像/视频/音频/角色文本，并分派到相应编码器。</li><li><code>h3_multimodal_free(&amp;mm)</code>：释放本次请求的中间缓冲。</li></ul>
+<h2>编排逻辑</h2>
+<ol><li><strong>文本分词</strong>：提示经 <code>h3_tokenizer_encode</code> 转为 token，并定位 <code>&lt;Picture n&gt;</code> 占位符。</li><li><strong>参考分类</strong>：<code>h3_ref</code> 数组决定每个参考的类型——图像/视频走 <code>h3_vision_encode_*</code>，音频走 <code>音频 VAE</code> 的条件路径，纯文本（如角色设定）作为对话上下文而非视觉 token。</li><li><strong>序列装配</strong>：视觉/音频嵌入按占位符顺序插入文本序列；<code>pr_cond</code>（提示参考条件）单独保存，供文本编码器的多模态入口使用。</li><li><strong>统一编码</strong>：装配后的序列送入 <code>h3_text_encode_multimodal_bf16()</code> 的前 50 层 Qwen3-VL，产出 BF16 联合嵌入。</li><li><strong>布局回填</strong>：最终嵌入的尺寸/段信息写回 <code>h3_layout</code>（由 <code>宿主逻辑</code> 的 <code>h3_layout_build</code> 预设骨架），供 DiT 去噪使用。</li></ol>
+<h2>设计取舍</h2>
+<p>把&quot;多模态装配&quot;独立成层，使 DiT 与编码器都不必理解 <code>&lt;Picture n&gt;</code> 语法与参考类型判断，降低耦合。代价是多一层缓冲管理，但换来清晰的分层与可测试性（各编码器可独立单测）。</p>
+<p>相关：输出写入 <code>宿主逻辑</code> 的 <code>h3_host_cond</code>，随后进入 <code>DiT 主干</code>；音频条件来自 <code>音频 VAE</code>。</p></div></body></html>

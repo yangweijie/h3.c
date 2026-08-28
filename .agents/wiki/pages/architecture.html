@@ -1,0 +1,28 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>系统架构 (Architecture)</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>系统架构 (Architecture)</h1>
+<p>引擎的数据流可分为六个阶段，从命令行/API 入口一直延伸到媒体输出。</p>
+<h2>1. 入口与上下文</h2>
+<p><code>h3_load_dir()</code>（<code>h3.c</code>）读取模型目录元数据并初始化 Metal 设备，但不映射权重。所有状态集中在不透明结构 <code>h3_ctx</code>（定义于 <code>h3_internal.h</code>），包含模型目录、设备信息、模型信息、条件缓存（conditioning）、以及当前加载的 DiT（<code>struct h3_dit <em></code>）和视频 VAE 解码器（<code>struct h3_video_vae_decoder </em></code>）。<code>h3_cache_*</code> 一组函数管理跨请求复用的条件嵌入、DiT 与解码器缓存。</p>
+<h2>2. 提示与多模态编码</h2>
+<p><code>h3_generate()</code> 是高层次生成入口。它先通过 <code>h3_tokenizer</code>（Objective-C 实现）做 UTF-8 分词；文本走 <code>h3_text_encode_bf16()</code>（前 50 层 Qwen3-VL 语言层，输出 BF16 嵌入）。图像/视频参考先经 <code>h3_vision_encoder</code> 的 Qwen 视觉编码器，再与文本在 <code>h3_multimodal</code> 中按 <code>&lt;Picture n&gt;</code> 呈现格式拼接，调用 <code>h3_text_encode_multimodal_bf16()</code>。<code>h3_host.c</code> 的 <code>h3_layout_build()</code> 计算序列分段、位置、以及图像/音频条件行数，作为后续张量排布的依据。</p>
+<h2>3. 扩散 Transformer (DiT)</h2>
+<p><code>h3_dit</code> 是 50 个残差块（block）的堆叠（<code>h3_dit_schedule.h</code> 中 <code>H3_DIT_BLOCKS=50</code>，<code>HIDDEN=5376</code>，<code>HEADS=56</code>）。权重矩阵（QKV、输出投影、FC1/FC2）可在 BF16 与 int8（分组/逐行量化）之间切换。AdaLN 调制值由 <code>h3_dit_schedule_precompute()</code> 在每个去噪步预先投影，并按门控分数（<code>h3_dit_schedule_gate_score()</code>）进行块剪枝以加速。去噪主循环 <code>h3_dit_denoise()</code> / <code>h3_dit_denoise_euler()</code> 按 <code>h3_sigma_schedule</code>（由 <code>h3_schedule_build()</code> 构造）迭代，逐步从噪声中还原视频与音频潜变量（latent）。</p>
+<h2>4. VAE 解码</h2>
+<p>视频潜变量（通道数 24、patch 96）经 <code>h3_video_vae</code> 的平铺（tiled）解码器还原为 RGB 帧；引擎支持常驻解码器 <code>h3_video_vae_decoder_load()</code>，可在每次 Euler 步只解码一帧用于实时预览（<code>h3_video_vae_decoder_preview()</code>），最终再完整解码。音频潜变量（<code>[32,2,T]</code>）由 <code>h3_audio_vae</code> 的 BigVGAN 解码器还原为 32 kHz 立体声 PCM。</p>
+<h2>5. 媒体封装</h2>
+<p><code>h3_ffmpeg</code> 负责图像/视频/音频的读取（FFprobe 探测尺寸、FFmpeg 解码为 channel-major F32）与写出（RGB24 视频 + F32 PCM 经两条并发管道直接封装为容器，不落中间文件）。</p>
+<h2>6. 设备与权重层</h2>
+<p><code>h3_gpu</code>（C 声明在 <code>h3_gpu.h</code>，实现在 <code>h3_gpu.m</code> / <code>h3_metal.m</code>）封装 Metal 设备、共享缓冲区（<code>h3_gpu_tensor</code>）、以及 F32/BF16/int8 内核与 MPSGraph 调度。<code>h3_safetensors</code> 解析 safetensors 头部，<code>h3_weights</code> 以&quot;打开头部—按需读 BF16 到共享缓冲区&quot;的模式流式加载权重，避免大规模主机内存分配。</p>
+<p>各模块详细文档见左侧目录树。</p></div></body></html>

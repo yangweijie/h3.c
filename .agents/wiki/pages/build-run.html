@@ -1,0 +1,24 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>构建与运行 (Build &amp; Run)</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>构建与运行 (Build &amp; Run)</h1>
+<h2>构建</h2>
+<p>仓库根通过 <code>Makefile</code> 驱动 Apple Clang 编译。关键构建变量：</p>
+<ul><li><code>SDK</code> / <code>ARCH</code>：面向 <code>arm64-apple-macosx</code>，使用 macOS SDK。</li><li><code>METAL_LIB</code>：由 <code>.metal</code> 着色器源（在 <code>h3_metal.m</code> 中以字符串常量内联，或独立 <code>.metal</code> 文件）编译出的 Metal 库，运行时通过 <code>shader_source_path</code> 传给 <code>h3_gpu_create()</code>。</li><li>链接框架：<code>Metal</code>、<code>MetalPerformanceShaders</code>（MPS）、<code>MetalFX</code>（若用）、<code>AVFoundation</code> / <code>CoreMedia</code>（经 FFmpeg 间接）、<code>Accelerate</code>（vImage 高质量缩放）。</li><li>外部库：<code>ffmpeg</code> / <code>ffprobe</code> 通过 <code>H3_FFMPEG</code> / <code>H3_FFPROBE</code> 环境变量或默认 PATH 定位（见 <code>h3_ffmpeg.c</code>）。</li></ul>
+<p>一个典型的构建会分别编译 C 源（<code>.c</code>）与 Objective-C 源（<code>.m</code>，含 <code>h3_tokenizer.m</code>、<code>h3_gpu.m</code>、<code>h3_metal.m</code>），最后链接为单个可执行文件（或库 + <code>main.c</code>）。<code>linenoise.c</code> 提供交互式行编辑。</p>
+<h2>运行</h2>
+<p>顶层入口为 <code>main.c</code>，它解析命令行参数并构造 <code>h3_params</code>（见 <code>h3.h</code> 中的 <code>H3_PARAMS_DEFAULT</code>），随后进入 <code>h3_cli_run()</code>（<code>h3_cli.c</code>）驱动的交互提示，或在一次性模式下直接调用 <code>h3_generate()</code>。</p>
+<p>常用参数（均定义在 <code>h3_params</code>）：</p>
+<ul><li><code>--width</code> / <code>--height</code> / <code>--frames</code> / <code>--steps</code>：画布与去噪步数。</li><li><code>--seed</code>：随机种子（默认 42）；交互模式下随机。</li><li><code>--dit-layers</code>：保留的 DiT 残差块数（50 准确、45 验证加速、40 激进）。</li><li><code>--core-reuse</code>：每隔 N 步重算 Transformer core（1 准确、4/6 加速）。</li><li><code>--denoise-reuse</code>：每 N 步评估一次去噪器（1 近参考、2 验证快速、3 激进）。</li><li><code>--token-reduction</code>：相邻水平视频 token 配对以减计算。</li><li><code>--ssd-streaming</code>：仅保留 2 个 BF16 DiT 块在内存，重叠 I/O 与执行。</li><li><code>--render-width</code> / <code>--render-height</code>：可选更低内部渲染画布。</li><li><code>--use-slower-*</code>：回退到可移植的 BF16/MPS 实现（用于对齐/诊断）。</li><li><code>--preview-denoise</code>：每个 Euler 步解码并投递一帧预览。</li></ul>
+<p>输出通过 <code>h3_params.on_frame</code> 回调增量交付；<code>h3_result</code> 报告最终宽高、帧数、fps（24）、采样率（32000）与种子。</p>
+<p>缓存（跨请求复用条件嵌入、DiT、VAE 解码器）默认关闭（<code>h3_cache_set_enabled()</code>），一次性调用者保持原始的逐阶段内存生命周期。</p></div></body></html>

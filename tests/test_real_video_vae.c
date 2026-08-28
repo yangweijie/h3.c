@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
     snprintf(weights, sizeof(weights), "%s/FL2VA/video_vae/source", model_root);
     h3_video_frames got;
     if (!h3_video_vae_decode(weights, "h3_shaders.metal", latent, 2, 2, 2,
-                             progress, NULL, &got, error, sizeof(error)))
+                             progress, NULL, 0, &got, error, sizeof(error)))
         die(error);
     if (got.frames != 5 || got.height != 32 || got.width != 32)
         die("native visual decoder returned the wrong shape");

@@ -1,6 +1,7 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
 #include "h3_host.h"
+#include "h3_memory_plan.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
 #include "h3_metal.h"
@@ -688,7 +689,8 @@ static void h3_video_encoder_progress_bridge(int completed, int total,
 static h3_video_vae_decoder *h3_acquire_video_decoder(
         h3_ctx *ctx, const char *key, const char *weight_directory,
         int latent_height, int latent_width, h3_video_vae_progress progress,
-        void *progress_opaque, int *cached, char *error, size_t error_size) {
+        void *progress_opaque, int video_vae_streaming, int *cached,
+        char *error, size_t error_size) {
     *cached = 0;
     if (ctx->cache_enabled && ctx->video_decoder &&
         ctx->video_decoder_key && !strcmp(ctx->video_decoder_key, key)) {
@@ -704,7 +706,8 @@ static h3_video_vae_decoder *h3_acquire_video_decoder(
     }
     h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
         weight_directory, "h3_shaders.metal", latent_height, latent_width,
-        progress, progress_opaque, error, error_size);
+        progress, progress_opaque, video_vae_streaming,
+        error, error_size);
     if (!decoder || !ctx->cache_enabled) return decoder;
     char *key_copy = strdup(key);
     if (!key_copy) {
@@ -853,6 +856,52 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "prompt must not be empty");
         return NULL;
     }
+    /* Apply the automatic memory-tier planner to an effective copy of the
+     * parameters, so small-RAM Macs pick a viable strategy from the device's
+     * recommended working set. An explicit ssd_streaming/int8 choice or
+     * memory_plan_auto=0 disables it. */
+    h3_params eff = *params;
+    if (eff.memory_plan_auto &&
+        eff.ssd_streaming == 0 && eff.use_int8_row_fc2 == 0) {
+        uint64_t total_weight =
+            ctx->model.text_encoder.bytes +
+            ctx->model.fl2va_transformer.bytes +
+            ctx->model.video_vae.bytes +
+            ctx->model.audio_vae.bytes;
+        if (ctx->model.ref2va_transformer.bytes)
+            total_weight += ctx->model.ref2va_transformer.bytes;
+        uint64_t activation = (uint64_t)eff.width * eff.height *
+                                  eff.frames / 16 / 16 * 56 * 4 +
+                              1024ull * 1024 * 1024;
+        /* Streaming-aware resident footprint: under ssd_streaming the DiT holds
+         * only ~2 blocks resident (of H3_DIT_BLOCKS) and the video VAE decoder
+         * only ~1 block (of its LAYERS); text/image/audio encoders are freed
+         * per call and contribute ~0. Approximate from per-component byte totals
+         * so the planner decides on the real resident size, not the full total. */
+        const uint64_t dit_blocks =
+            ctx->model.fl2va_transformer.bytes +
+            (ctx->model.ref2va_transformer.bytes
+                 ? ctx->model.ref2va_transformer.bytes : 0);
+        const uint64_t dit_resident =
+            2 * (dit_blocks / H3_DEFAULT_DIT_LAYERS);
+        const uint64_t vae_resident =
+            ctx->model.video_vae.bytes / H3_VIDEO_VAE_LAYERS; /* ~1 block */
+        const uint64_t streamed_resident =
+            ctx->model.text_encoder.bytes * 0 + /* freed per call */
+            ctx->model.audio_vae.bytes * 0 +
+            dit_resident + vae_resident;
+        h3_memory_plan plan;
+        if (h3_memory_plan_auto(&ctx->device, total_weight, streamed_resident,
+                                activation, &plan) == 0) {
+            eff.ssd_streaming = plan.ssd_streaming;
+            eff.use_int8_row_fc2 = plan.use_int8_row_fc2;
+            eff.video_vae_streaming = plan.video_vae_streaming;
+            eff.encoder_streaming = plan.encoder_streaming;
+            if (plan.dit_layers > 0) eff.dit_layers = plan.dit_layers;
+            fprintf(stderr, "h3: auto memory plan: %s\n", plan.reason);
+        }
+    }
+    params = &eff;
     if (!h3_valid_params(ctx, params)) return NULL;
     int render_width = params->render_width ? params->render_width :
                                                params->width;
@@ -1541,7 +1590,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         preview_decoder = h3_acquire_video_decoder(
             ctx, decoder_key, vae_path, latent_h, latent_w,
             h3_preview_vae_progress_bridge, &progress,
-            &decoder_is_cached, detail, sizeof(detail));
+            params->video_vae_streaming, &decoder_is_cached,
+            detail, sizeof(detail));
         if (preview_decoder && ctx->video_decoder == preview_decoder)
             h3_progress_emit(&progress, "preview VAE load", 36, 36);
         if (!preview_decoder) {
@@ -1606,7 +1656,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         preview_decoder = h3_acquire_video_decoder(
             ctx, decoder_key, vae_path, latent_h, latent_w,
             h3_vae_progress_bridge, &progress,
-            &decoder_is_cached, detail, sizeof(detail));
+            params->video_vae_streaming, &decoder_is_cached,
+            detail, sizeof(detail));
         if (preview_decoder && ctx->video_decoder == preview_decoder)
             h3_progress_emit(&progress, "video VAE load", 36, 36);
         if (!preview_decoder) {
@@ -1621,8 +1672,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_video_vae_decode(
             vae_path, "h3_shaders.metal", video,
             temporal.video_t, latent_h, latent_w,
-            h3_vae_progress_bridge, &progress, &frames,
-            detail, sizeof(detail));
+            h3_vae_progress_bridge, &progress, params->video_vae_streaming,
+            &frames, detail, sizeof(detail));
     if (!video_ok) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;

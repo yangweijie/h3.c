@@ -1,0 +1,24 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>命令行交互: h3_cli / main / terminal</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>命令行交互: h3_cli / main / terminal</h1>
+<p>命令行体验由三部分组成：<code>main.c</code>（进程入口与参数解析）、<code>h3_cli.c</code>（生成循环与交互提示）、<code>h3_terminal.c</code> + <code>linenoise.c</code>（行编辑/历史/信号）。</p>
+<h2>入口</h2>
+<p><code>main.c</code> 负责：</p>
+<ul><li>解析命令行选项到 <code>h3_params</code>（默认值 <code>H3_PARAMS_DEFAULT</code>）。</li><li>解析 <code>--model</code>（含 <code>shader_source_path</code>、<code>H3_FFMPEG</code>/<code>H3_FFPROBE</code> 定位）。</li><li>调用 <code>h3_load_dir()</code> 建立 <code>h3_ctx</code>。</li><li>进入 <code>h3_cli_run()</code>；或在非交互模式下直接 <code>h3_generate()</code>。</li></ul>
+<h2>交互循环</h2>
+<p><code>h3_cli_run()</code> 维护一个交互式提示，允许用户反复提交提示与参考（图片/视频/音频/角色文本），每次提交触发一次 <code>h3_generate()</code>。它把 <code>on_frame</code> 回调接驳到终端预览（配合 <code>linenoise</code> 实现无闪烁刷新），并通过 <code>on_progress</code> / <code>on_elapsed</code> 显示进度与耗时。交互模式下种子默认随机，与一次性模式的默认 42 不同。</p>
+<h2>终端原语</h2>
+<p><code>h3_terminal.c</code> 封装 ANSI 转义、逐帧绘制（用于 <code>--preview-denoise</code> 的逐 Euler 步预览）、以及 SIGINT 处理（干净中断生成）。<code>linenoise.c</code> 是第三方行编辑库（MIT），提供历史回溯与基本补全。</p>
+<h2>与公共 API 的关系</h2>
+<p>CLI 只是 <code>h3.h</code> 公共 API 的一个宿主示例。任何宿主（GUI、服务端、脚本）都可以跳过 <code>h3_cli</code>，直接调用 <code>h3_load_dir()</code> → <code>h3_generate()</code> → <code>h3_unload_dir()</code>，并通过 <code>on_frame</code> 回调接收结果。见 <code>公共 API</code>。</p></div></body></html>

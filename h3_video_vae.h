@@ -17,6 +17,12 @@ typedef struct {
 typedef void (*h3_video_vae_progress)(int completed_blocks, int total_blocks,
                                       void *opaque);
 
+/* Number of VAE decoder transformer blocks. Must match LAYERS in
+ * h3_video_vae.c; exported so the memory planner can estimate the per-block
+ * resident footprint when streaming the VAE decoder (instead of hard-coding
+ * a magic number that silently drifts from the real count). */
+#define H3_VIDEO_VAE_LAYERS 36
+
 typedef struct h3_video_vae_decoder h3_video_vae_decoder;
 
 /* Resident tiled decoder used by live denoising previews. It decodes one
@@ -27,6 +33,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
                         const char *shader_source_path,
                         int latent_height, int latent_width,
                         h3_video_vae_progress progress, void *progress_opaque,
+                        int streaming,
                         char *error, size_t error_size);
 int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
@@ -46,6 +53,7 @@ int h3_video_vae_decode(const char *weight_directory,
                         const float *normalized_latent, int latent_time,
                         int latent_height, int latent_width,
                         h3_video_vae_progress progress, void *progress_opaque,
+                        int streaming,
                         h3_video_frames *output,
                         char *error, size_t error_size);
 void h3_video_frames_free(h3_video_frames *frames);

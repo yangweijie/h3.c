@@ -1,0 +1,28 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>公共 API: h3.h / h3.c</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>公共 API: h3.h / h3.c</h1>
+<p><code>h3.h</code> 是引擎对外的纯 C 头文件，定义了版本宏、参数结构体、结果结构体、以及全部公共函数声明。<code>h3.c</code> 实现这些函数的编排逻辑，是生成流程的&quot;中央调度器&quot;。</p>
+<h2>版本与宏</h2>
+<ul><li><code>H3_VERSION &quot;0.1.0-dev&quot;</code></li><li>默认值：<code>H3_DEFAULT_WIDTH=864</code>、<code>H3_DEFAULT_HEIGHT=480</code>、<code>H3_DEFAULT_FRAMES=56</code>、<code>H3_DEFAULT_STEPS=20</code>、<code>H3_DEFAULT_DIT_LAYERS=50</code></li><li>约束：<code>H3_MIN_DIT_LAYERS=35</code>、<code>H3_MIN_CORE_REUSE=1</code>、<code>H3_MAX_CORE_REUSE</code> 等</li></ul>
+<h2>参数与结果</h2>
+<p><code>struct h3_params</code>（默认值 <code>H3_PARAMS_DEFAULT</code>）携带所有生成配置：画布尺寸、帧数、步数、种子、各加速/质量开关，以及输出回调 <code>on_frame</code>、日志/进度回调、<code>on_start</code> / <code>on_end</code> 钩子。<code>struct h3_result</code> 报告最终 <code>width/height/frames/fps/sample_rate/seed</code>。这两个结构体与 <code>h3_get_param()</code> / <code>h3_set_param()</code> 一起，让宿主在不重新链接的情况下调参。</p>
+<h2>生命周期 API</h2>
+<ul><li><code>h3_load_dir(const char *dir, const char *shader_source_path, const char *ffmpeg, const char <em>ffprobe)</code> → <code>h3_ctx </em></code>：打开模型目录与 Metal 着色器，初始化设备。不映射权重。</li><li><code>h3_unload_dir(h3_ctx *)</code>：释放上下文与已加载权重。</li><li><code>h3_model_info(h3_ctx <em>)</code> / <code>h3_device_info(h3_ctx </em>)</code>：返回只读元数据。</li></ul>
+<h2>生成 API</h2>
+<ul><li><code>h3_generate(h3_ctx <em>, h3_params </em>, const char *prompt, const h3_ref *refs, int n_refs, h3_result *out)</code>：一次性文本/参考到视频-音频生成，结果通过回调增量交付。</li><li><code>h3_generate_incremental(...)</code>：逐块（chunk）生成，便于交互式预览。</li></ul>
+<h2>缓存 API</h2>
+<p><code>h3_cache_enabled()</code> / <code>h3_cache_set_enabled()</code>、<code>h3_cache_clear()</code>：控制跨请求复用的条件/DiT/解码器缓存；默认关闭以匹配一次性调用的内存生命周期。</p>
+<h2>多模态引用类型</h2>
+<p><code>h3_ref</code>（见 <code>h3.h</code>）描述参考输入：图片、视频、音频、或文本&quot;角色&quot;（如 <code>system</code>/<code>assistant</code>）；<code>h3_new_image_ref</code> / <code>h3_new_video_ref</code> / <code>h3_new_audio_ref</code> / <code>h3_new_text_ref</code> 构造它们。文本引用（如角色设定）不进入视觉编码器，而是作为对话上下文拼接到提示。</p>
+<p>编排实现要点：在 <code>h3.c</code> 中，<code>h3_generate()</code> 负责调用 tokenizer→text/vision encoder→multimodal→dit→vae→ffmpeg 的全链路；它通过 <code>h3_host</code> 计算张量布局，通过 <code>h3_cache_*</code> 决定复用，通过 <code>h3_dit_denoise_euler()</code> 驱动去噪，并通过 <code>h3_ffmpeg</code> 与 <code>on_frame</code> 回调产出最终媒体。下游模块见 <code>宿主逻辑与张量布局</code> 与 <code>命令行交互</code>。</p></div></body></html>

@@ -1,0 +1,24 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>视频 VAE 解码/编码: h3_video_vae / h3_video_encoder</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>视频 VAE 解码/编码: h3_video_vae / h3_video_encoder</h1>
+<p><code>h3_video_vae.h</code> / <code>h3_video_vae.c</code> 实现视频潜变量的平铺（tiled）解码与编码；<code>h3_video_encoder.c</code> 把输入参考视频编码为潜变量（用于 Ref2VA 的视频参考条件）。二者共用一套 VAE 权重（来自 <code>权重存储</code>）。</p>
+<h2>视频 VAE 解码器</h2>
+<ul><li><code>h3_video_vae_decoder_open(ctx, weights, params)</code> / <code>h3_video_vae_decoder_close()</code>：加载并释放解码器权重。支持常驻模式，便于逐步预览。</li><li><code>h3_video_vae_decoder_load(ctx, latents, n, params, decoder)</code>：把 <code>DiT 主干</code> 输出的视频潜变量（<code>[24, F/2, H/16, W/16]</code>，patch=96）解码为 RGB 帧序列（channel-major F32，值范围 0..1）。</li><li><code>h3_video_vae_decoder_preview(decoder, latent_i)</code>：在常驻解码器上只解码第 <code>i</code> 个潜变量帧，用于 <code>--preview-denoise</code> 的逐 Euler 步预览，避免每步重解全部帧。</li><li><code>h3_video_vae_decode_tiled(...)</code>：平铺解码——把大帧切分为空间块分别解码再拼接，控制峰值内存；块边界用重叠-加窗（overlap-add）消除接缝。</li></ul>
+<h2>视频编码器（参考路径）</h2>
+<ul><li><code>h3_video_encoder_encode(path, params, &amp;latent)</code>：把参考视频（经 <code>FFmpeg</code> 读入）编码为潜变量，作为 Ref2VA 的视频条件输入，进入 <code>多模态嵌入编排</code> 的序列装配。</li></ul>
+<h2>与 DiT 的耦合</h2>
+<p>视频 VAE 的通道数（24）与 patch 尺寸（96）直接决定 DiT 输入/输出维度（<code>DIT_IN=24</code>），二者必须版本匹配；若权重与代码维度不一致，<code>h3_load_dir()</code> 阶段会通过 <code>h3_model_info</code> 校验报错。</p>
+<h2>实现要点</h2>
+<p>解码器大量使用 <code>Metal 着色器</code> 中的 <code>vae_upsample_*</code>（转置卷积/上采样）与卷积算子，并在 <code>.m</code> 后端上以 BF16 运行。平铺策略使 864×480×56 帧的解码峰值内存显著低于整帧一次性解码。</p>
+<p>相关：音频侧对称实现见 <code>音频 VAE</code>；解码结果经 <code>FFmpeg</code> 封装输出。</p></div></body></html>

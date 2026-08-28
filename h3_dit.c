@@ -637,6 +637,33 @@ static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
              h3_gpu_error(dit->gpu));
         return 0;
     }
+    if (dit->int8_qkv) {
+        slot->qkv_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)INNER * 3 * HIDDEN);
+        slot->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+    }
+    if (dit->int8_attention_out) {
+        slot->out_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * INNER);
+        slot->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    }
+    if (dit->int8_mlp) {
+        slot->fc1_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)FFN * 2 * HIDDEN);
+        slot->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+        slot->fc2_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * FFN);
+        slot->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    }
+    if ((dit->int8_qkv && (!slot->qkv_int8 || !slot->qkv_scales)) ||
+        (dit->int8_attention_out && (!slot->out_int8 || !slot->out_scales)) ||
+        (dit->int8_mlp && (!slot->fc1_int8 || !slot->fc1_scales ||
+                           !slot->fc2_int8 || !slot->fc2_scales))) {
+        fail(error, error_size,
+             "cannot allocate int8 SSD layer slot: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
     return 1;
 }
 
@@ -680,6 +707,30 @@ static int read_stream_layer(h3_dit_stream_job *job) {
         }
         job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
     }
+    /* When int8 is enabled, quantize the freshly read BF16 slot into its int8
+     * buffers + scales. The streamed-block resident footprint (and the GPU
+     * working set used by run_block) is then halved, with no change to the on-
+     * disk BF16 checkpoint format. run_block reads the int8 fields directly. */
+    h3_dit *dit = job->dit;
+    if (job->ok && (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) &&
+        !h3_gpu_begin(dit->gpu)) {
+        job->ok = 0;
+    }
+    if (job->ok && dit->int8_qkv &&
+        !h3_gpu_quantize_weight_int8(dit->gpu, slot->qkv_int8,
+            slot->qkv_scales, slot->qkv, INNER * 3, HIDDEN)) job->ok = 0;
+    if (job->ok && dit->int8_attention_out &&
+        !h3_gpu_quantize_weight_int8(dit->gpu, slot->out_int8,
+            slot->out_scales, slot->out, HIDDEN, INNER)) job->ok = 0;
+    if (job->ok && dit->int8_mlp &&
+        (!h3_gpu_quantize_weight_int8(dit->gpu, slot->fc1_int8,
+             slot->fc1_scales, slot->fc1, FFN * 2, HIDDEN) ||
+         !h3_gpu_quantize_weight_int8(dit->gpu, slot->fc2_int8,
+             slot->fc2_scales, slot->fc2, HIDDEN, FFN))) job->ok = 0;
+    if (job->ok && !h3_gpu_submit(dit->gpu)) job->ok = 0;
+    if (!job->ok)
+        snprintf(job->error, sizeof(job->error),
+                 "int8 quantization of streamed DiT block failed");
     job->seconds = stream_now() - started;
     return job->ok;
 }
@@ -1630,14 +1681,16 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
-    dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
-                    !use_slower_bf16_mlp &&
+    /* int8 quantization is orthogonal to SSD streaming: streaming decides where
+     * weights live (disk vs resident), int8 how they are compressed. When both
+     * are on, streamed blocks are read as BF16 and quantized into the resident
+     * slot's int8 buffers, halving the resident footprint. (Previously the two
+     * were force-mutually-exclusive.) */
+    dit->int8_mlp = dit->fused_mlp && !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
-                    dit->sequence >= 128 &&
+    dit->int8_qkv = !use_slower_bf16_qkv && dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_attention_out = !dit->ssd_streaming &&
-                              !use_slower_bf16_attention_output &&
+    dit->int8_attention_out = !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
     dit->use_slower_row_major_attention_output =
@@ -2235,6 +2288,20 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 streamed_weight.out = slot->out;
                 streamed_weight.fc1 = slot->fc1;
                 streamed_weight.fc2 = slot->fc2;
+                if (dit->int8_qkv) {
+                    streamed_weight.qkv_int8 = slot->qkv_int8;
+                    streamed_weight.qkv_scales = slot->qkv_scales;
+                }
+                if (dit->int8_attention_out) {
+                    streamed_weight.out_int8 = slot->out_int8;
+                    streamed_weight.out_scales = slot->out_scales;
+                }
+                if (dit->int8_mlp) {
+                    streamed_weight.fc1_int8 = slot->fc1_int8;
+                    streamed_weight.fc1_scales = slot->fc1_scales;
+                    streamed_weight.fc2_int8 = slot->fc2_int8;
+                    streamed_weight.fc2_scales = slot->fc2_scales;
+                }
                 weight = &streamed_weight;
 
                 unsigned future = next_active_block(dit, block);

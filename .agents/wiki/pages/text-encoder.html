@@ -1,0 +1,22 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Qwen3-VL 文本编码器: h3_text_encoder</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>Qwen3-VL 文本编码器: h3_text_encoder</h1>
+<p><code>h3_text_encoder.c</code> / <code>h3_text_encoder.h</code> 实现了 H3 文本侧的条件生成：把 token 序列（及可选的视觉嵌入）喂入 Qwen3-VL 语言模型的前 50 层，产出 BF16 条件嵌入。</p>
+<h2>核心函数</h2>
+<ul><li><code>h3_text_encode_bf16(params, tokenizer, model_name, text, cond)</code>：纯文本路径。输入提示 → 分词 → 前 50 层 Qwen3-VL → BF16 嵌入，写入 <code>h3_host_cond.text_embed</code>。这是 FL2VA（文本到视频/音频）的主路径。</li><li><code>h3_text_encode_multimodal_bf16(params, tokenizer, model_name, text, image_embed, audio_embed, n_audio, pr_cond, cond)</code>：多模态路径。把 <code>Qwen 视觉编码器</code> 产生的图像嵌入与音频条件，按 <code>&lt;Picture n&gt;</code> 呈现格式插入文本序列对应位置，再走同样的 50 层语言层，输出联合 BF16 嵌入。用于 Ref2VA（参考到视频）。</li></ul>
+<h2>关键设计</h2>
+<ul><li><strong>只取前 50 层</strong>：H3 复用 Qwen3-VL 的语言主干而非完整模型，输出 5376 维（<code>HIDDEN</code>）嵌入，与 <code>DiT 主干</code> 的隐藏维度对齐。</li><li><strong>BF16 输出</strong>：所有中间与最终嵌入均为 BF16，直接驻留共享 Metal 缓冲，避免 F32 往返开销。</li><li><strong>条件分离</strong>：<code>pr_cond</code>（提示参考条件，如角色设定文本）与 <code>image_embed</code>/<code>audio_embed</code> 分别传入，由本模块负责在序列中正确放置。</li></ul>
+<h2>与宿主的关系</h2>
+<p>本模块产出 <code>h3_host_cond</code> 的嵌入字段，由 <code>宿主逻辑</code> 持有并在去噪步之间复用（除非 <code>core_reuse</code> 强制重算）。嵌入维度与布局必须匹配 <code>h3_layout_build()</code> 计算的段结构。</p>
+<p>相关：文本序列来自 <code>Tokenizer</code>；多模态装配见 <code>多模态嵌入编排</code>。</p></div></body></html>

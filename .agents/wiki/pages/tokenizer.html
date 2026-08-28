@@ -1,0 +1,22 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tokenizer: h3_tokenizer</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>Tokenizer: h3_tokenizer</h1>
+<p><code>h3_tokenizer.h</code> 是 C 接口声明，<code>h3_tokenizer.m</code> 是 Objective-C 实现（基于 Apple 的 <code>NLTokenizer</code> / <code>tokenizer.json</code> 配置），负责把 UTF-8 提示切分为模型词表 ID。</p>
+<h2>核心类型与函数</h2>
+<ul><li><code>struct h3_tokenizer</code>：分词器句柄，持有词表与合并规则。</li><li><code>h3_tokenizer_load(path)</code> / <code>h3_tokenizer_free()</code>：从模型目录加载词表与 BPE 合并。</li><li><code>h3_tokenizer_encode(tk, text, ids[], *n)</code>：UTF-8 → token ID 数组。引擎用它在 <code>h3_generate()</code> 起点把提示文本转为可喂入 <code>Qwen3-VL 文本编码器</code> 的序列。</li><li><code>h3_tokenizer_decode(tk, ids[], n, text)</code>：反向解码（用于调试/日志）。</li></ul>
+<h2>与文本编码器的关系</h2>
+<p>分词结果（token ID 列表）与提示中的 <code>&lt;Picture n&gt;</code> 占位符一起，由 <code>多模态嵌入编排</code> 组装成完整序列；文本部分走前 50 层 Qwen3-VL 语言层产生 BF16 嵌入。注意：参考图像/视频/音频不通过本分词器，它们由 <code>Qwen 视觉编码器</code> 与音频 VAE 分别处理。</p>
+<h2>实现说明</h2>
+<p>以 <code>.m</code> 结尾表明它依赖 Foundation 框架（而非纯 C）。这是仓库中少数必须作为 Objective-C 编译的源码之一，其余为 <code>h3_gpu.m</code> / <code>h3_metal.m</code>。</p>
+<p>相关：分词输出进入 <code>多模态嵌入编排</code> 与 <code>宿主逻辑</code> 的布局计算。</p></div></body></html>

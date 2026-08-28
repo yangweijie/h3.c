@@ -1,0 +1,20 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>项目总览 (Overview)</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>项目总览 (Overview)</h1>
+<p><code>h3-metal</code> 是一个面向 Apple Silicon 的原生视频/音频生成推理引擎，用于运行 MiniMax-H3（H3）系列扩散模型。它以纯 C（核心）与 Objective-C（Metal 后端）实现，无 Python 依赖，通过 Metal Performance Shaders（MPS）在 GPU 上执行所有权重计算，并通过 FFmpeg 处理媒体读写。</p>
+<p>仓库根目录为 C 源码所在位置（<code>h3.c</code> 文件夹），主要源文件包括：</p>
+<ul><li>公共 API 与编排：<code>h3.c</code>、<code>h3.h</code>、<code>h3_internal.h</code>、<code>h3_cli.c</code>、<code>main.c</code>、<code>h3_terminal.c</code></li><li>设备/权重层：<code>h3_gpu.h</code>（C 声明）、<code>h3_gpu.m</code> / <code>h3_metal.h</code> / <code>h3_metal.m</code>（Metal 实现）、<code>h3_safetensors.c</code>、<code>h3_weights.c</code></li><li>文本/多模态：<code>h3_tokenizer.m</code>、<code>h3_text_encoder.c</code>、<code>h3_vision_encoder.c</code>、<code>h3_multimodal.c</code></li><li>扩散主干：<code>h3_dit.c</code>、<code>h3_dit_schedule.c</code></li><li>VAE 与媒体：<code>h3_video_vae.c</code>、<code>h3_video_encoder.c</code>、<code>h3_audio_vae.c</code>、<code>h3_ffmpeg.c</code></li><li>终端交互：<code>linenoise.c</code>（第三方行编辑库）</li></ul>
+<p>引擎支持两种 Transformer 装配：<code>FL2VA</code>（文本到视频/音频）与 <code>Ref2VA</code>（带图像/视频/音频参考的参考到视频）。模型权重以 safetensors 分片形式提供，引擎在加载时仅映射元数据、按需流式读取张量到共享 Metal 缓冲区。</p>
+<p>版本宏位于 <code>h3.h</code>：<code>H3_VERSION &quot;0.1.0-dev&quot;</code>；默认画布 864×480、56 帧、20 步去噪、50 个 DiT 层（<code>H3_DEFAULT_*</code>、<code>H3_MIN_DIT_LAYERS=35</code>）。</p>
+<p>详细架构见 <code>系统架构</code>，构建与运行见 <code>构建与运行</code>。</p></div></body></html>

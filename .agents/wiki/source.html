@@ -1,0 +1,34 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>源码浏览</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="style/wiki.css">
+<link rel="stylesheet" href="style/hljs.css">
+<script>window.__WIKI_ROOT__='';</script>
+<script src="data/src/index.js"></script>
+<script src="script/highlight.min.js"></script>
+<script src="script/source-viewer.js"></script>
+<script src="script/wiki.js" defer></script>
+</head><body><div id="svapp">
+<aside id="svside">
+  <div class="brand" style="display:flex;justify-content:space-between;align-items:center;padding:2px 4px 8px;font-size:13px;font-weight:700">
+    <span>源码浏览</span><button class="btn" id="themebtn" title="切换主题">☀</button>
+  </div>
+  <input class="search" id="svfilter" placeholder="过滤文件路径…" autocomplete="off">
+  <div id="svlist"></div>
+  <div class="hint" id="svhint"></div>
+</aside>
+<section id="svmain">
+  <div class="sv-head">
+    <div class="sv-path"></div><span class="sv-badge"></span>
+    <div class="sv-tools">
+      <button class="btn" data-r="part">片段</button>
+      <button class="btn" data-r="full">完整</button>
+      <button class="btn" data-r="copy">复制</button>
+    </div>
+  </div>
+  <div class="sv-note" style="display:none"></div>
+  <div class="sv-body"><div class="sv-empty">从左侧选择一个文件开始浏览。</div></div>
+</section>
+</div></body></html>
