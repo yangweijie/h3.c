@@ -92,3 +92,10 @@
 - **sink_out 精确复现**：单 token prompt 输出与投影元数据 sink_out maxdiff=0.0（norm=16357.887），证明 ClipProj 前向与作者实现一致。
 - **最终语义检查**：cat/dog=0.979, cat/elephant=0.814（动物组高）, cat/quantum physics=0.450（低）, fox/sports car=0.628（同场景）, world peace/war and peace=0.092。
 - 后续（可选）：在 ≥128GB 机器跑 h3.c 32B 同 prompts 与 cand_4b_final.npz 对照，验证接近 cos_test=0.8144。
+
+### int8 vs fp16 候选向量对照（补充验证，0.9982）
+- 用原版 fp16 4B（截断 25 层，2.91B）跑**同一批 10 prompts** → `/tmp/cand_fp16.npz`，与 int8 交付物 `weights/cand_4b_final.npz` 逐 prompt 对比最后 token 余弦：
+  - 平均余弦 **0.9982**，min 0.9900（hello world/neon city 为长 prompt 累积量化误差），9/10 个 >0.999
+  - 证明 int8 反量化管线与原版 fp16 数值一致（编码器层面 ≈ 模型卡声称的 0.0023 余弦差）
+  - 因此 int8 候选向量 ≈ 作者校准用 int8 编码器输出 → 与 32B 的余弦应接近 cos_test=0.8144
+- 结论：以网络测评数据（cos_test=0.8144）为对比基准的论证链完整闭合。
