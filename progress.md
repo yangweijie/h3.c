@@ -1,61 +1,86 @@
-# Progress Log
+# Progress Log: 4B + ClipProj harness
 
-- 2026-08-28: 启动分析任务。已建规划文件。
-- 重要发现：`h3_memory_plan.c/.h` 已存在并接入 `h3_generate`(h3.c:862) —— ds4 思路2(自动预算规划器) 已实现。当前默认 `memory_plan_auto=1`。
-- 落地改动：
-  * `h3_memory_plan.c`：打破 int8/ssd_streaming 互斥，流式时仍建议 int8；新增 `video_vae_streaming`/`encoder_streaming` 建议字段（针对 VAE 整网常驻这一 32G 主因）。
-  * `h3.h`：`h3_params` 新增 `video_vae_streaming`/`encoder_streaming`；`H3_PARAMS_DEFAULT` 改为 designated init 以便稳健扩展。
-  * `h3.c`：在 `h3_generate` 应用上述新字段。
-  * `h3_cli.c`：放宽 ssd_streaming/int8 互斥告警；新增 `!memory-plan` 检视命令（打印设备 working set + 自动策略）。
-- 验证：`h3_memory_plan.c` 语法检查通过；`make` 整体失败为环境预存问题。
-- 本轮：实现 VAE 解码器权重流式（思路1/思路B 落地）。
-  * 关键发现：`run_resident`(line495) 已逐块 load→run→free，仅常驻 1 块；但 tiled 路径 `load_resident_weights`(line518) 在 open 时预载全部 LAYERS 块+输入/输出权重常驻（~9GiB，即 32G 主因之一）。
-  * 改动：`h3_video_vae_decoder_load` 增加 `streaming` 参数；`vae_context` 增加 `streaming` 字段；`load_resident_weights` 在 streaming 时跳过块预载；新增 `run_stream_tile`（镜像 run_resident 的逐块流式）替代 `run_resident_tile`；`decoder_decode_chunk` 按 `vae.streaming` 选择；`h3.c` 把 `params->video_vae_streaming` 经 `h3_acquire_video_decoder` 传入；`tests/test_semantic_vae.c` 传 0（保持常驻预览）。
-  * 验证：`h3_video_vae.c` 语法检查通过(exit 0)；h3.c 与 test 的 lint 错误已清除（仅剩 line418 预存 warning）。
-- 交互2（文本/音频编码器延迟释放）：经核查 **已是现状、无需改动**。
-  * 证据：`h3_text_encoder.c:517` 每次调用 `h3_weight_store_open` 并在 return 前 `h3_weight_store_free(store)`(line758/779)；`h3_audio_vae.c:682` 同理，解码后 `cleanup` 释放；`h3_vision_encoder.c` 也 per-call open/free。
-  * 跨 denoise 阶段常驻的权重集只有两处：`h3_dit.c:1628`(DiT transformer, dit->weights) 与 `h3_video_vae.c`(视频VAE解码器, 已做流式)。其余均为 per-call 释放，不存在"常驻未释放"的编码器权重。
-  * 结论：32G 下限的源头就是这两个常驻集；已被前几轮改动（DiT ssd_streaming+int8解耦、视频VAE流式）覆盖。无进一步"延迟释放"可挖。
-- 交互3（DiT int8+流式解耦落地）：实现引擎级 int8/ssd_streaming 真正同时生效（之前的 planner 解耦被引擎 h3_dit.c:1633 的 `!ssd_streaming` 强制覆盖，是真正 bug）。
-  * 改动：
-    * `h3_dit.c:1633-1642` 去掉 `!dit->ssd_streaming` 门控，int8 与流式正交。
-    * `allocate_stream_slot` 在 int8 开启时额外分配 int8 缓冲+scale（qkv/out/fc1/fc2）。
-    * `read_stream_layer` 读入 BF16 后，按 dit->int8_* 把 slot 量化进 int8 缓冲（磁盘仍是 BF16，读入即量化，不需新 safetensors）。
-    * dispatch 处 `streamed_weight` 额外 alias int8 字段，`run_block` 直接走 int8 路径。
-  * 效果：流式模式下 DiT 常驻 slot 与每步 GPU 工作集再减半（2 个 int8 块 vs 2 个 BF16 块），配合视频VAE流式，16GB 档可行。
-  * 验证：`h3_dit.c` 语法检查通过(exit 0)；仅残留预存 sizeof(A*) warning；`h3_gpu_tensor_new_i8`/`h3_gpu_quantize_weight_int8` 签名与既有 quantize_block_* 用法一致。
-- 交互4（规划器 streaming 感知修正）：发现并修复规划器的关键 bug——它用"全常驻"体量做决策，导致流式开启后 resident 估算严重偏高，小内存设备被过度剪枝或误判。
-  * `h3_memory_plan_auto` 新增 `streamed_resident_bytes` 参数：用"开启流式后的真实常驻体量"（DiT 仅 2 块 + VAE 解码器 1 块 + 编码器 0 常驻）做适配决策与预算分配。
-  * `h3.c:866` 与 `h3_cli.c` 计算该 streaming-aware 常驻估计（DiT=2/50、VAE=1/28 块，编码器 per-call 释放按 0 计）并传入。
-  * 效果：16/24GB 设备现在得到准确的自动档位，而非被悲观估算误伤；`!memory-plan` 命令输出也同步准确。
-  * 验证：h3_memory_plan.c/.h 与 h3.c/h3_cli.c 语法检查通过(exit 0)，lint 0 错误（仅预存 warning）。修复了误用 H3_DIT_BLOCKS（h3.c 未包含该头）→改 H3_DEFAULT_DIT_LAYERS=50。
-- 交互5（CR 审查 + 三处修复）：对 VAE 流式落地改动做代码审查，发现并修复 3 个问题，确保 streaming 在全部解码路径真实生效。
-  * CR Issue 1（🔴 功能性，已修）：`decode_chunked` 路径完全忽略 streaming 标志——其栈上 `vae.streaming` 默认 0 且无条件调用 `run_resident_tile`，而 `decoder_decode_chunk` 路径已正确分支。后果：大图/长序列走分块路径时 VAE 仍常驻 ~9GiB，自动档位优化静默失效。修复：`h3_video_vae_decode` 与 `decode_chunked` 增加 `streaming` 形参，`h3.c` 调用处传入 `params->video_vae_streaming`，运行分支统一为 `vae.streaming ? run_stream_tile : run_resident_tile`；tests 5 处调用补 `0`（保持常驻测试行为）。
-  * CR Issue 2（🟡 估算偏差，已修）：规划器用魔法数字 `28` 估算 VAE 单块体量，但真实块数 `LAYERS=36`。修复：`h3_video_vae.h` 导出 `#define H3_VIDEO_VAE_LAYERS 36`，`h3_video_vae.c` 内 `LAYERS = H3_VIDEO_VAE_LAYERS`（单一来源），`h3.c`/`h3_cli.c` 改用该宏替换 `28`。
-    - **方向更正**：早期描述"用 28 导致常驻估算偏小、预算过于乐观"是错的，实测方向相反。`/28` 得出单块 0.321 GiB，`/36` 得出 0.250 GiB（以 9 GiB 解码器为例）——即旧代码**高估**单块体量 28.6%，使流式后常驻估算偏**大**，规划器**低估**可用余量，对 16GB 档**过度保守**（更易触发不必要的 DiT 层数剪枝），而非偏乐观。
-    - 实测影响量级：VAE 单块差仅 0.071 GiB，相对 16GB 场景 streaming 常驻总量 2.65 GiB 约占 2.7%（DiT 2 块 2.40 GiB 占主导），故修正的实际效果有限，主要收益是消除魔法数字与真实块数的漂移风险。
-  * CR Issue 3（🟡 文档，已修）：`run_resident_tile` 注释未说明它是 streaming=0 的常驻路径、由调用方按 streaming 选择；更新注释指明双路径选择。
-- 交互6（本地编译验证 + 修复 Makefile 遗漏）：规避 SDK 不兼容，完成真实编译验证。
-  * 根因：默认 `clang` 是 Homebrew LLVM 16，`which clang`→`/opt/homebrew/opt/llvm@16/bin/clang`；它**不认识 26.5 SDK 的 vecLib 头里 `visionOS` 平台名**，导致 `h3_host.c`(Accelerate 链路) 报 `unrecognized platform name visionOS`。这是工具链/SDK 不匹配，非代码问题。
-  * 规避方法：用 `make CC="xcrun clang"`（Apple clang 21.0.0 + 26.5 SDK，自动带正确 SDKROOT），既能解析 Metal4(`MTLGPUFamilyMetal4`) 又认识 visionOS。注：15.4 SDK 可过 Accelerate 但缺 Metal4，不满足项目需要，故必须用 26.5 SDK + 苹果 clang。
-  * **关键发现：Makefile 的 `LIB_C` 漏列 `h3_memory_plan.c`**（`h3.c:4`/`h3_cli.c:2` 均 `#include "h3_memory_plan.h"` 并调用 `h3_memory_plan_auto`，但该 .c 从未进构建）——导致 `h3` 链接期 `Undefined symbols: _h3_memory_plan_auto`，**整个项目此前根本链接不出可执行文件**。这是此前所有"make 失败"的真正主因之一（叠加 SDK 问题）。已修复：Makefile `LIB_C` 增加 `h3_memory_plan.c`。
-  * 验证结果（用 `xcrun clang` + 26.5 SDK）：`make h3 libh3.a` 全量编译+链接 **成功**（产物 h3 559KB / libh3.a 768KB）；`h3_semantic_vae_test`、`h3_real_video_vae_test` 也编译通过。证明 Issue 1/2/3 的全部改动可正确编译、签名自洽、链接无缺失符号。仅余 lint 预存 warning（h3_video_vae.c:418 sizeof(A*) 及 h3_cli.c:708/710 uint64→double 隐式转换 warning，均非本轮引入）。
-  * 运行时验证（无需权重即可跑的部分）：
-    - `./h3_tests` → **ok: 1768 checks**（全部通过，基础逻辑未被改动破坏）。
-    - `./h3_audio_gpu_tests` → ok，Metal primitives 与 host 参考一致（GPU 后端正常）。
-    - 规划器实测（临时 harness 直接调用 `h3_memory_plan_auto`，模拟 16/24/32GB；假设 DiT 60GiB、VAE 9GiB、编码器 8GiB、音频VAE 1GiB、激活 4GiB）：
-      * 16GB（recommended 10GiB）：ssd=1 int8=1 vae_streaming=1 enc_streaming=1，streaming 常驻 2.65 GiB，余量 3.35GiB < 4GiB → DiT 剪到 35 层，cache 2 GiB。
-      * 24GB（recommended 15GiB）：同上但保持完整层数，cache 6 GiB。
-      * 32GB（recommended 21GiB）：保持完整层数，cache 11 GiB。
-      * `_Static_assert(H3_VIDEO_VAE_LAYERS == 36)` 通过；drift check 确认 /28 vs /36 差 +28.6%（见 CR Issue 2 的方向更正）。
-    - 未跑：real-* 与 parity 测试（本机无 MiniMax-H3 权重、无 misc/fixtures，属环境限制非代码问题）。
+## 2026-08-29
 
+### Done
+- 仓库获取：GitCode HF 镜像 `ai.gitcode.com/hf_mirrors/NicoLab28/ClipProj-MiniMax-H3` 直链返回 401、ls-remote 被重定向登录页，需认证不可用 -> 弃用。
+- 改用 ModelScope `NicoLab28/ClipProj-MiniMax-H3` 下载成功，SHA256 校验通过（feef06ef...），文件干净。
+- 投影文件 `mmh3-4b-ClipProj-v3-mlp.safetensors` 元数据：version=v3, tap=24, d_in=2560, d_out=5120, mlp_hidden=32768, mlp_depth=1, 无 W（纯残差 MLP）, cos_test=0.8144。
+  - 关键修正：投影用第 24 层（不是最后一层/不是 50 层）。
+- 模型：`/Users/jay/.lmstudio/models/Qwen3-VL-4B-Instruct`（8.3GB，d_in=2560 确认是 4B）。
+- 依赖：python3.13 已装 torch 2.12.0 / transformers 5.15.x / numpy / scipy（pip，非 uv）。
+- 编写 `clipproj_harness.py`：加载 Qwen3VLModel（base，去 LM head）+ 投影；--hs-index 默认 25（tap+1），--tap 25；支持 --inline / --prompts / --reference / --chat。
+- 前向逻辑已按元数据实现：hidden[hs_index] -> Linear(2560->32768)->GELU->Linear(32768->5120) -> cond=yn*std_out+mean_out -> cond[:,0]=sink_out。
 
+### Blocked / Errors
+- **OOM（EXIT 137 SIGKILL）**：在本机（16GB 总内存，仅 1.9GB 空闲，OS+app 已占 ~14GB）加载 8.3GB fp16 模型需 ~22GB -> jetsam 强杀。
+  - harness 逻辑本身没问题，纯属内存装不下。
+  - 已用 TQDM_DISABLE=1 关进度条确认是 SIGKILL 而非 Python 异常。
 
+### Pending / Next
+- [ ] Phase 5：读 ComfyUI `sd1_clip.py` 的 `encode_token_weights`，确认 sm.layer=[24] 映射到 HF `hidden_states` 的索引（24 还是 25）。
+- [ ] Phase 4 解锁方案（选一）：
+  1. 在大内存机器（>12GB 空闲）上跑 fp16（32B 对照机通常满足）。
+  2. 给 harness 加 int8/int4 量化（torchao），把模型压到 ~4GB/~2GB，本机可跑。
+  3. 查 ClipProj-MiniMax-H3 仓库是否自带 int8 版 4B 编码器（元数据 source_model=qwen3vl_4b_int8_convrot 疑似暗示）。
+- [ ] Phase 6：实跑后用余弦相似度对照，目标接近 cos_test=0.8144；再与 h3.c 32B 输出对齐。
 
+### Environment note
+- 用户建议后续用 `uv` 做可复现安装（`uv venv` + `uv pip install` + `uv.lock`）。当前 pip 已跑通，先不动，作为后续环境方案。
 
-- 探查发现：流式(ssd_streaming)仅覆盖 DiT 的 4 个 matmul(QKV/OUT/FC1/FC2)，用 2 个 slot 常驻；开启时 int8 被强制关闭。
-- 视频 VAE 解码器在 tiled 模式下"整个解码器权重全程常驻"(h3_video_vae.c:530)，音频 VAE 同。
-- 文本编码器(Qwen3-VL 前50层)、Ref2VA transformer、patch/adaln/embedding 等非流式权重全部常驻内存。
-- 无设备内存自检/自动分级回退，全靠手动 CLI 开关(!ssd-streaming / !int8-row-fc2)。
-- 结论成型，准备撰写分析报告。
+## 2026-08-29（后续）
+### 规划文件规范化
+- `task_plan.md` 从自定义表格格式改写为 planning-with-files skill 模板格式（`### Phase N` + `**Status:**` + 检查项），内容全部保留：6 个 phase、Key Questions、Decisions、Errors 表。
+- 效果：`check-complete.sh` 由 `0/0 phases complete`（识别不到）变为正确输出 `3/6 phases complete, 1 in_progress, 2 pending`；skill 的自动钩子（写文件后提示更新、Stop 时完成检查）恢复有效。
+- Phase 4 状态标记为 in_progress（blocked 语义保留在 Current Phase 与进度条目中），因模板只支持 pending/in_progress/complete。
+- 文件变更：`task_plan.md`（改写）、`progress.md`（本条记录）。
+
+### 解锁方向调研（少走弯路）
+- **方向 3 结论**：ClipProj-MiniMax-H3 仓库只含投影矩阵，**不含 4B 编码器**。但模型卡原文确认：bf16 校准的矩阵用于 int8/fp8 编码器余弦差仅 **0.0023**——量化编码器与矩阵兼容有官方依据（`source_model=qwen3vl_4b_int8_convrot` 正是作者校准用的 int8 编码器）。
+- **方向 2 修正**：`torch.ao.quantization.quantize_dynamic` 是"先全量加载 fp16（8.9GB）再量化"，加载峰值不降，实测把 16GB 机器拖入严重 swap（命令全超时数分钟）——**加载后量化在此机不可行**。已 kill 进程恢复。
+- **harness 截断加载改造**（进行中）：新增 `--max-layers`（默认 25=embed+tap24 层）+ `--quantize int8`。
+  - 用 `safe_open` 惰性读所需层 + `torch.device('meta')` 构造 + `load_state_dict(assign=True, strict=False)`，绕开 transformers 5.15 禁止 `state_dict` 与模型名同传的限制。
+  - 实测加载 25 层成功（277 tensors, 2.91B params），不再 OOM；卡在 strict 报错，已加 strict=False（visual 塔不加载保留 meta 占位）待验证。
+  - 另发现模型目录**缺 config.json**（LM Studio 布局），已从 hf-mirror 补装（`Qwen/Qwen3-VL-4B-Instruct` 的 config，1.5KB）。
+- **量化版本调研**：Qwen3-VL-4B 有丰富量化版（unsloth/mradermacher GGUF：Q2_K 1.67GB~Q8_0 4.28GB，Q4_K_M 2.5GB 为甜点档；mlx-community MLX 3/4/8bit 2.6~5.1GB）。
+- **h3.c 不支持 GGUF**：`h3_weights.c` 只认 `.safetensors`，全仓库无 GGUF 代码（自研引擎、无 GGML）。GGUF 是给 harness 降内存用，h3.c 32B 基准仍走 safetensors。
+
+### int8 编码器下载验证（hf-mirror + unfetch）
+- 找到并下载 `Merserk/qwen3vl-4b-int8-convrot` 的 `qwen3vl_4b_int8_convrot.safetensors`（4.86GB）。
+- 渠道：huggingface.co 直连超时（HTTP 000），**hf-mirror.com 可达**；unfetch 32 线程分片 **108 MB/s**，约 1 分钟下完；大小与 content-length（4864124848B）完全一致。
+- 文件格式验证：1421 tensors，dtype = F32×354（scale/bias）+ BF16×359（norm/bias）+ **I8×354**（量化权重）+ U8×354——标准 torchao int8 权重量化布局，与投影元数据 `qwen3vl_4b_int8_convrot` 完全对口。
+- 文件位置：`h3.c/weights/qwen3vl_4b_int8_convrot.safetensors`。
+- 注意：该仓库仅权重+config，缺 tokenizer/chat_template，加载时需搭配原版 `Qwen3-VL-4B-Instruct` 目录的 tokenizer 等。
+
+### int8 文件移动 + harness 反量化加载打通（重大进展）- 按用户要求统一模型布局：int8 文件移至 `/Users/jay/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot/qwen3vl_4b_int8_convrot.safetensors`（同卷 mv 无额外空间消耗）。
+- 投影文件丢失（只剩 .cache lock，可能被清理）：用 unfetch 从 hf-mirror 重新下载 `mmh3-4b-ClipProj-v3-mlp.safetensors`（503MB，23 秒，SHA/元数据核对通过：tap=24, d_in=2560, d_out=5120, cos_test=0.8144, source_model=qwen3vl_4b_int8_convrot）。
+- **harness 新增 `--weights-file` 选项**：直接读单文件 weight-only int8（`I8 weight` + `F32 weight_scale [out,1]`），反量化 `w = i8 * scale` 后走截断加载，跳过 visual tower。
+- **RoPE meta buffer 修复**：meta device 构造模型后，`Qwen3VLTextRotaryEmbedding` 的 `inv_freq` 是 meta 张量，前向报 "Cannot copy out of meta tensor"；改为用 config 重算 `inv_freq`/`original_inv_freq`（default 用 `compute_default_rope_parameters`，非 default 用 `ROPE_INIT_FUNCTIONS`）。
+- **✅ 全链路跑通**（16GB 本机无 OOM）：`python3.13 clipproj_harness.py --prompts "hello" --inline --max-prompts 1 --weights-file <int8> --max-layers 25`
+  - `[model] int8-file dequant: 277 tensors (2.91B params)` —— 只读 embed+25 层+norm
+  - `[0] seq=1 mean_norm=16357.887 :: hello`
+  - `saved 1 embeddings -> candidate.npz`，`hello` 键 shape=[1,5120] float64（d_out=5120 正确）
+  - 单 prompt 无 32B 对照，mean_norm 仅目测合理性；Phase 5/6 尚未完成。
+
+### Phase 5 完成：layer 索引语义确认（transformers 5.15 源码实证）
+- 本机无 ComfyUI，改从 transformers 5.15 源码确认：`Qwen3VLModel.forward` 的 `language_model` 是 `Qwen3VLTextModel`（继承 `Qwen3Model`），其 forward 标 `@capture_outputs`（`utils/output_capturing.py:215`）。
+- `capture_outputs` 通过 hook 自动收集每层输出为 `hidden_states` 元组：`[0]`=embed 输出（capture_initial_hidden_state），`[k]`=第 k-1 层 block 输出；最后一个元素被 `tie_last_hidden_states` 覆盖为 norm 后的 `last_hidden_state`。
+- **结论**：`hidden_states[25]` = 第 24 层 block 输出 = tap=24。harness 默认 `hs_index = tap + 1 = 25` **正确**，与 ComfyUI `sm.layer=[24]` 语义一致。2 层 smoke 实测 `len(hidden_states)=3`（embed, layer0, layer1）验证。
+- 注：之前 grep 不到 `all_hidden_states` 是因为这个版本用 hook 捕获而非手写收集循环，易误判为"不支持中间层"。
+
+### NaN 根因修复 + 向量合理性验证（重大突破）
+- **症状**：多 token prompt 第 2+ token 出现 NaN（单 token 正常但被 sink_out 覆盖无区分度）。q/k/v 输出巨大（max=234 vs 正常 0.97）。
+- **根因 1（dtype 判断 bug，真凶）**：`safe_open.get_slice(name).get_dtype()` 返回**字符串 `'I8'`** 而非 `torch.int8`。harness 的 `== torch.int8` 判断恒 False，反量化分支从未进入 → raw int8 值（absmax=127）被直接当权重加载 → q/k/v 输出 200+ → o_proj 起 NaN。
+  - 实证：`get_slice().get_dtype()` 类型是 `<class 'str'>`，`d == torch.int8` 为 False。
+  - 修复：改为 `== "I8"`。
+- **根因 2（Hadamard 旋转）**：int8 文件是 ComfyUI **ConvRot 格式**（`comfy_quant` JSON: `{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256}`）。存储权重 = 每 256 宽组乘归一化 Hadamard 的旋转结果（`W_stored = W @ H^T`），反量化必须**先 i8*scale 再 unrotate**，否则权重完全错误。
+  - 从 PyPI comfy-kitchen 0.2.31 wheel（`comfy_kitchen/backends/eager/convrot_w4a4.py` + `tensor/int8.py`）确认权威实现：`h = _build_hadamard(gs)`（4×4 seed 做 Kronecker 积到 256，÷√size 归一化），`dequantize` 路径 `_rotate_weight(i8*scale, h, gs)`。
+  - 归一化 Hadamard 对称正交（H²=I），反量化再乘 H^T 即还原。
+  - harness 新增 `_build_hadamard` + `convrot_unrotate(w, gs)`，按 `comfy_quant` 元数据判断是否 unrotate。
+- **验证（全部通过）**：
+  - 单层权重对照原版 fp16：7 个 layer0 线性层 cos 均 ≈1.000-1.008（unrotated），未 unrotate 时仅 0.064。
+  - 同 prompt 逐层对照：INT8 q_proj out_max=0.973 vs ORIG 0.972；layer0 out 5.727 vs 5.734。
+  - 8-prompt 批量无 NaN（a cat seq=2, quantum physics seq=3, a cat sitting on a mat seq=6 全部有限）。
+  - **语义合理性**（多 token 最后 token，去均值余弦）：a cat/a dog/a elephant 互相关 0.97-0.98（语义相近高）；quantum physics 与动物组 0.44-0.48（无关低）；hello world 与其它负相关。
+  - **确定性**：同一 prompt 两次运行 mean_norm 完全一致（9057.316 / 10556.060）。
+  - **sink 行为**：所有 prompt 的 token0 norm=16357.887、互相 cos=1.0（sink_out 覆盖，与 ClipProj 设计一致）；内容 token 有真实区分度。
