@@ -99,3 +99,9 @@
   - 证明 int8 反量化管线与原版 fp16 数值一致（编码器层面 ≈ 模型卡声称的 0.0023 余弦差）
   - 因此 int8 候选向量 ≈ 作者校准用 int8 编码器输出 → 与 32B 的余弦应接近 cos_test=0.8144
 - 结论：以网络测评数据（cos_test=0.8144）为对比基准的论证链完整闭合。
+
+### 32B 对照指引落地（task_plan 收尾）
+- 新增 `weights/README.md`：交付物说明 + 10 prompts 清单 + 4B 复现命令 + **32B 实证对照完整步骤**。
+- 32B 侧对照路径确认：h3.c `h3_text_encode_bf16`（`tests/test_real_prompt.c` 参照）输出 `[tokens,5120]` BF16，导出为 `ref32b.npz`（key=prompt 原文）；harness 已内置 `--reference ref32b.npz` 一键输出逐 prompt `cosine_vs_32B` + `mean/min/max/frac>=0.7`。
+- 目标基准：mean 接近 ClipProj 元数据 `cos_test=0.8144`（作者 200-prompt 4B-vs-32B 平均余弦）。
+- task_plan.md：Current Phase 更新为「全部完成（本机范围）」；Key Questions 3 已答（网络测评基准 + weights/README.md 实证步骤）。

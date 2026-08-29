@@ -5,9 +5,9 @@
 与 h3.c 在 32B 上跑出的结果做余弦相似度对照（ClipProj 自带 cos_test=0.8144 参考值）。
 
 ## Current Phase
-Phase 6（in_progress）
+全部完成（本机范围）
 
-**一句话状态：** harness 已在本机 16GB Mac 上完整跑通并产出 `weights/cand_4b_final.npz`（10 prompts, 多 token 无 NaN，语义/确定性/sink 验证全过）。**NaN bug 已修复**（根因：`get_dtype()` 返回字符串 'I8' 使反量化分支从未进入 + ConvRot Hadamard 解旋转缺失）。**32B 对照放弃**：32B 权重 37 GiB（README 明确目标机 M5 Max/128 GiB），16GB 本机不可行——按用户指示以网络测评数据（cos_test=0.8144）为对比基准。
+**一句话状态：** 4B+ClipProj 候选向量 harness 全部 6 个 phase 完成。产出 `weights/cand_4b_final.npz`（10 prompts）并附 `weights/README.md`（prompts 清单、4B 复现命令、32B 对照完整指引）。NaN 双根因修复、int8 vs fp16 对照（mean cos 0.9982）、网络测评基准（cos_test=0.8144）论证链全部闭合。32B 实证对照需 ≥128GB 机器，按 README 步骤可一键复现。
 
 ## Phases
 
@@ -44,13 +44,14 @@ Phase 6（in_progress）
 - [x] 交付物：`weights/cand_4b_final.npz`（10 prompts，全部 finite，无 NaN）
 - [x] **32B 本机对照不可行**：32B 文本编码器权重 37 GiB（README 534-537 行：M5 零拷贝映射 37 GiB 模型文件；543 行：默认流式深度 3 层目标机 128 GiB），16GB Mac 装不下
 - [x] 按用户指示以网络测评数据为对比：ClipProj 元数据 `cos_test=0.8144` 即作者 4B-vs-32B 的 200-prompt 平均余弦；模型卡声明 bf16 校准矩阵用于 int8 编码器余弦差仅 0.0023
-- [ ] （可后续）在大内存机（≥128GB）跑 h3.c 32B 同 prompts，与 `cand_4b_final.npz` 对照
-- **Status:** complete（本机范围）
+- [x] int8 vs fp16 对照：同 10 prompts 最终向量 mean cos=0.9982（min 0.99），论证链闭合
+- [x] 32B 后续对照指引落地：`weights/README.md`（prompts 清单、4B 复现命令、32B 侧导出 `ref32b.npz` 步骤、`--reference` 一键对照、目标 mean≈0.8144）
+- **Status:** complete（本机范围；32B 实证对照待 ≥128GB 机器）
 
 ## Key Questions
 1. ~~ComfyUI 的 sm.layer=[24] 对应 HF `hidden_states` 的哪个索引？~~ 已答：`hidden_states[25]`（tap+1，embed 算第 0 层），源码实证
 2. ~~本机 16GB 跑不下 8.3GB fp16：怎么解锁？~~ 已解：int8 convrot 反量化 + 截断 25 层加载，无 OOM
-3. Phase 6：单 prompt 结果如何与 cos_test=0.8144 对齐？cos_test 是作者在 200 prompts 上 4B-vs-32B 的余弦；需要 32B 参考输出或构造 4B self-test
+3. ~~Phase 6：单 prompt 结果如何与 cos_test=0.8144 对齐？~~ 已答：cos_test 是作者在 200 prompts 上 4B-vs-32B 的余弦；本机无 32B 权重，按用户指示以网络测评数据为基准，实证对照步骤见 `weights/README.md`（需 ≥128GB 机器）
 
 ## Decisions Made
 | Decision | Rationale |
