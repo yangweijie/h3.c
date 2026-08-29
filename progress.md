@@ -105,3 +105,12 @@
 - 32B 侧对照路径确认：h3.c `h3_text_encode_bf16`（`tests/test_real_prompt.c` 参照）输出 `[tokens,5120]` BF16，导出为 `ref32b.npz`（key=prompt 原文）；harness 已内置 `--reference ref32b.npz` 一键输出逐 prompt `cosine_vs_32B` + `mean/min/max/frac>=0.7`。
 - 目标基准：mean 接近 ClipProj 元数据 `cos_test=0.8144`（作者 200-prompt 4B-vs-32B 平均余弦）。
 - task_plan.md：Current Phase 更新为「全部完成（本机范围）」；Key Questions 3 已答（网络测评基准 + weights/README.md 实证步骤）。
+
+### h3.c 引擎真实验证（回应：32B 从未跑过）
+- **用户指出验证链缺口**：h3.c 的 32B 真实前向从未验证（权重 37GiB + 目标机 M5 Max/128GB，本机 M4/16GB 物理不可行），我们 4B harness 的对照对象"h3.c 32B 输出"从未产生。
+- **本轮补强验证（无权重可做项全部做完）**：
+  1. `./h3_tests`：**1768 checks 全过**（引擎数学原语自检）
+  2. `./h3_audio_gpu_tests`：**AudioVAE Metal 原语与 host 参考匹配**（真实 Metal 计算）
+  3. `./h3_tokenizer_tests <Qwen3-VL tokenizer.json>`：**60 checks 过**——h3.c 解析真实 Qwen3-VL tokenizer.json（7MB），编码与 Qwen 词汇表兼容
+  4. safetensors 探针（`h3_st_read_header`）：**成功解析真实文件**——ClipProj（9 tensors: mean_in/mean_out/mlp.0.bias...）、4B int8 convrot（1421 tensors: model.language_model.layers.0.mlp.*.weight_scale...）
+- **仍缺口**：32B 文本编码/DiT/VAE 真实权重前向（需 MiniMax-H3 原版 BF16 37GiB + 128GB 机器）。h3.c 只认 BF16 权重（`h3_text_encoder.c:225` 硬校验 H3_DTYPE_BF16），ComfyUI 的 int8_convrot 打包格式不受支持。
