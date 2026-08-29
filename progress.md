@@ -84,3 +84,11 @@
   - **语义合理性**（多 token 最后 token，去均值余弦）：a cat/a dog/a elephant 互相关 0.97-0.98（语义相近高）；quantum physics 与动物组 0.44-0.48（无关低）；hello world 与其它负相关。
   - **确定性**：同一 prompt 两次运行 mean_norm 完全一致（9057.316 / 10556.060）。
   - **sink 行为**：所有 prompt 的 token0 norm=16357.887、互相 cos=1.0（sink_out 覆盖，与 ClipProj 设计一致）；内容 token 有真实区分度。
+
+### Phase 6 收尾：32B 对照放弃，以网络测评数据为基准
+- **32B 本机不可行（确认放弃）**：h3.c 文本编码器跑 Qwen3-VL-32B 语言部分，权重 37 GiB（README 534-537 行），流式文本编码默认 ring depth 3 的目标机是 **M5 Max / 128 GiB**（README 543 行）。16GB Mac 无法加载。按用户指示放弃本地 32B 对照，以网络测评数据为对比。
+- **以网络测评数据对比**：ClipProj 元数据 `cos_test=0.8144` = 作者 200 prompts 上 4B-vs-32B 的平均余弦；模型卡声明 bf16 校准矩阵用于 int8 编码器余弦差仅 **0.0023**（int8 编码器与矩阵兼容有官方依据）。
+- **交付物**：`weights/cand_4b_final.npz`（10 prompts：a cat, a dog, an elephant, quantum physics, a vintage sports car, world peace, war and peace, hello world, close-up of a red fox in snowy forest, cinematic neon city street at night；全部 finite）。
+- **sink_out 精确复现**：单 token prompt 输出与投影元数据 sink_out maxdiff=0.0（norm=16357.887），证明 ClipProj 前向与作者实现一致。
+- **最终语义检查**：cat/dog=0.979, cat/elephant=0.814（动物组高）, cat/quantum physics=0.450（低）, fox/sports car=0.628（同场景）, world peace/war and peace=0.092。
+- 后续（可选）：在 ≥128GB 机器跑 h3.c 32B 同 prompts 与 cand_4b_final.npz 对照，验证接近 cos_test=0.8144。

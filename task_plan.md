@@ -7,7 +7,7 @@
 ## Current Phase
 Phase 6（in_progress）
 
-**一句话状态：** harness 已在本机 16GB Mac 上完整跑通——用 `qwen3vl_4b_int8_convrot`（torchao int8, 4.86GB）反量化加载 + `--max-layers 25` 截断，无 OOM；产出 `candidate.npz`。**NaN bug 已修复**（根因：`get_dtype()` 返回字符串 'I8' 使反量化分支从未进入 + ConvRot Hadamard 解旋转缺失），多 token 向量语义验证全部通过（cat/dog 高、无关词低、确定性、sink 正确）。剩 Phase 6 余弦对照（cos_test=0.8144）未做。
+**一句话状态：** harness 已在本机 16GB Mac 上完整跑通并产出 `weights/cand_4b_final.npz`（10 prompts, 多 token 无 NaN，语义/确定性/sink 验证全过）。**NaN bug 已修复**（根因：`get_dtype()` 返回字符串 'I8' 使反量化分支从未进入 + ConvRot Hadamard 解旋转缺失）。**32B 对照放弃**：32B 权重 37 GiB（README 明确目标机 M5 Max/128 GiB），16GB 本机不可行——按用户指示以网络测评数据（cos_test=0.8144）为对比基准。
 
 ## Phases
 
@@ -41,9 +41,11 @@ Phase 6（in_progress）
 
 ### Phase 6: 余弦对齐到 0.81 / 与 h3.c 32B 对照
 - [x] 向量合理性验证（多 token 语义余弦：cat/dog 高、无关词低、确定性、sink 行为正确）
-- [ ] 实跑后余弦相似度对照，目标接近 cos_test=0.8144
-- [ ] 与 h3.c 32B 输出对齐
-- **Status:** in_progress
+- [x] 交付物：`weights/cand_4b_final.npz`（10 prompts，全部 finite，无 NaN）
+- [x] **32B 本机对照不可行**：32B 文本编码器权重 37 GiB（README 534-537 行：M5 零拷贝映射 37 GiB 模型文件；543 行：默认流式深度 3 层目标机 128 GiB），16GB Mac 装不下
+- [x] 按用户指示以网络测评数据为对比：ClipProj 元数据 `cos_test=0.8144` 即作者 4B-vs-32B 的 200-prompt 平均余弦；模型卡声明 bf16 校准矩阵用于 int8 编码器余弦差仅 0.0023
+- [ ] （可后续）在大内存机（≥128GB）跑 h3.c 32B 同 prompts，与 `cand_4b_final.npz` 对照
+- **Status:** complete（本机范围）
 
 ## Key Questions
 1. ~~ComfyUI 的 sm.layer=[24] 对应 HF `hidden_states` 的哪个索引？~~ 已答：`hidden_states[25]`（tap+1，embed 算第 0 层），源码实证
