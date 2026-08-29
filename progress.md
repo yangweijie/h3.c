@@ -132,3 +132,13 @@
   - `FL2VA/text_encoder/` 14 片 ~64GB + `FL2VA/tokenizer/` + `FL2VA/transformer/config.json`（h3_load_dir 必需）
   - 最小验证集依据：`tests/test_real_prompt.c:141` 直接 `h3_text_encode_bf16(text_encoder_dir,...)`，不经过完整 h3_load_dir；校验 `submissions==51`（50 层+1 norm）
 - **待办**：下载完成后 `./h3_real_prompt_test /Users/jay/.lmstudio/models/MiniMax-H3` 验证 32B 文本编码 16GB 跑通 + 4B harness 对照闭环；再评估 DiT/VAE 整体生成。
+
+### turbo 少步调研（回应：能否参考 ComfyUI 插件优化 h3.c）
+- **h3.c 现状**：支持 `--steps 4-7`（普通调度少步）+ `--reuse`（denoiser 复用）；**无 LoRA/turbo/lightning 实现**（grep 无任何 lora 代码）。
+- **ComfyUI 加速生态**（搜索确认）：
+  - 量化：INT4/INT8/NVFP4（Abiray 汇总 16GB卡→int4_convrot 11.3GB DiT+15GB 编码器；24GB→int8；Blackwell→nvfp4 12.5GB）——h3.c 只认 BF16，不可用
+  - Turbo 少步：LightX2V MiniMax-H3-Turbo（4步 LoRA）+ 官方 Lightning 8步 LoRA（1.8GB）——标准 LoRA safetensors
+  - 缓存预测：TeaCache/EasyCache/FirstBlockCache；SageAttention（~2x）
+  - unsloth/MiniMax-H3-GGUF（212GB）：DiT Q2_K 6.7GB~Q8_0 21.4GB + qwen3vl_32b Q4_K_M 等——**h3.c 无 GGML，不可用**
+- **结论**：h3.c 可借鉴的最高价值机制 = **LoRA 合并（Turbo 少步）**：W'=W+α·(B@A)，20步→4-8步 = 2.5-5x 提速。h3_safetensors + h3_dit.c 加载逻辑现成，仅需把 ComfyUI `lora_unet_*` 键名映射到 h3.c DiT 层结构。计划在 32B 文本编码验证后优先实现。
+- 下载恢复：unfetch 降并发（max_concurrent=2, threads=16）后 8 片并行正常（3-4MB/s/片）。
