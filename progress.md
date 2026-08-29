@@ -114,3 +114,21 @@
   3. `./h3_tokenizer_tests <Qwen3-VL tokenizer.json>`：**60 checks 过**——h3.c 解析真实 Qwen3-VL tokenizer.json（7MB），编码与 Qwen 词汇表兼容
   4. safetensors 探针（`h3_st_read_header`）：**成功解析真实文件**——ClipProj（9 tensors: mean_in/mean_out/mlp.0.bias...）、4B int8 convrot（1421 tensors: model.language_model.layers.0.mlp.*.weight_scale...）
 - **仍缺口**：32B 文本编码/DiT/VAE 真实权重前向（需 MiniMax-H3 原版 BF16 37GiB + 128GB 机器）。h3.c 只认 BF16 权重（`h3_text_encoder.c:225` 硬校验 H3_DTYPE_BF16），ComfyUI 的 int8_convrot 打包格式不受支持。
+
+### Phase 7 启动：16GB 跑通整体（核心目标）
+- **目标**：本次主要目的是优化 h3.c 让其在 **16GB 统一内存**上跑通 MiniMax-H3 整体（32B 文本编码 + DiT + VAE）。
+- **关键澄清（回应 4B 疑问）**：
+  - h3.c **硬编码 32B 维度**（`h3_text_encoder.h:9` `H3_TEXT_HIDDEN_SIZE 5120u`，`h3_text_encoder.c:15` TEXT_HIDDEN=5120），4B（2560 hidden）不兼容，**不能替代 32B**。
+  - 4B harness 是独立 Python 验证工具（验证 ClipProj 投影），不是 h3.c 组件。
+  - 4B harness 存在的意义 = 模拟验证投影数学，最终对照目标仍是 h3.c 32B 真实输出。
+  - d5752a0 commit 是**内存优化**（h3_memory_plan/h3_dit/h3_video_vae，让 16/24GB 跑 32B 权重），不是 4B 支持。
+  - h3.c 只认 **BF16 权重**（h3_text_encoder.c:225 硬校验 H3_DTYPE_BF16），低精度是运行时从 BF16 量化（MLP int8 引擎），无需低精度权重文件。
+- **16GB 跑通的设计基础（README 确认）**：
+  - 文本编码器：**流式 ring buffer**，8 个 I/O worker 预取未来层，Metal 执行当前层；默认 ring depth = 2（M3/16GB）/ 3（M5/128GB），`H3_QWEN_PREFETCH`/`H3_QWEN_PREFETCH_DEPTH` 可调。
+  - DiT：`--ssd-streaming`，仅小归一化权重驻留，双 BF16 槽交替 + 后台读（~14.6 GB/s 内 SSD）。
+  - M5 零拷贝映射权重；M3 copied-buffer。本机 M4 走 copied-buffer 路径。
+- **权重下载**（hf-mirror，unfetch 32 线程 ~20MB/s×5 并行）：
+  - `/Users/jay/.lmstudio/models/MiniMax-H3/`（`.lmstudio` 是软链 → `/Volumes/data/.lmstudio` 移动硬盘 1.2Ti）
+  - `FL2VA/text_encoder/` 14 片 ~64GB + `FL2VA/tokenizer/` + `FL2VA/transformer/config.json`（h3_load_dir 必需）
+  - 最小验证集依据：`tests/test_real_prompt.c:141` 直接 `h3_text_encode_bf16(text_encoder_dir,...)`，不经过完整 h3_load_dir；校验 `submissions==51`（50 层+1 norm）
+- **待办**：下载完成后 `./h3_real_prompt_test /Users/jay/.lmstudio/models/MiniMax-H3` 验证 32B 文本编码 16GB 跑通 + 4B harness 对照闭环；再评估 DiT/VAE 整体生成。

@@ -5,11 +5,19 @@
 与 h3.c 在 32B 上跑出的结果做余弦相似度对照（ClipProj 自带 cos_test=0.8144 参考值）。
 
 ## Current Phase
-全部完成（本机范围）
+Phase 7（in_progress）
 
-**一句话状态：** 4B+ClipProj 候选向量 harness 全部 6 个 phase 完成。产出 `weights/cand_4b_final.npz`（10 prompts）并附 `weights/README.md`（prompts 清单、4B 复现命令、32B 对照完整指引）。NaN 双根因修复、int8 vs fp16 对照（mean cos 0.9982）、网络测评基准（cos_test=0.8144）论证链全部闭合。32B 实证对照需 ≥128GB 机器，按 README 步骤可一键复现。
+**一句话状态：** 4B+ClipProj harness 全部 6 个 phase 完成。当前进入**核心目标阶段：在 16GB 统一内存上跑通 h3.c 整体（MiniMax-H3 32B）**。MiniMax-H3 FL2VA 权重开始下载到 `/Users/jay/.lmstudio/models/MiniMax-H3/`（软链 → 移动硬盘 1.2Ti 可用）：text_encoder 14 片（~64GB）+ tokenizer + transformer/config.json。下载完成后跑 `h3_real_prompt_test` 验证 32B 文本编码（`submissions==51` = 50 层 + norm），评估内存占用；通过后再决定 DiT/VAE 下载与整体生成。
 
 ## Phases
+
+### Phase 7: 16GB 跑通整体（h3.c + MiniMax-H3 32B）— 当前
+- [ ] 下载 MiniMax-H3 FL2VA：text_encoder 14 片（~64GB）+ tokenizer + transformer/config.json → `/Users/jay/.lmstudio/models/MiniMax-H3/`（移动硬盘）
+- [ ] `./h3_real_prompt_test /Users/jay/.lmstudio/models/MiniMax-H3` 验证 32B 文本编码在 16GB 跑通（`submissions==51`，流式 ring depth 2）
+- [ ] 对照验证链闭环：h3.c 32B 文本输出 ↔ 4B harness 候选向量（cos 目标 ≈0.8144）
+- [ ] 评估内存峰值；若 OOM 则按 h3.c 流式参数调优（`H3_QWEN_PREFETCH`/`H3_QWEN_PREFETCH_DEPTH`）
+- [ ] （通过后）下载 DiT（~58GB）+ video/audio VAE，`h3 --ssd-streaming` 整体生成验证
+- **Status:** in_progress
 
 ### Phase 1: 获取 ClipProj 仓库并校验
 - [x] ModelScope `NicoLab28/ClipProj-MiniMax-H3` 下载成功，SHA256 校验通过（feef06ef...），文件干净
