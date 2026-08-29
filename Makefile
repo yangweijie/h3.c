@@ -1,4 +1,4 @@
-CC := clang
+CC := xcrun clang
 AR := ar
 CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
