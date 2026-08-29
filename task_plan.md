@@ -9,6 +9,17 @@ Phase 8（in_progress）
 
 **一句话状态：** 4B+ClipProj harness 全部 6 个 phase 完成；**Turbo LoRA 合并已实现并通过真实 LoRA 端到端验证**（feature/lora-merge 分支）。MiniMax-H3 FL2VA 下载完成大部分：text_encoder **14/14 片（~64GB）** + tokenizer + transformer/config.json 已就位（62GB 汇总，移动硬盘）；**Turbo LoRA v1.1 4step 1.38GB 已下载并验证**。下一步：跑 `h3_real_prompt_test` 验证 32B 文本编码，然后下载 DiT/VAE 做整体生成。
 
+## Workstream B: 加速/优化任务（来自 main）
+| # | 任务 | 状态 | 验证 |
+|---|------|------|------|
+| B1 | 32B 文本编码耗时拆解 | complete | 22.5min=46.9GB@35MB/s 流式；GPU 仅 1.9s；非加载慢 |
+| B2 | 磁盘/USB 瓶颈定位 | in_progress | disk_speed.c 实测写 33MB/s；ioreg 见 USB2 Hub；待换口验证 |
+| B3 | 下载 DiT 权重(58GB) | pending | 前置：需快盘/快口 |
+| B4 | 合并 feature/lora-merge + --lora DiT 验证 | pending | DiT 权重下载后置 |
+| B5 | h3.c 外部条件注入接口 | pending | 读 npz 替换 text encoder 输出 |
+| B6 | 4B+ClipProj/MLX 文本编码 offload | pending | Phase4 已产 [seq,5120]；脚本待补入 |
+| B7 | h3.c int8 权重加载器 | pending | 方向1：int8 62→15.5GB 驻留 |
+
 ## Phases
 
 ### Phase 7: 16GB 跑通整体（h3.c + MiniMax-H3 32B）— 大部分完成
@@ -108,3 +119,8 @@ Phase 8（in_progress）
 - Update phase status as you progress: pending → in_progress → complete
 - Re-read this plan before major decisions (attention manipulation)
 - Log ALL errors - they help avoid repetition
+
+## Open Questions（来自 main）
+- Phase 4 MLX 脚本在哪、是否补入 h3.c 仓库？
+- 外部条件注入接口的具体 API 形态？
+- int8 加载器（B7）vs 4B offload（B6）哪个优先落地？

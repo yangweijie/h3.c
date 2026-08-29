@@ -27,6 +27,7 @@
 
 ### Environment note
 - 用户建议后续用 `uv` 做可复现安装（`uv venv` + `uv pip install` + `uv.lock`）。当前 pip 已跑通，先不动，作为后续环境方案。
+- 注意：`disk_speed.c` 在父目录 `/Volumes/data/git/c/`，不在 h3.c 仓库；提交需在该仓库进行。
 
 ## 2026-08-29（后续）
 ### 规划文件规范化
