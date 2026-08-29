@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_lora.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -87,6 +88,7 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
+    h3_lora *lora;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -522,6 +524,42 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
 #undef LOAD1
 #undef LOAD2
+    if (dit->lora) {
+        /* Map the native prefix onto the Diffusers LoRA namespace.
+         * "blocks.N." -> "transformer_blocks.N", and
+         * "token_refiner.blocks.N." -> "token_refiner.refiner_blocks.N". */
+        char lora_prefix[64] = "";
+        size_t prefix_length = strlen(prefix);
+        if (!strncmp(prefix, "blocks.", 7) && prefix_length > 8) {
+            snprintf(lora_prefix, sizeof(lora_prefix), "transformer_blocks.%.*s",
+                     (int)(prefix_length - 8), prefix + 7);
+        } else if (!strncmp(prefix, "token_refiner.blocks.", 21) &&
+                   prefix_length > 22) {
+            snprintf(lora_prefix, sizeof(lora_prefix),
+                     "token_refiner.refiner_blocks.%.*s",
+                     (int)(prefix_length - 22), prefix + 21);
+        }
+        if (lora_prefix[0] &&
+            (!h3_lora_apply(dit->gpu, dit->lora, block->qkv, lora_prefix,
+                            "attn.to_q", 0, INNER, HIDDEN,
+                            error, error_size) ||
+             !h3_lora_apply(dit->gpu, dit->lora, block->qkv, lora_prefix,
+                            "attn.to_k", INNER, INNER, HIDDEN,
+                            error, error_size) ||
+             !h3_lora_apply(dit->gpu, dit->lora, block->qkv, lora_prefix,
+                            "attn.to_v", 2 * INNER, INNER, HIDDEN,
+                            error, error_size) ||
+             !h3_lora_apply(dit->gpu, dit->lora, block->out, lora_prefix,
+                            "attn.to_out.0", 0, HIDDEN, INNER,
+                            error, error_size) ||
+             !h3_lora_apply(dit->gpu, dit->lora, block->fc1, lora_prefix,
+                            "ff.net.0.proj", 0, FFN * 2, HIDDEN,
+                            error, error_size) ||
+             !h3_lora_apply(dit->gpu, dit->lora, block->fc2, lora_prefix,
+                            "ff.net.2", 0, HIDDEN, FFN,
+                            error, error_size)))
+            return 0;
+    }
     return 1;
 }
 
@@ -1616,6 +1654,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         unsigned core_reuse_interval,
                         int token_reduction,
                         int ssd_streaming,
+                        const char *lora_path,
                         float spatial_rope_scale,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
@@ -1658,6 +1697,15 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->core_reuse_interval = core_reuse_interval;
     dit->ssd_streaming = ssd_streaming;
     dit->spatial_rope_scale = spatial_rope_scale;
+    if (lora_path && *lora_path) {
+        if (ssd_streaming) {
+            fail(error, error_size,
+                 "LoRA merging is not supported with --ssd-streaming");
+            goto failed;
+        }
+        dit->lora = h3_lora_open(lora_path, error, error_size);
+        if (!dit->lora) goto failed;
+    }
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
@@ -1760,6 +1808,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int ssd_streaming,
+                         const char *lora_path,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
@@ -1777,6 +1826,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
+                    lora_path,
                     spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
@@ -1802,6 +1852,7 @@ h3_dit *h3_dit_load_conditioned(
                          unsigned core_reuse_interval,
                          int token_reduction,
                          int ssd_streaming,
+                         const char *lora_path,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
@@ -1823,6 +1874,7 @@ h3_dit *h3_dit_load_conditioned(
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
+                    lora_path,
                     spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
@@ -3112,6 +3164,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
+    if (dit->lora) h3_lora_close(dit->lora);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,

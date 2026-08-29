@@ -96,6 +96,10 @@ typedef struct {
     /* Keep only two original BF16 DiT blocks in memory and overlap reading the
      * next block from the checkpoint with execution of the current block. */
     int ssd_streaming;
+    /* Optional Turbo/distillation LoRA safetensors merged into the DiT weights
+     * at load time (4-step/8-step schedulers). Cannot be combined with
+     * ssd_streaming. */
+    const char *lora_path;
     /* Stream the video VAE decoder weights instead of keeping the whole decoder
      * resident. Off by default; the auto memory planner (h3_memory_plan) turns
      * it on when the device working set is tight. */

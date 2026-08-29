@@ -1,4 +1,4 @@
-CC := clang
+CC := xcrun clang
 AR := ar
 CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
@@ -9,7 +9,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c h3_memory_plan.c
+	h3_dit_schedule.c h3_dit.c h3_lora.c h3_memory_plan.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -37,6 +37,9 @@ h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_lora_tests: tests/test_lora.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
