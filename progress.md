@@ -142,3 +142,10 @@
   - unsloth/MiniMax-H3-GGUF（212GB）：DiT Q2_K 6.7GB~Q8_0 21.4GB + qwen3vl_32b Q4_K_M 等——**h3.c 无 GGML，不可用**
 - **结论**：h3.c 可借鉴的最高价值机制 = **LoRA 合并（Turbo 少步）**：W'=W+α·(B@A)，20步→4-8步 = 2.5-5x 提速。h3_safetensors + h3_dit.c 加载逻辑现成，仅需把 ComfyUI `lora_unet_*` 键名映射到 h3.c DiT 层结构。计划在 32B 文本编码验证后优先实现。
 - 下载恢复：unfetch 降并发（max_concurrent=2, threads=16）后 8 片并行正常（3-4MB/s/片）。
+
+### LoRA 合并实现完成 + 真实 LoRA 端到端验证（feature/lora-merge 分支）
+- 实现：h3_lora.c/h（解析 Diffusers 风格 BF16 LoRA，rank 从 lora_A 读，scale=alpha/rank，GPU linear 算 B@A，host 行带写回）+ h3_dit.c load_block 6 目标合并 + main.c `--lora PATH` + h3_gpu.m read_bf16_range + Makefile 改用 xcrun clang（Homebrew clang16 无法编译 macOS26 SDK MPSGraph）
+- 合成验证：tests/test_lora.c 真实维度×F64 参考，rel-L2 0.29%，qkv 三带/4 组权重/缺失 no-op 全过
+- **真实 LoRA 验证**（ModelScope 下载 v1.1 4step 1.38GB）：624 张量、312 个目标键全匹配、alpha=128→scale=1.0、to_out.0 合并 rel-L2 0.175% PASS
+- 用法：`h3 --lora /Users/jay/.lmstudio/models/LightX2V/MiniMax-H3-Turbo/minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors --steps 4`
+- 限制：与 --ssd-streaming 互斥（流式路径未接入合并）
