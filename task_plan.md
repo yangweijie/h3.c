@@ -42,8 +42,16 @@
   → `int8_mlp/qkv/attention_out` 恒为 0 → int8+流式量化路径在本硬件上不可达。
 - **结论**：本机仅能验证 BF16 流式（P3/P4 一致通过）；streamed-block int8 + 流式路径需 **M5 类 GPU** 才能端到端验证，当前硬件无法覆盖。
 
-### P5 提速优化 — `pending`（待用户拍板）
-- 砍步数（4→更少）、砍帧数、MPS 首步编译预热缓存、量化整盘常驻、低像素+超分。
+### P5 提速优化 — `in_progress`（诊断完成，受硬件硬上限约束）
+- 实测瓶颈（H3_PROFILE）：`BF16 SSD stream 72.495 GiB read in 94.376s (0.768 GiB/s), unhidden wait 78.894s`。
+- 模型在 **USB SSD**（`/Volumes/data`，814 MB/s，Protocol: USB）；内部盘 `/` 仅 43Gi 空闲装不下 134GB → 无法搬去更快存储。
+- 本机非 M5 → int8 量化不可用；16GB RAM < 134GB → 无法常驻。
+- 结论：生成耗时被 USB 读速硬封顶（每个去噪步 ~47s I/O）。软件杠杆在此硬件收益极小：
+  - steps 4→2 实测仅省 ~26s（244s→214s）；frames/res 已压到 16/256。
+  - MPS 预热、core_reuse、token_reduction 均不解决 I/O 瓶颈。
+- 唯一有实质收益的方向（待用户拍板）：
+  (a) 更深流式预取（增加 stream slot / prefetch 深度）回收部分 79s unhidden wait（~30-40% 潜力，但改动刚修好的流式核心有风险）；
+  (b) 换更快模型盘（Thunderbolt/USB4 SSD）或 M5 / >64GB RAM（硬件层面根治）。
 
 ### P6 验证 lora 合并 + 流式 — `blocked`（代码硬限制）
 - `h3_dit.c:1712-1716`：若 `lora_path` 非空且 `ssd_streaming`，直接 `fail("LoRA merging is not supported with --ssd-streaming")`。
@@ -60,3 +68,9 @@
 | "int8 quantization of streamed DiT block failed" | P3 | 反遮罩错误文案 → 露出真错 "DiT SSD stream submit failed" |
 | "DiT SSD stream submit failed" | P3 | P2 修复：int8 关时跳过 submit |
 | "LoRA merge incompatible with SSD streaming"（早期 lora 失败） | P1 | P1 修复：仅拦截 row-fc2 int8 与流式组合 |
+
+### P7 4B vs 50 层 性能计时对比 — `complete`
+- 编码器隔离：4B 7.93s / 5.4 GiB vs 50 层 52.41s / 46.86 GiB（4B 快 **6.6×**、权重少 **8.7×**）。
+- 完整生成（256×256 / 16 帧 / steps 4 / ssd-streaming）：4B **251.25s** vs 50 层 **292.80s**（4B 省 **~41.5s ≈14%**）。
+- 结论：文本编码器**非总时长瓶颈**（DiT/VAE/流式 I/O 占 `sys` 52–61s）；换 4B 价值在**省内存/权重体积与编码启动延迟**，非显著缩短总生成时间。生产 `--steps 20` 时编码器占比更小、收益进一步缩小。
+- 陷阱：`H3_CLIPPROJ_DIR` 持久导出导致首次"50 层"实测仍是 4B（251.05s），须 `env -u`/`unset` 强制默认路径。

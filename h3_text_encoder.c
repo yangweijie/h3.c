@@ -780,6 +780,519 @@ early_cleanup:
     return 0;
 }
 
+/* ---- ClipProj in-engine text encoder -------------------------------------
+ * Runs Qwen3-VL-4B (truncated to tap+1 layers) on Metal reusing the same
+ * gpu ops as the 50-layer encoder, then lifts the tapped 2560-dim hidden to
+ * the 5120-dim H3 conditioning space with the ClipProj MLP. Dimensions are
+ * read from the 4B weights so the function stays robust to config changes. */
+
+#define CP_TAP_LAYERS 25          /* harness tap=24 -> hidden_states[25] */
+#define CP_HEAD_DIM 128
+#define CP_ROPE_HALF (CP_HEAD_DIM / 2)
+#define CP_ROPE_THETA 5000000.0f
+#define CP_MLP_HIDDEN 32768       /* ClipProj inner dim (2560 -> 32768 -> 5120) */
+#define CP_OUT_DIM 5120
+#define CP_RMS_EPS 1e-6f
+#define CP_VOCAB 151936
+
+static float cp_bf16_to_f32(uint16_t h) {
+    uint32_t bits = ((uint32_t)h) << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static uint16_t cp_f32_to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    bits &= UINT32_C(0xffff0000);
+    return (uint16_t)(bits >> 16);
+}
+
+static float cp_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) & 1u;
+    uint32_t exp = (uint32_t)(h >> 10) & 0x1fu;
+    uint32_t mant = (uint32_t)(h & 0x3ffu);
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        float f = (float)mant * 5.9604644775390625e-8f;  /* 2^-24 */
+        return sign ? -f : f;
+    }
+    if (exp == 0x1fu) {
+        uint32_t r = (sign << 31) | 0x7f800000u | (mant ? 0x7fffffu : 0u);
+        float f;
+        memcpy(&f, &r, sizeof(f));
+        return f;
+    }
+    uint32_t r = (sign << 31) | ((exp - 15u + 127u) << 23) | (mant << 13);
+    float f;
+    memcpy(&f, &r, sizeof(f));
+    return f;
+}
+
+static h3_gpu_tensor *cp_load_2d(h3_gpu *gpu, const h3_weight_store *store,
+                                 const char *name, uint64_t rows, uint64_t cols,
+                                 char *error, size_t error_size) {
+    uint64_t shape[] = {rows, cols};
+    return h3_weight_load_bf16(store, gpu, name, 2, shape, error, error_size);
+}
+
+static h3_gpu_tensor *cp_load_1d(h3_gpu *gpu, const h3_weight_store *store,
+                                 const char *name, uint64_t dim,
+                                 char *error, size_t error_size) {
+    uint64_t shape[] = {dim};
+    return h3_weight_load_bf16(store, gpu, name, 1, shape, error, error_size);
+}
+
+/* Read a tensor from a weight store, always upcast to host float32 (the
+ * ClipProj projection file stores F16 weights; the Python harness upcasts too). */
+static int cp_load_f32(const h3_weight_store *store, const char *name,
+                       float **out, size_t *count,
+                       char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor) {
+        fail(error, error_size, "ClipProj projection tensor absent: %s", name);
+        return 0;
+    }
+    size_t n = (size_t)h3_st_tensor_elements(tensor);
+    float *buf = malloc(n * sizeof(float));
+    if (!buf) {
+        fail(error, error_size, "out of memory reading ClipProj %s", name);
+        return 0;
+    }
+    if (tensor->dtype == H3_DTYPE_F32) {
+        if (!h3_st_read_data(header, tensor, buf, n * sizeof(float),
+                             error, error_size)) { free(buf); return 0; }
+    } else if (tensor->dtype == H3_DTYPE_F16) {
+        uint16_t *raw = malloc(n * sizeof(uint16_t));
+        if (!raw) { free(buf);
+                    fail(error, error_size, "oom reading ClipProj %s", name);
+                    return 0; }
+        if (!h3_st_read_data(header, tensor, raw, n * sizeof(uint16_t),
+                             error, error_size)) { free(raw); free(buf); return 0; }
+        for (size_t i = 0; i < n; i++) buf[i] = cp_f16_to_f32(raw[i]);
+        free(raw);
+    } else {
+        fail(error, error_size, "ClipProj tensor %s is %s, expected F32/F16",
+             name, h3_dtype_name(tensor->dtype));
+        free(buf);
+        return 0;
+    }
+    *out = buf;
+    *count = n;
+    return 1;
+}
+
+static float cp_gelu(float x) {
+    return 0.5f * x * (1.0f + erff(x / (float)M_SQRT2));
+}
+
+static int cp_encode_layer(h3_gpu *gpu, const text_layer_weights *w,
+                           uint32_t tokens, h3_gpu_tensor *hidden,
+                           h3_gpu_tensor *norm, h3_gpu_tensor *query,
+                           h3_gpu_tensor *key, h3_gpu_tensor *value,
+                           h3_gpu_tensor *attention_heads,
+                           h3_gpu_tensor *attention_output,
+                           h3_gpu_tensor *gate, h3_gpu_tensor *up,
+                           h3_gpu_tensor *mlp_output,
+                           h3_gpu_tensor *rope_cos, h3_gpu_tensor *rope_sin,
+                           uint64_t H, uint64_t I, uint64_t QD, uint64_t KVD,
+                           int QH, int KVH, char *error, size_t error_size) {
+#define CP_OP(call, label) do {                                            \
+    if (!gpu_operation(gpu, (call), error, error_size, label, -1)) return 0; \
+} while (0)
+    CP_OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, w->input_norm,
+                                tokens, (int)H, CP_RMS_EPS), "input RMSNorm");
+    CP_OP(h3_gpu_linear_bf16(gpu, query, norm, w->query, NULL, tokens,
+                             (int)H, (int)QD), "query projection");
+    CP_OP(h3_gpu_linear_bf16(gpu, key, norm, w->key, NULL, tokens,
+                             (int)H, (int)KVD), "key projection");
+    CP_OP(h3_gpu_linear_bf16(gpu, value, norm, w->value, NULL, tokens,
+                             (int)H, (int)KVD), "value projection");
+    CP_OP(h3_gpu_head_rms_norm_bf16(gpu, query, w->query_norm, tokens,
+                                    QH, CP_HEAD_DIM, CP_RMS_EPS), "query RMSNorm");
+    CP_OP(h3_gpu_head_rms_norm_bf16(gpu, key, w->key_norm, tokens,
+                                    KVH, CP_HEAD_DIM, CP_RMS_EPS), "key RMSNorm");
+    CP_OP(h3_gpu_rope_text_bf16(gpu, query, key, rope_cos, rope_sin, tokens,
+                                 QH, KVH, CP_HEAD_DIM), "RoPE");
+    {
+        const char *qd = getenv("H3_CLIPPROJ_DUMP_QROPE");
+        if (qd) {
+            uint16_t *qb = malloc(tokens * (size_t)QD * sizeof(uint16_t));
+            if (qb && h3_gpu_tensor_read_bf16(query, qb, tokens * (size_t)QD)) {
+                FILE *qf = fopen(qd, "wb");
+                if (qf) {
+                    uint32_t seq = (uint32_t)tokens, dim = (uint32_t)QD;
+                    fwrite(&seq, sizeof(seq), 1, qf);
+                    fwrite(&dim, sizeof(dim), 1, qf);
+                    for (size_t i = 0; i < tokens * (size_t)QD; i++) {
+                        float v = cp_bf16_to_f32(qb[i]);
+                        fwrite(&v, sizeof(v), 1, qf);
+                    }
+                    fclose(qf);
+                }
+                free(qb);
+            }
+        }
+    }
+    CP_OP(h3_gpu_gqa_causal_bf16(gpu, attention_heads, query, key, value,
+                                  tokens, QH, KVH, CP_HEAD_DIM,
+                                  1.0f / (float)sqrt((float)CP_HEAD_DIM)),
+         "causal GQA");
+    CP_OP(h3_gpu_linear_bf16(gpu, attention_output, attention_heads,
+                             w->attention_output, NULL, tokens, (int)QD, (int)H),
+         "attention output projection");
+    CP_OP(h3_gpu_add_bf16(gpu, hidden, hidden, attention_output,
+                          tokens * (int)H), "attention residual");
+    {
+        const char *ad = getenv("H3_CLIPPROJ_DUMP_ATTN");
+        if (ad) {
+            uint16_t *ah = malloc(tokens * (size_t)H * sizeof(uint16_t));
+            if (ah && h3_gpu_tensor_read_bf16(hidden, ah, tokens * (size_t)H)) {
+                FILE *af = fopen(ad, "wb");
+                if (af) {
+                    uint32_t seq = (uint32_t)tokens, hd = (uint32_t)H;
+                    fwrite(&seq, sizeof(seq), 1, af);
+                    fwrite(&hd, sizeof(hd), 1, af);
+                    for (size_t i = 0; i < tokens * (size_t)H; i++) {
+                        float v = cp_bf16_to_f32(ah[i]);
+                        fwrite(&v, sizeof(v), 1, af);
+                    }
+                    fclose(af);
+                }
+                free(ah);
+            }
+        }
+    }
+    CP_OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, w->post_norm, tokens,
+                               (int)H, CP_RMS_EPS), "post-attention RMSNorm");
+    CP_OP(h3_gpu_linear_bf16(gpu, gate, norm, w->gate, NULL, tokens,
+                             (int)H, (int)I), "MLP gate");
+    CP_OP(h3_gpu_linear_bf16(gpu, up, norm, w->up, NULL, tokens,
+                             (int)H, (int)I), "MLP up");
+    CP_OP(h3_gpu_silu_mul_bf16(gpu, gate, gate, up, tokens * (int)I),
+         "fused SwiGLU");
+    CP_OP(h3_gpu_linear_bf16(gpu, mlp_output, gate, w->down, NULL, tokens,
+                             (int)I, (int)H), "MLP down");
+    CP_OP(h3_gpu_add_bf16(gpu, hidden, hidden, mlp_output, tokens * (int)H),
+         "MLP residual");
+#undef CP_OP
+    return 1;
+}
+
+int h3_text_encode_clipproj_bf16(const char *qwen4b_directory,
+                                 const char *projection_directory,
+                                 const char *shader_source_path,
+                                 const uint32_t *token_ids, size_t token_count,
+                                 h3_text_progress progress, void *progress_opaque,
+                                 h3_text_embedding *output,
+                                 char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (!qwen4b_directory || !projection_directory || !shader_source_path ||
+        !token_ids || !token_count || token_count > UINT32_MAX) {
+        fail(error, error_size, "invalid ClipProj text encoder arguments");
+        return 0;
+    }
+    for (size_t i = 0; i < token_count; i++)
+        if (token_ids[i] >= CP_VOCAB) {
+            fail(error, error_size, "ClipProj token ID %u out of vocabulary",
+                 token_ids[i]);
+            return 0;
+        }
+    int tap_layers = CP_TAP_LAYERS;
+    const char *tl = getenv("H3_CLIPPROJ_LAYERS");
+    if (tl && atoi(tl) > 0) tap_layers = atoi(tl);
+
+    h3_weight_store *store = h3_weight_store_open(qwen4b_directory, error,
+                                                 error_size);
+    if (!store) return 0;
+    h3_weight_store *pstore = h3_weight_store_open(projection_directory, error,
+                                                  error_size);
+    if (!pstore) { h3_weight_store_free(store); return 0; }
+
+    /* Derive dims from the 4B weights (robust to config changes). */
+    const h3_st_header *h = NULL;
+    const h3_st_tensor *t;
+    uint64_t H = 0, I = 0, QD = 0, KVD = 0;
+    int ok = 1;
+    if (!(t = h3_weight_find(store, "model.language_model.embed_tokens.weight",
+                             &h)) ||
+        t->ndim != 2) { fail(error, error_size, "4B embed_tokens missing"); ok = 0; }
+    else H = t->shape[1];
+    if (ok && (t = h3_weight_find(store,
+            "model.language_model.layers.0.self_attn.q_proj.weight", &h)) &&
+        t->ndim == 2) QD = t->shape[0];
+    else { fail(error, error_size, "4B q_proj missing"); ok = 0; }
+    if (ok && (t = h3_weight_find(store,
+            "model.language_model.layers.0.self_attn.k_proj.weight", &h)) &&
+        t->ndim == 2) KVD = t->shape[0];
+    else { fail(error, error_size, "4B k_proj missing"); ok = 0; }
+    if (ok && (t = h3_weight_find(store,
+            "model.language_model.layers.0.mlp.gate_proj.weight", &h)) &&
+        t->ndim == 2) I = t->shape[0];
+    else { fail(error, error_size, "4B gate_proj missing"); ok = 0; }
+    int QH = (int)(QD / CP_HEAD_DIM), KVH = (int)(KVD / CP_HEAD_DIM);
+    if (!ok || H == 0 || I == 0 || QD == 0 || KVD == 0 || QH < 1 || KVH < 1) {
+        h3_weight_store_free(pstore);
+        h3_weight_store_free(store);
+        return 0;
+    }
+
+    /* Load ClipProj F32 projection tensors. */
+    float *mean_in = NULL, *std_in = NULL, *mean_out = NULL, *std_out = NULL;
+    float *sink_out = NULL, *w0 = NULL, *b0 = NULL, *w2 = NULL, *b2 = NULL;
+    size_t n_unused;
+    ok = cp_load_f32(pstore, "mean_in", &mean_in, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "std_in", &std_in, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "mean_out", &mean_out, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "std_out", &std_out, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "sink_out", &sink_out, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "mlp.0.weight", &w0, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "mlp.0.bias", &b0, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "mlp.2.weight", &w2, &n_unused, error, error_size) &&
+         cp_load_f32(pstore, "mlp.2.bias", &b2, &n_unused, error, error_size);
+    if (!ok) {
+        free(mean_in); free(std_in); free(mean_out); free(std_out);
+        free(sink_out); free(w0); free(b0); free(w2); free(b2);
+        h3_weight_store_free(pstore);
+        h3_weight_store_free(store);
+        return 0;
+    }
+
+    h3_gpu *gpu = h3_gpu_create(shader_source_path, error, error_size);
+    if (!gpu) {
+        free(mean_in); free(std_in); free(mean_out); free(std_out);
+        free(sink_out); free(w0); free(b0); free(w2); free(b2);
+        h3_weight_store_free(pstore);
+        h3_weight_store_free(store);
+        return 0;
+    }
+
+    uint32_t tokens = (uint32_t)token_count;
+    size_t hidden_count = token_count * H;
+    size_t q_count = token_count * QD;
+    size_t kv_count = token_count * KVD;
+    size_t inter_count = token_count * I;
+
+    /* RoPE tables (1D positions, text-only mRoPE). */
+    float *cosines = malloc(token_count * CP_ROPE_HALF * sizeof(float));
+    float *sines = malloc(token_count * CP_ROPE_HALF * sizeof(float));
+    float inv_freq[CP_ROPE_HALF];
+    for (size_t i = 0; i < CP_ROPE_HALF; i++)
+        inv_freq[i] = 1.0f / powf(CP_ROPE_THETA,
+                                   (float)(i * 2) / (float)CP_HEAD_DIM);
+    for (size_t pos = 0; pos < token_count; pos++)
+        for (size_t i = 0; i < CP_ROPE_HALF; i++) {
+            float angle = (float)pos * inv_freq[i];
+            cosines[pos * CP_ROPE_HALF + i] = cosf(angle);
+            sines[pos * CP_ROPE_HALF + i] = sinf(angle);
+        }
+
+    int rc = 0;
+    h3_gpu_tensor *ids = h3_gpu_tensor_from_u32(gpu, token_ids, token_count);
+    h3_gpu_tensor *rope_cos = h3_gpu_tensor_from_f32(gpu, cosines,
+                                                     token_count * CP_ROPE_HALF);
+    h3_gpu_tensor *rope_sin = h3_gpu_tensor_from_f32(gpu, sines,
+                                                     token_count * CP_ROPE_HALF);
+    h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *norm = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *query = h3_gpu_tensor_new_bf16(gpu, q_count);
+    h3_gpu_tensor *key = h3_gpu_tensor_new_bf16(gpu, kv_count);
+    h3_gpu_tensor *value = h3_gpu_tensor_new_bf16(gpu, kv_count);
+    h3_gpu_tensor *attention_heads = h3_gpu_tensor_new_bf16(gpu, q_count);
+    h3_gpu_tensor *attention_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *gate = h3_gpu_tensor_new_bf16(gpu, inter_count);
+    h3_gpu_tensor *up = h3_gpu_tensor_new_bf16(gpu, inter_count);
+    h3_gpu_tensor *mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *activations[] = {ids, rope_cos, rope_sin, hidden, norm,
+        query, key, value, attention_heads, attention_output, gate, up,
+        mlp_output};
+    for (size_t i = 0; i < sizeof(activations)/sizeof(*activations); i++)
+        if (!activations[i]) { fail(error, error_size, "ClipProj alloc failed");
+                               goto cp_cleanup; }
+
+    h3_gpu_tensor *embed = cp_load_2d(gpu, store,
+        "model.language_model.embed_tokens.weight", CP_VOCAB, H,
+        error, error_size);
+    if (!embed) goto cp_cleanup;
+    if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
+                       "stream begin", -1) ||
+        !gpu_operation(gpu, h3_gpu_embedding_bf16(gpu, hidden, embed, ids,
+                         tokens, (int)CP_VOCAB, (int)H), error, error_size,
+                       "embedding lookup", -1) ||
+        !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
+                       "embedding submit", -1)) goto cp_cleanup;
+    h3_gpu_tensor_free(embed);
+
+    /* Optional dump of the post-embedding hidden (pre-layer) for fidelity
+       debugging (compares against harness hidden_states[0]). */
+    const char *embed_dump = getenv("H3_CLIPPROJ_DUMP_EMBED");
+    if (embed_dump) {
+        uint16_t *he = malloc(hidden_count * sizeof(uint16_t));
+        if (he && h3_gpu_tensor_read_bf16(hidden, he, hidden_count)) {
+            FILE *ef = fopen(embed_dump, "wb");
+            if (ef) {
+                uint32_t seq = (uint32_t)token_count, hd = (uint32_t)H;
+                fwrite(&seq, sizeof(seq), 1, ef);
+                fwrite(&hd, sizeof(hd), 1, ef);
+                for (size_t i = 0; i < hidden_count; i++) {
+                    float v = cp_bf16_to_f32(he[i]);
+                    fwrite(&v, sizeof(v), 1, ef);
+                }
+                fclose(ef);
+            }
+            free(he);
+        }
+    }
+
+    text_layer_weights w;
+    memset(&w, 0, sizeof(w));
+    char prefix[96];
+    for (int layer = 0; layer < tap_layers; layer++) {
+        snprintf(prefix, sizeof(prefix),
+                 "model.language_model.layers.%d.", layer);
+#define CP_L(name, field, rows, cols) do {                                  \
+        char _n[192];                                                       \
+        snprintf(_n, sizeof(_n), "%s%s", prefix, name);                     \
+        w.field = cp_load_2d(gpu, store, _n, rows, cols,                    \
+                             error, error_size);                            \
+        if (!w.field) goto cp_cleanup;                                      \
+    } while (0)
+#define CP_L1(name, field, dim) do {                                         \
+        char _n[192];                                                       \
+        snprintf(_n, sizeof(_n), "%s%s", prefix, name);                     \
+        w.field = cp_load_1d(gpu, store, _n, dim, error, error_size);        \
+        if (!w.field) goto cp_cleanup;                                      \
+    } while (0)
+        CP_L1("input_layernorm.weight", input_norm, H);
+        CP_L("self_attn.q_proj.weight", query, QD, H);
+        CP_L("self_attn.k_proj.weight", key, KVD, H);
+        CP_L("self_attn.v_proj.weight", value, KVD, H);
+        CP_L1("self_attn.q_norm.weight", query_norm, CP_HEAD_DIM);
+        CP_L1("self_attn.k_norm.weight", key_norm, CP_HEAD_DIM);
+        CP_L("self_attn.o_proj.weight", attention_output, H, QD);
+        CP_L1("post_attention_layernorm.weight", post_norm, H);
+        CP_L("mlp.gate_proj.weight", gate, I, H);
+        CP_L("mlp.up_proj.weight", up, I, H);
+        CP_L("mlp.down_proj.weight", down, H, I);
+#undef CP_L1
+#undef CP_L
+        if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
+                           "layer begin", layer) ||
+            !cp_encode_layer(gpu, &w, tokens, hidden, norm, query, key, value,
+                             attention_heads, attention_output, gate, up,
+                             mlp_output, rope_cos, rope_sin, H, I, QD, KVD,
+                             QH, KVH, error, error_size) ||
+            !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
+                           "layer submit", layer)) goto cp_cleanup;
+        h3_gpu_tensor_free(w.input_norm); h3_gpu_tensor_free(w.query);
+        h3_gpu_tensor_free(w.key); h3_gpu_tensor_free(w.value);
+        h3_gpu_tensor_free(w.query_norm); h3_gpu_tensor_free(w.key_norm);
+        h3_gpu_tensor_free(w.attention_output); h3_gpu_tensor_free(w.post_norm);
+        h3_gpu_tensor_free(w.gate); h3_gpu_tensor_free(w.up);
+        h3_gpu_tensor_free(w.down);
+        memset(&w, 0, sizeof(w));
+        if (progress) progress(layer + 1, tap_layers, progress_opaque);
+    }
+
+    /* Apply the model's final RMSNorm before tapping. HF / ComfyUI clip the
+       normed hidden (hidden_states[tap+1]); without it token 0's residual
+       stream is still in its ~4700-magnitude exploded state and every token's
+       direction drifts, collapsing the cosine vs the reference to ~0.7. */
+    h3_gpu_tensor *final_norm = cp_load_1d(gpu, store,
+        "model.language_model.norm.weight", H, error, error_size);
+    if (!final_norm) goto cp_cleanup;
+    if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
+                       "final-norm begin", -1) ||
+        !gpu_operation(gpu, h3_gpu_rms_norm_bf16(gpu, hidden, hidden,
+                         final_norm, tokens, (int)H, CP_RMS_EPS), error,
+                       error_size, "final RMSNorm", -1) ||
+        !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
+                       "final-norm submit", -1)) {
+        h3_gpu_tensor_free(final_norm);
+        goto cp_cleanup;
+    }
+    h3_gpu_tensor_free(final_norm);
+
+    /* Read tapped 2560-dim hidden and run ClipProj MLP on CPU. */
+    uint16_t *host_hidden = malloc(hidden_count * sizeof(uint16_t));
+    if (!host_hidden) { fail(error, error_size, "out of memory (host hidden)");
+                       goto cp_cleanup; }
+    if (!h3_gpu_tensor_read_bf16(hidden, host_hidden, hidden_count)) {
+        fail(error, error_size, "cannot read ClipProj tapped hidden");
+        free(host_hidden);
+        goto cp_cleanup;
+    }
+    /* Optional dump of the tapped 2560-dim hidden (pre-MLP) for fidelity
+       debugging: writes [seq u32][dim u32][seq*dim float32]. */
+    const char *hidden_dump = getenv("H3_CLIPPROJ_DUMP_HIDDEN");
+    if (hidden_dump) {
+        FILE *hf = fopen(hidden_dump, "wb");
+        if (hf) {
+            uint32_t seq = (uint32_t)token_count, hd = (uint32_t)H;
+            fwrite(&seq, sizeof(seq), 1, hf);
+            fwrite(&hd, sizeof(hd), 1, hf);
+            for (size_t i = 0; i < hidden_count; i++) {
+                float v = cp_bf16_to_f32(host_hidden[i]);
+                fwrite(&v, sizeof(v), 1, hf);
+            }
+            fclose(hf);
+        }
+    }
+    size_t total_out = token_count * CP_OUT_DIM;
+    uint16_t *outv = malloc(total_out * sizeof(uint16_t));
+    if (!outv) { fail(error, error_size, "out of memory (output)");
+                free(host_hidden); goto cp_cleanup; }
+    float *xn = malloc(H * sizeof(float));
+    float *xm = malloc(CP_MLP_HIDDEN * sizeof(float));
+    float *cond = malloc(CP_OUT_DIM * sizeof(float));
+    if (!xn || !xm || !cond) {
+        fail(error, error_size, "out of memory (mlp buffers)");
+        free(host_hidden); free(outv); free(xn); free(xm); free(cond);
+        goto cp_cleanup;
+    }
+    for (size_t tok = 0; tok < token_count; tok++) {
+        const uint16_t *row = host_hidden + tok * H;
+        for (uint64_t c = 0; c < H; c++)
+            xn[c] = (cp_bf16_to_f32(row[c]) - mean_in[c]) / std_in[c];
+        for (size_t r = 0; r < CP_MLP_HIDDEN; r++) {
+            const float *wr = w0 + r * H;
+            float acc = b0[r];
+            for (uint64_t c = 0; c < H; c++) acc += xn[c] * wr[c];
+            xm[r] = cp_gelu(acc);
+        }
+        for (size_t r = 0; r < CP_OUT_DIM; r++) {
+            const float *wr = w2 + r * CP_MLP_HIDDEN;
+            float acc = b2[r];
+            for (uint64_t c = 0; c < CP_MLP_HIDDEN; c++) acc += xm[c] * wr[c];
+            cond[r] = acc * std_out[r] + mean_out[r];
+        }
+        if (sink_out && tok == 0)
+            for (size_t r = 0; r < CP_OUT_DIM; r++) cond[r] = sink_out[r];
+        for (size_t r = 0; r < CP_OUT_DIM; r++)
+            outv[tok * CP_OUT_DIM + r] = cp_f32_to_bf16(cond[r]);
+    }
+    free(xn); free(xm); free(cond); free(host_hidden);
+
+    output->values = outv;
+    output->tokens = token_count;
+    output->width = CP_OUT_DIM;
+    if (h3_gpu_get_stats(gpu, &output->gpu_stats)) rc = 1;
+
+cp_cleanup:
+    free(mean_in); free(std_in); free(mean_out); free(std_out);
+    free(sink_out); free(w0); free(b0); free(w2); free(b2);
+    for (size_t i = 0; i < sizeof(activations)/sizeof(*activations); i++)
+        h3_gpu_tensor_free(activations[i]);
+    h3_gpu_free(gpu);
+    h3_weight_store_free(pstore);
+    h3_weight_store_free(store);
+    if (!rc && output->values) { free(output->values); output->values = NULL; }
+    return rc;
+}
+
 int h3_text_encode_bf16(const char *weight_directory,
                         const char *shader_source_path,
                         const uint32_t *token_ids, size_t token_count,

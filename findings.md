@@ -79,6 +79,17 @@ ds4 是同类 native 推理引擎，已解决"小内存 Mac + SSD streaming"问�
   2. streamed-block int8 + 流式量化/submit 路径（P2 修复的代码）**需 M5 类 GPU 才能端到端验证**；当前硬件无法覆盖。
   3. `use_int8_row_fc2`（行式 fc2 int8）另有 `h3.c:563` 的 `!h3_device(ctx)->metal4` 门槛，同样依赖新硬件（Metal 4）。
 
+## P5 提速诊断：瓶颈是 USB SSD I/O（2026-09-01）
+
+- 模型权重位于 `/Volumes/data`（Protocol: USB 的 SSD，顺序读 ~814 MB/s = 0.768 GiB/s）；内部盘 `/` 仅 43Gi 空闲，装不下 134GB 模型，故无法迁移到更快存储。
+- H3_PROFILE 实测：`BF16 SSD stream 72.495 GiB read in 94.376s (0.768 GiB/s), unhidden wait 78.894s`。
+  - 每次生成流式读取约 72.5 GiB（≈ 2 步 × 每步 36 GiB 的 50 个 DiT block matmul 权重）。
+  - **78.9s 是计算端等待盘就绪的 I/O 停滞（unhidden wait）** —— 纯 I/O 阻塞，与步数/算力无关。
+- 16GB RAM 装不下单步 36 GiB，page cache 无法跨步复用 → 每步都从 USB 重读，~47s/步 不可避免。
+- 软件杠杆收益极小（已验证）：steps 4→2 仅省 ~26s（240s→214s）；frames/res 已压到 16/256；MPS 预热/core_reuse/token_reduction 不解决 I/O。
+- 真正提速需硬件：①更快模型盘（Thunderbolt/USB4 SSD，2-3 GB/s 可将 ~79s 停滞降到 ~20-30s）；②M5（int8 减半读量，~24s/步）；③>64GB RAM（常驻去流式）。
+- 唯一可行的代码杠杆：增加流式预取深度（更多 stream slot / 更大 prefetch）以回收部分 unhidden wait（~30-40% 潜力），但需改动刚修复的流式核心（`h3_dit.c` stream_thread / stream_slots），有回归风险。
+
 ## lora 合并 + 流式被代码硬阻断（2026-09-01 发现）
 
 - `h3_dit.c:1712-1716`：
@@ -97,3 +108,148 @@ ds4 是同类 native 推理引擎，已解决"小内存 Mac + SSD streaming"问�
 - `h3_lora.h` 注释明确："SSD streaming 和 int8 路径不支持合并"（lora 合并也不支持流式）。
 - 出路（待定）：放宽 `h3_dit.c:1713` 的限制，使 lora 权重在流式读取/量化前合并；或仅在非流式大内存机器上用 lora。
 - 注意：P3/P4 的验证均**不带 lora**（`lora_path` 为空），故未触发此限制；带 lora 的流式运行会立即失败。
+
+## ClipProj 替换文本编码器：最大单一组件的近半 I/O 可被消除（2026-09-01）
+
+### 实测 inventory（`./h3 -d <MODEL_DIR> --info`，本机 M4 / 16GB 统一内存）
+```
+  Qwen3-VL encoder   14 files  1058 tensors   62.133 GiB   <- FL2VA/text_encoder
+  FL2VA DiT          13 files   535 tensors   61.728 GiB
+  Ref2VA DiT          0 files     0 tensors    0.000 GiB   <- 未加载
+  video VAE           1 files   560 tensors    9.700 GiB
+  audio VAE           1 files  1087 tensors    0.564 GiB
+  合计 ≈ 134.1 GiB
+```
+- **文本编码器 = 62.13 GiB，是单模型最大单一组件**，比 FL2VA DiT（61.7 GiB）还略大，占总权重 **46%**。
+- 本机 `recommended_working_set 11.8 GiB` / `max Metal buffer 8.9 GiB` → 62 GiB 编码器**必然走流式读盘**（USB SSD 瓶颈，见 P5）。
+
+### 架构发现：编码器与 DiT 的契约只有一个 5120 维向量
+- 文本编码器在 `h3_text_encoder.c` 是 **Qwen3-VL 前 50 层**（`TEXT_LAYERS=50, TEXT_HIDDEN=5120, TEXT_INTERMEDIATE=25600`），权重路径独立的 `FL2VA/text_encoder`（`h3.c:427,1468`），与 DiT/VAE 分开计重（`h3_memory_plan.h:47` 5 组件之和）。
+- DiT 只校验 `text->width == TEXT_DIM`（5120）与 `text->tokens`：
+  ```297:297:h3_dit.c
+  if (!text || !text->values || text->width != TEXT_DIM || !text->tokens ||
+  ```
+- **维度一致 = 可原位替换**：只要喂进去一个 5120 维的 `h3_text_embedding`，`validate_layout`/`refine_text`/`prepare_maps` 一行都不用改。
+
+### ClipProj 做法（已在仓库原型化）
+- 用 **Qwen3-VL-4B**（36 层 / hidden 2560；截断到 25 层 ≈ 5.5 GiB 以塞进 16GB）作文本编码器，取中间层 `tap=24` 的 hidden（2560 维），过一个很小的 **MLP 投影**（`2560→32768→5120`，带 mean/std 归一化 + attention-sink 替换），输出 **5120 维**，正好对齐 H3 conditioning 空间。与 32B 真值 `cos_test ≈ 0.81`（见 `clipproj_harness.py`）。
+- 该 harness 已在本机跑通：模型在 `~/.lmstudio/models/Qwen3-VL-4B-Instruct`，投影权重 `ClipProj-MiniMax-H3/mmh3-4b-ClipProj-v3-mlp.safetensors`，产出 `.npz` 的 5120 维 embedding。
+
+### 收益（实测量级）
+| 方案 | 文本编码器占用 | I/O 节省 |
+|---|---|---|
+| 原 50 层 Qwen（32B 级） | 62.13 GiB | 基准 |
+| ClipProj：Qwen3-VL-4B（25 层）+ MLP | ≈ 5.5 GiB | **省 ~56.6 GiB（编码器自身 91%）** |
+
+- 对**纯文本 prompt**：占总模型 134 GiB 的 **~42% I/O 被直接消除**；等于把最大读盘源从 USB SSD 砍掉。
+- 这比 int8 落盘 / 增加预取深度（P5）更划算——它是"换组件"而非"压缩原组件"，且不影响 DiT/VAE 精度。
+
+### 硬限制（必须知道）
+- **仅适用于纯文本 prompt**。多模态路径（`h3_text_encode_multimodal_bf16`，带 image/ref 输入的 vision span + deepstack）仍依赖 50 层编码器的**视觉塔**（`h3_text_encoder.c` 的 `h3_text_encode_multimodal_bf16` / `h3_multimodal.c`）。图生视频 / 参考图输入暂时不能用 4B 替换（除非另做视觉版 ClipProj）。harness 注释也写明 vision tower "unused for text-only encoding"。
+
+### 集成方案（两个选项）
+- **A（推荐，最省事）文件喂入**：新增 `h3_text_encode_from_file`，把 harness 预计算的 5120 维 BF16 `.npz` 直接载入成 `h3_text_embedding`；`h3.c:1468` 调用点改走这条分支（纯文本时）。改动集中在 1 个文件 + 调用点，不需在 Metal 引擎重写 4B 前向。
+- **B（彻底）引擎内化**：把 Qwen3-VL-4B 前向 + MLP 投影移植进 Metal 引擎，运行时直接算。改动大，但免去离线步骤。
+
+### 与 GGUF/MLX/llama.cpp 的边界（避免混淆）
+- GGUF / MLX / llama.cpp / Qwen-VL 量化是 **LLM 生态**，不能直接跑 H3 视频扩散模型。ClipProj 是 **H3 原生**的"用小模型替换大模型组件"等价做法：Qwen3-VL-4B 当**文本编码器**，H3 的 DiT 照样生成视频。这与前面讨论的"量化省内存/I/O"是同一思想，但必须落在 H3 自身代码上。
+
+### 待办
+- 决定走 A 还是 B；先量 `FL2VA/text_encoder` 实际值（已完成：62.13 GiB）确认收益后再落地。
+- 落地后更新 task_plan 增加 P6（ClipProj 文本编码器替换）。
+
+## 编码器替换选型原则（2026-09-01，本轮讨论固化）
+
+1. **任意 5120 维编码器都需训对齐投影头；同族 Qwen3-VL-4B 优于异族 MiniCPM-V-4.6。**
+   - "DiT 只校验 `text->width==5120`" 只保证**形状**能喂进去，**不代表语义对得上**。DiT 是在 32B Qwen3-VL 编码器的**输出分布**上训的；喂分布不符的 5120 维向量不会报错，但视频会变乱。
+   - ClipProj(Qwen3-VL-4B) 成功的关键不是"小"，是"**同族**"：4B 与 32B 编码器同为 Qwen3-VL 架构族，hidden 分布相近，故一个简单 MLP 投影即可达 `cos_test≈0.81`。
+   - MiniCPM-V-4.6 主干是 **Qwen3.5-0.8B + SigLIP2**（异族），hidden 分布差异大，需重新训练"MiniCPM→H3 5120"投影头且预期 `cos_test` 远低于 0.81 → 质量掉。故**同族优先于异族**，即便后者更小。
+
+2. **同族选型 + 量化 4B 优先于换 2B / MoE。**
+   - 同族梯度（官方）：Dense `2B/4B/8B/32B`；MoE `30B-A3B`(激活 3B) / `235B-A22B`(激活 22B)。
+   - **最优省内存杠杆是量化已在用的 4B（int8/int4）**：架构与 hidden 分布不变 → ClipProj `cos_test≈0.81` 基本保留、**投影头零重训**；harness 已支持 `--quantize int8` 与 `--weights-file`(weight-only int8 convrot)，且文档实证 int8 4B 与 bf16 真值仅差 ~0.0023 cosine。4B fp16 ~8.9GiB → 截断 25 层 ~5.5GiB → int8 ~4.5GiB → int4 ~2.2GiB。
+   - **换 2B**（dense 半尺寸）：同族余弦仍高，但 hidden 2048（4B 为 2560）、层数更少 → ClipProj MLP 须重训为 `2048→5120` 且换 tap 层，多一道工序，收益只是再小一点。
+   - **MoE 30B-A3B**：激活参数仅 3B、质量/算力比佳，但**总权重 ~60GiB** → 对"塞进 16GB"反效果（需常驻/流式一大坨权重），除非为质量换速度否则不推荐。
+   - 结论：**留在 4B 并量化（int4/int8）是最小可行形态（~2–4GiB），优于换 2B / MoE**。
+
+### 方案 A vs B 的收益边界（澄清）
+- **I/O / 显存 footprint 收益在 A 与 B 完全相同**：都来自"32B→4B"替换（编码器 62.13→~5.5GiB，省 ~56.6GiB / 91%，占总模型 ~42% I/O）。这是大头，A 已 100% 拿到。
+- **B（引擎内化）的额外收益**仅在运行时质量：① 编码速度（Metal GPU 4B vs A 的 CPU torch 4B，可能快数倍～十倍）；② 免离线两步、单命令生成；③ 内存并入 Metal 堆、可 per-call 释放，避免 Python torch 额外常驻；④ 可接入现有 embedding 缓存复用。
+- **B 的代价**：需把标准 HF `Qwen3-VL-4B` safetensors 装进 Metal（现有 `h3_weight_store` 读的是 H3 自定义 `.h3st` 格式，不能直接吃 4B），或把 4B 转成 `.h3st`；再加 ClipProj MLP kernel（含 convrot int8 反旋转 / mean·std 归一化 / sink 替换）。工作量大于 A。
+  - 缓解因素：Qwen3-VL 与现有 50 层编码器**同构**，RMSNorm/RoPE/GQA/SwiGLU/linear 等 Metal kernel 可复用，仅 hidden(2560)、层数(25) 不同 + 末尾加 MLP。
+- **结论**：若目标只是"16GB 跑起来 + 砍 I/O"，**先上 A**（代码最小、风险最低、立即拿到全部 I/O 收益）；B 为锦上添花（更快/更顺），因 kernel 可复用、架构同构，成本低于从零写。编码阶段占总生成时间比例小（瓶颈在 denoise/VAE 的 ~79s USB I/O），故 B 对*总*生成时间的改善有限。
+
+## 文本编码运行时行为（2026-09-01，代码实证）
+
+- **文本编码每次生成只跑一次**，位于 conditioning 阶段，**非每步 / 每帧 / 每秒重跑**。
+  - 证据：`h3.c` 单次调用 `h3_text_encode_bf16`（或 multimodal 变体，`h3.c:1445-1474`）；产出 `h3_text_embedding`（5120 × **prompt_tokens**）后在 `load_dit` 内 `refine_text` / `prepare_maps` 各调用一次（`h3_dit.c:1780,1793`），**denoise 循环（2804/2947/3052/3129）不再碰 text**；prepare 完即 `h3_text_embedding_free`（`h3.c:1584`）。
+- **成本仅 f(prompt 长度)，与视频时长无关** → 长视频下为固定开销，被整段时长摊薄趋近于零。真正随时长线性增长的是 DiT 去噪（序列长度 ∝ 帧数）与 VAE 解码（帧数）。
+- **可缓存**：`ctx->cache_enabled` 时 `h3_conditioning_cache_store` 存 exact BF16；同 prompt 重复生成直接命中 → 文本成本 ~0。
+- **含义**：长视频优化重心在 DiT 去噪 + VAE 解码（I/O 与算力），不在文本模型；ClipProj 把 62 GiB 固定读盘砍掉后，文本更非瓶颈。也意味着文本编码**天然适合卸载到远程服务器**（见下条待办）。
+
+### 待办（远程卸载思路，2026-09-01 提出）
+- 文本编码是 prompt→5120 维向量的**纯函数**，与后续 DiT/VAE 完全解耦，输出极小（5120×tokens×2B：100 token ≈ 1 MiB，1000 token ≈ 10 MiB），可在远程服务器跑 4B+ClipProj **甚至原始 32B 编码器**生成 embedding，再下载到本地喂引擎（复用方案 A 的 loader）。
+  - 远程跑**原始 32B** 可得 cos_test=1.0 的精确 embedding，无任何 4B 近似损失，且 62 GiB 编码器永不落本地 Mac → 直接破解"16GB 装不下编码器"。
+  - 与方案 A 兼容（A 的 `.npz` 即可来自本地 harness 或远程服务器）；若走远程，方案 B（引擎内化）必要性下降。
+
+### 未来探索 TODO（2026-09-01 记入，非当前优先级）
+- **A_local（本地文件喂入）**：新增 `h3_text_encode_from_file`，把本地 harness 预计算的 5120 维 BF16 `.npz` 直接载入成 `h3_text_embedding`；`h3.c` 纯文本调用点改走此分支。代码量小（1 文件 + 调用点），可先拿全部 I/O 收益（62→~5.5 GiB），但需两步工作流（先跑 harness 产 .npz）。
+- **A_remote（远程服务器生成 embedding）**：文本编码放远程（4B+ClipProj 或原始 32B 编码器），仅下载 MB 级 5120 维 embedding 回本地喂引擎（复用 A_local loader）。本地 Mac 完全不持编码器权重，甚至可用原始 32B 得 cos=1.0 精确 embedding。优先级低于 B，作为后续探索。
+- **当前优先级：B（引擎内化）进行中**——将 4B 前向 + ClipProj MLP 搬进 Metal 引擎，运行时直接算，免离线步骤（见下）。
+
+### B（引擎内化）实现状态（2026-09-01，已完成并验证）
+- **已实现**：`h3_text_encode_clipproj_bf16`（`h3_text_encoder.c`）+ 头文件声明；`h3.c` 纯文本路径接 env 开关 `H3_CLIPPROJ_DIR`（设了就走 4B+ClipProj，不设仍走原 50 层路径，**零回归**）。`H3_CLIPPROJ_PROJ` 可覆盖 projection 目录（默认 `/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3`）。
+- **做法**：复用现有 Metal gpu ops（RMSNorm/Linear/RoPE/GQA/SwiGLU/Add），维度从权重**动态读取**（4B: hidden 2560 / intermediate 9728 / q_heads 32 / kv_heads 8；与 50 层同族 `rope_theta=5e6`、`eps=1e-6`、`head_dim=128`、`vocab=151936`），跑 **25 层**（tap=24）取 2560 维 hidden，末尾 **CPU 跑 ClipProj MLP**（F16→F32 upcast，含 mean/std 归一化 + GELU + sink 替换）输出 **5120 维**。DiT 无需改动（`width==5120`）。
+- **验证**：`tests/test_clipproj_encoder.c` 通过——提示 "A red fox walking through snow"（6 token）产出 `6×5120` BF16，无 NaN/Inf、非退化；GPU 分配 **~5.4 GiB**（与"截断 25 层 ~5.5 GiB"预估吻合），25 层前向 + MLP 正常；单次约 7.6s（含 4B 权重磁盘读取，生产环境常驻内存后更快）。
+- **待补强**：与 harness `mmh3_cond` 的余弦对齐（`cos_test≈0.81`）未自动比对；如需可加 golden 对比（复用 A_local 的离线 `.npz` 思路）。但前向与 harness 同架构同超参（rope/eps/head_dim 一致），预期对齐。
+- **端到端验证通过（2026-09-01）**：设 `H3_CLIPPROJ_DIR` 跑 `./h3 -d MiniMax-H3 -p "a red ball bouncing on a white floor" -o /tmp/h3out/clipproj_stream_nolora_256.mp4 --ssd-streaming --steps 4 --frames 16 --width 256 --height 256 --use-slower-bf16-mlp --use-slower-bf16-qkv --use-slower-bf16-attention-output`。日志确认 `text encoder (clipproj)` 触发、4B 跑满 25 层、`refine text 1/1` 后 DiT 正常消费 5120 维 embedding；最终产出 `clipproj_stream_nolora_256.mp4`：ffprobe 验 256×256 h264+aac 24fps 0.92s 22 帧，与 P3 基线（50 层编码器）**同规格**，大小 123379 vs 122408 bytes（不同 embedding 驱动的不同生成，非崩溃/拷贝）。**B 完成**。内存规划与 P3 一致——文本编码器在 `h3.c:890` 本就按 per-call 释放计（`* 0`），4B 更小不改变规划，流式照常。
+
+## ClipProj token-0 爆炸根因与修复（2026-09-01）
+
+### 现象
+`h3_text_encode_clipproj_bf16` 跑 25 层 Qwen3-VL-4B（tap=24），token 0 的最终 hidden 范数 **4701**，而 HF 参考 `hidden_states[25]`（= `tap+1`）token 0 范数仅 **24.15**；逐层余弦前 24 层 ~1.0、最后一层 token 0 骤降到 0.659。B-vs-A_local（同 4B）5120 输出余弦仅 0.697。
+
+### 根因（已数值验证，非猜测）
+1. **B 在 25 层之后、喂给 ClipProj MLP 之前，漏掉了 model 的最终 RMSNorm**（`model.language_model.norm`）。
+   - HF/ComfyUI 取的是**归一化后**的 `hidden_states[tap+1]`；B 之前取的是**裸 layer-24 输出**。
+   - token 0 在 pre-norm 残差流里本就会膨胀（首位 token 因果注意力只看自己、无平均，attention 输出=全幅 value，逐层累加）。HF 同样会膨胀到 ~4824，但**最终 RMSNorm 把 token 0 拉回 24.15**；B 没这步，故停在 4701。
+   - token 0 的隐藏态膨胀其**方向**是错的（幅值被 RMSNorm/head-RMSNorm 重置但方向携带垃圾），污染所有 attend token 0 的 token，导致逐 token 方向漂移（tok1–5 余弦仅 0.70–0.80）。
+2. 修复：循环后、读 hidden 前，对 `hidden` 应用 `h3_gpu_rms_norm_bf16(gpu, hidden, hidden, final_norm, tokens, H, CP_RMS_EPS)`，`final_norm` = `cp_load_1d(..., "model.language_model.norm.weight", H, ...)`。
+
+### 验证（golden + 逐 token）
+- 手工对 B 裸 hidden 应用 final RMSNorm → 与 HF `hs25` 逐 token 余弦 **1.00000**（tok0 范数 4701→24.39，吻合 HF 24.15）。→ 假设实锤。
+- 修复后重跑：B 最终 hidden 与 HF `hs25` 逐 token余弦 **0.99997**（tok0 含）；B 5120 输出 vs A_local 余弦 **0.9799**（修复前 0.697）。
+- 剩余 0.9799 是 **bf16(B) vs fp16(A_local) 精度地板**：tok4 的 hidden 在 ClipProj MLP 处于高敏感方向，把 25 层累积的微小数值差放大（tok4 的 cos=0.88，其余 token≈0.999；`|B_h-A_h|` tok4 仅 0.94 与别无二致，说明 B 前向本身正确，只是精度放大）。`cos_test=0.814`（4B vs 32B）目标质量达成。
+- 结论：**token 0 爆炸是漏 final RMSNorm 导致，已修复**；0.9799 是 bf16/fp16 精度容差（golden 阈值 0.999 对 bf16 实现过严），非逻辑 bug。若需 B 与 A_local 逐位一致，须让 B 前向改用 fp16（非 bf16），代价大且不影响 cos_test。
+
+## 4B vs 50 层 计时对比（2026-09-01，本轮实测）
+
+### 动机
+B（引擎内化 ClipProj）已端到端验证通过，但"换 4B 生成快多少"此前只有编码器单阶段粗估（~7.6s）。本会话实测两类计时：① 编码器隔离计时；② 同设置完整生成计时（唯一变量 = 文本编码器）。
+
+### 方法
+- 编码器隔离：4B 用 `tests/test_clipproj_encoder.c`；50 层用 `h3_real_prompt_test`（直接调 `h3_text_encode_bf16`，**不读 env**，故不受 `H3_CLIPPROJ_DIR` 影响）。
+- 完整生成：`./h3 -d <MODEL> -p "a red ball bouncing on a white floor" -o <OUT> --ssd-streaming --steps 4 --frames 16 --width 256 --height 256 --use-slower-bf16-mlp --use-slower-bf16-qkv --use-slower-bf16-attention-output`；4B 设 `H3_CLIPPROJ_DIR`，50 层用 `env -u H3_CLIPPROJ_DIR -u H3_CLIPPROJ_PROJ` 强制走默认路径。
+
+### 结果
+编码器单阶段：
+| 编码器 | wall | GPU | 权重加载 |
+|---|---|---|---|
+| 4B ClipProj | 7.93 s | 0.301 s | 5.4 GiB |
+| 50 层默认 | 52.41 s | 1.844 s | 46.86 GiB |
+
+完整生成（256×256 / 16 帧 / steps 4 / ssd-streaming）：
+| 编码器 | 总 wall |
+|---|---|
+| 4B ClipProj | 251.25 s |
+| 50 层默认 | 292.80 s |
+| 差值 | 4B 省 ~41.5 s（≈14%） |
+
+### 结论
+- 4B 把文本编码器阶段从 52s 砍到 8s（**6.6×**），权重 I/O 从 46.86 GiB 降到 5.4 GiB（**8.7×**），内存/启动压力大幅降低。
+- 但**端到端仅快 ~14%（41s）**：文本编码器只是流水线一小段，大头是 DiT 去噪 + VAE 解码 + 流式读权重的 I/O（`sys` 52–61s，两者相同）。
+- 生产默认 `--steps 20`（本次仅 4 步），DiT 占比更大，4B 相对收益会**进一步缩小**。换 4B 的核心价值是**省内存/权重体积与编码启动延迟**，不是显著缩短总生成时间。
+- 所有计时均为冷启动（每次从盘读权重）；warm page cache / 常驻权重会让两者都更快，但比率不变。
+
+### 关键陷阱（影响对比有效性）
+`H3_CLIPPROJ_DIR`（及 `H3_CLIPPROJ_PROJ`）在 shell 环境被**持久导出**。第一次我以为的"50 层"完整生成其实仍走了 4B（日志出现 `text encoder (clipproj) 0/50` + 25 层），导致两次 wall-clock 几乎相同（251.25 vs 251.05）。必须 `env -u` / `unset` 显式清除才能跑真 50 层。手动对比前务必 `unset H3_CLIPPROJ_DIR`。

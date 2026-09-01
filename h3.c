@@ -1464,13 +1464,28 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        h3_progress_emit(&progress, "text encoder", 0, 50);
-        if (!h3_text_encode_bf16(
-                text_path, "h3_shaders.metal", ids, token_count,
-                h3_text_progress_bridge, &progress, &text,
-                detail, sizeof(detail))) {
-            h3_set_error(ctx, "%s", detail);
-            goto cleanup;
+        const char *cp_dir = getenv("H3_CLIPPROJ_DIR");
+        if (cp_dir) {
+            const char *cp_proj = getenv("H3_CLIPPROJ_PROJ");
+            if (!cp_proj)
+                cp_proj = "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3";
+            h3_progress_emit(&progress, "text encoder (clipproj)", 0, 50);
+            if (!h3_text_encode_clipproj_bf16(
+                    cp_dir, cp_proj, "h3_shaders.metal", ids, token_count,
+                    h3_text_progress_bridge, &progress, &text,
+                    detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+        } else {
+            h3_progress_emit(&progress, "text encoder", 0, 50);
+            if (!h3_text_encode_bf16(
+                    text_path, "h3_shaders.metal", ids, token_count,
+                    h3_text_progress_bridge, &progress, &text,
+                    detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
         }
     }
     conditioned = visual_count != 0 || condition_audio_elements != 0;

@@ -14,10 +14,16 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
+
+# ClipProj golden fidelity check (in-engine B vs offline A_local harness)
+QWEN4B ?= /Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct
+PROJ    ?= /Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3
+CLIPPROJ_MODEL ?= /Volumes/data/.lmstudio/models/MiniMax-H3
+CLIPPROJ_PROMPT ?= A red fox walking through snow
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity clean
+.PHONY: all test parity real-parity clipproj-golden clean
 
 all: h3 libh3.a
 
@@ -70,6 +76,9 @@ h3_real_ref_video_text_test: tests/test_real_ref_video_text.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_prompt_test: tests/test_real_prompt.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_clipproj_test: tests/test_clipproj_encoder.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_dit_block_test: tests/test_real_dit_block.o $(LIB_OBJ)
@@ -189,6 +198,9 @@ parity: h3_metal_tests h3_bf16_tests h3_text_tests
 real-parity: h3_real_prompt_test h3_real_dit_block_test
 	./h3_real_prompt_test MiniMax-H3 misc/fixtures/h3_real_prompt_bf16.safetensors
 	./h3_real_dit_block_test MiniMax-H3 misc/fixtures/h3_real_dit_block0_bf16.safetensors
+
+clipproj-golden: h3_clipproj_test
+	bash clipproj_golden.sh
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@

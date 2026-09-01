@@ -163,6 +163,9 @@ def main():
     ap.add_argument("--hs-index", type=int, default=None, help="HF hidden_states index; default tap+1")
     ap.add_argument("--chat", action="store_true", help="apply Qwen3-VL chat template (user role)")
     ap.add_argument("--max-prompts", type=int, default=0)
+    ap.add_argument("--dump-hidden", default=None,
+                    help="npz to dump per-prompt tapped hidden [seq,2560] "
+                         "for fidelity debugging (keyed by prompt)")
     args = ap.parse_args()
 
     import torch
@@ -307,6 +310,7 @@ def main():
         print(f"[ref] loaded 32B reference with {len(ref.files)} prompts", file=sys.stderr)
 
     results = {}
+    hidden_results = {}
     cosines = []
     for i, p in enumerate(prompts):
         if args.chat:
@@ -321,6 +325,8 @@ def main():
                         attention_mask=mask.to(args.device),
                         output_hidden_states=True)
         h = out.hidden_states[hs_index][0].detach().cpu().numpy().astype(np.float32)  # [seq,2560]
+        if args.dump_hidden:
+            hidden_results[p] = h
         cond = proj(h)  # [seq,5120]
         results[p] = cond
         print(f"[{i}] seq={cond.shape[0]} mean_norm={np.linalg.norm(cond, axis=-1).mean():.3f} :: {p[:60]}", file=sys.stderr)
@@ -331,6 +337,8 @@ def main():
             print(f"    cosine_vs_32B={c:.4f}", file=sys.stderr)
 
     np.savez(args.out, **results)
+    if args.dump_hidden:
+        np.savez(args.dump_hidden, **hidden_results)
     print(f"[done] saved {len(results)} embeddings -> {args.out}", file=sys.stderr)
     if cosines:
         arr = np.array(cosines)

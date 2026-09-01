@@ -64,4 +64,23 @@ int h3_text_encode_multimodal_layers_bf16(
                         char *error, size_t error_size);
 void h3_text_embedding_free(h3_text_embedding *embedding);
 
+/* ClipProj path: run Qwen3-VL-4B (truncated to the tapped layer) as the text
+ * encoder and lift its 2560-dim tapped hidden to the 5120-dim H3 conditioning
+ * space with the ClipProj MLP (mean/std normalization + 2-layer projection +
+ * attention-sink replacement). Produces an h3_text_embedding fully compatible
+ * with the DiT (width == TEXT_DIM == 5120), so the DiT consumes it unchanged.
+ *
+ * This is the in-engine equivalent of clipproj_harness.py: it removes the need
+ * to read the ~62 GiB 50-layer encoder, replacing it with a ~5.5 GiB 4B model
+ * plus a tiny projection. Enable by pointing H3_CLIPPROJ_DIR at a BF16
+ * Qwen3-VL-4B-Instruct directory (H3_CLIPPROJ_PROJ overrides the projection dir). */
+int h3_text_encode_clipproj_bf16(
+                        const char *qwen4b_directory,
+                        const char *projection_directory,
+                        const char *shader_source_path,
+                        const uint32_t *token_ids, size_t token_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size);
+
 #endif
