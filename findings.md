@@ -63,3 +63,37 @@ ds4 是同类 native 推理引擎，已解决"小内存 Mac + SSD streaming"问�
 - 命令：`--ssd-streaming --steps 4 --frames 16 --width 256 --height 256 --use-slower-bf16-mlp --use-slower-bf16-qkv --use-slower-bf16-attention-output`
 - 结果：denoise 4/4、video VAE 36/36、FFmpeg 22/22，错误计数 0，产出 256×256 h264+aac 0.92s 视频。
 - 注意：本次验证走的是 **BF16 关 int8** 路径；默认 int8 开启的流式路径（streamed-block int8 量化）尚未单独验证，见 task_plan P4。
+
+## int8 仅在 M5 类 GPU 可用（本轮 P4 发现，2026-09-01）
+
+- `h3_gpu.m:364-373`：`m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound`；
+  `wantsTensorOps = m5 && (!nax || !*nax || strcmp(nax,"0")!=0)`；
+  `tensorOpsEnabled = gpu.library && wantsTensorOps`。
+- 即 **int8（tensor ops）只在设备名含 "M5" 的 GPU 上启用**，可用 `H3_NAX=0` 显式关闭。
+- 后果：`h3_dit.c:1749-1755` 的 `int8_mlp/qkv/attention_out` 全部依赖 `h3_gpu_has_int8_mlp`（= `tensorOpsEnabled`），
+  非 M5 机器上恒为 0 → 即便显式 `--ssd-streaming` 且不传 `--use-slower-bf16-*`，streamed-block int8 也绝不启用。
+- 实测：P4（默认流式）与 P3（显式关 int8）产出 mp4 逐字节相同（`cmp` IDENTICAL），证实本机（非 M5）int8 未启用，
+  默认 int8 流式路径实际退化为 BF16 流式。
+- 含义：
+  1. 本机只能验证 BF16 流式生成（已稳定通过，P3/P4 一致）。
+  2. streamed-block int8 + 流式量化/submit 路径（P2 修复的代码）**需 M5 类 GPU 才能端到端验证**；当前硬件无法覆盖。
+  3. `use_int8_row_fc2`（行式 fc2 int8）另有 `h3.c:563` 的 `!h3_device(ctx)->metal4` 门槛，同样依赖新硬件（Metal 4）。
+
+## lora 合并 + 流式被代码硬阻断（2026-09-01 发现）
+
+- `h3_dit.c:1712-1716`：
+  ```c
+  if (lora_path && *lora_path) {
+      if (ssd_streaming) {
+          fail(error, error_size,
+               "LoRA merging is not supported with --ssd-streaming");
+          goto failed;
+      }
+  }
+  ```
+- 即 **lora 合并与 `--ssd-streaming` 互斥**，且这是 `fail` 硬报错，不是性能/精度问题。
+- 对 feature/lora-merge 分支的影响：在 16GB 上非流式（全量常驻 ~134GB）会 OOM，
+  唯一可行形态是流式，但该组合被直接拒绝 → **lora 路径在 16GB 上当前完全不可用**。
+- `h3_lora.h` 注释明确："SSD streaming 和 int8 路径不支持合并"（lora 合并也不支持流式）。
+- 出路（待定）：放宽 `h3_dit.c:1713` 的限制，使 lora 权重在流式读取/量化前合并；或仅在非流式大内存机器上用 lora。
+- 注意：P3/P4 的验证均**不带 lora**（`lora_path` 为空），故未触发此限制；带 lora 的流式运行会立即失败。

@@ -4,7 +4,7 @@
 让 fork 仓库（`/Volumes/data/git/c/h3.c`，antirez 原版 `8974cc0` 之上叠加 16GB 优化 + lora 合并）
 在 16GB Mac 上能够：
 1. **不接 lora 也能流式生成视频（基线验证）** ✅ 已完成
-2. （后续）接入 lora 合并后同样能流式生成
+2. （后续）接入 lora 合并后同样能流式生成 — **当前被 `h3_dit.c:1713` 硬限制阻断，见 P6**
 
 ## Phases
 
@@ -33,12 +33,26 @@
 - 产物：256×256，h264+aac，24fps，0.92s，22 帧，122408 bytes。
 - **结论：目标 1 ✅ 达成**（走的是 BF16 关 int8 路径）。
 
-### P4 验证默认 int8 开启的流式路径 — `pending`
-- 不传 `--use-slower-bf16-*`，让内存规划器默认开启 int8，验证 streamed-block int8 量化是否也 OK。
-- 当前仅证明 BF16 关 int8 路径可用，默认 int8 流式路径未单独验证。
+### P4 验证默认 int8 流式路径 — `complete`（但 int8 未实际启用）
+- 命令：`./h3 -d MiniMax-H3 -p "a red ball..." -o /tmp/h3out/fork_stream_int8_nolora_256.mp4 \
+  --ssd-streaming --steps 4 --frames 16 --width 256 --height 256`（不传 `--use-slower-bf16-*`）。
+- 结果：denoise 4/4、video VAE 36/36、ffmpeg 22/22，错误计数 0，产出 256×256 h264+aac 0.92s 视频。
+- **关键发现**：产出 mp4 与 P3（BF16）逐字节相同（`cmp` IDENTICAL）→ 本机 int8 未启用，P4 实际仍走 BF16 流式。
+- 根因：`h3_gpu.m:366` `wantsTensorOps = m5 && (...)`，`m5` = GPU 设备名含 "M5"；本机非 M5 → `tensorOpsEnabled=false`
+  → `int8_mlp/qkv/attention_out` 恒为 0 → int8+流式量化路径在本硬件上不可达。
+- **结论**：本机仅能验证 BF16 流式（P3/P4 一致通过）；streamed-block int8 + 流式路径需 **M5 类 GPU** 才能端到端验证，当前硬件无法覆盖。
 
 ### P5 提速优化 — `pending`（待用户拍板）
 - 砍步数（4→更少）、砍帧数、MPS 首步编译预热缓存、量化整盘常驻、低像素+超分。
+
+### P6 验证 lora 合并 + 流式 — `blocked`（代码硬限制）
+- `h3_dit.c:1712-1716`：若 `lora_path` 非空且 `ssd_streaming`，直接 `fail("LoRA merging is not supported with --ssd-streaming")`。
+- 含义：本 fork（feature/lora-merge 分支）核心目标"lora 合并 + 流式生成"在代码层被显式禁止。
+- 16GB 上非流式（全量常驻）会 OOM，故 lora 路径唯一可行形态正是流式 —— 当前被堵死。
+- 可行出路（待用户拍板）：
+  (a) 放宽 `h3_dit.c:1713` 限制，让 lora 权重在流式读取时合并（须确保 merge 在量化/submit 前完成，且不与 int8 流式冲突 —— 见 `h3_lora.h` 注释"SSD streaming 和 int8 路径不支持合并"）；
+  (b) 先在大内存机器（>64GB 常驻）验证 lora + 非流式是否可行；
+  (c) 评估 lora 合并到常驻权重的时机（加载期一次性 merge，而非流式每块 merge）。
 
 ## Errors Encountered
 | Error | Phase | Resolution |
