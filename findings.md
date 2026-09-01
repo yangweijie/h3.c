@@ -39,3 +39,27 @@ ds4 是同类 native 推理引擎，已解决"小内存 Mac + SSD streaming"问�
 
 ## 为何下限约 32GB
 全量 BF16 常驻(文本编码器+Ref2VA+DiT 全块+双 VAE 解码器+激活) 远超 16/24GB；即便开流式，VAE 解码器+文本编码器+2 个 DiT slot+激活仍逼近 24GB 上限，故实测仅在 32GB 稳定。但经本轮所有修复（DiT int8+流式解耦、视频 VAE 流式路径全入口打通、规划器 streaming-aware 估算用真实块数 36），16/24GB 设备可在自动档位下显著降常驻，不再被默认配置逼到 32GB。
+
+## 流式生成失败的两个根因（本轮新发现，2026-09-01）
+
+在 fork 不接 lora 的流式生成验证中，实测命中两个阻断性 bug，均已精准修复（详见 task_plan P1/P2）：
+
+### Bug A：int8 与 ssd-streaming 互斥校验误判（h3.c 约 554 行）
+- 旧逻辑将"streamed-block int8"（流式时仍可量化 DiT matmul 权重）与"use_int8_row_fc2"（行式 fc2 int8）混为一谈，
+  在 `params.use_int8_row_fc2 && params.ssd_streaming` 之外，也对 streamed-block int8 报错，
+  导致流式模式（即便用户只想纯 BF16 流式）被同款拦截挡下。
+- 修复：冲突校验只拦截 `use_int8_row_fc2` 与 `ssd_streaming` 的组合；streamed-block int8 与流式可共存。
+
+### Bug B：流式 read 后无条件调用 h3_gpu_submit（h3_dit.c read_stream_layer 约 768 行）
+- 旧逻辑在 `read_stream_layer` 末尾无条件 `if (job->ok && !h3_gpu_submit(dit->gpu))`，
+  而 `h3_gpu_submit` 首行 `if (!gpu.command) return 0;`——int8 关闭时从未调用 `h3_gpu_begin` 创建 command buffer，
+  故 submit 必然失败，prime 阶段报 "DiT SSD stream submit failed"。
+- 更糟：771 行通用文案 "int8 quantization of streamed DiT block failed" 在 submit 失败时**覆盖**了真错误，
+  早期把根因误导为 int8 量化问题。
+- 修复：submit 与 quantize 一起以 `(int8_mlp || int8_qkv || int8_attention_out)` 守卫，
+  int8 关时整段跳过，与纯 CPU `pread` 流式行为（及原版流式）一致。
+
+### 验证结果
+- 命令：`--ssd-streaming --steps 4 --frames 16 --width 256 --height 256 --use-slower-bf16-mlp --use-slower-bf16-qkv --use-slower-bf16-attention-output`
+- 结果：denoise 4/4、video VAE 36/36、FFmpeg 22/22，错误计数 0，产出 256×256 h264+aac 0.92s 视频。
+- 注意：本次验证走的是 **BF16 关 int8** 路径；默认 int8 开启的流式路径（streamed-block int8 量化）尚未单独验证，见 task_plan P4。

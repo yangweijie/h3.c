@@ -765,8 +765,20 @@ static int read_stream_layer(h3_dit_stream_job *job) {
              slot->fc1_scales, slot->fc1, FFN * 2, HIDDEN) ||
          !h3_gpu_quantize_weight_int8(dit->gpu, slot->fc2_int8,
              slot->fc2_scales, slot->fc2, HIDDEN, FFN))) job->ok = 0;
-    if (job->ok && !h3_gpu_submit(dit->gpu)) job->ok = 0;
-    if (!job->ok)
+    /* h3_gpu_submit requires an active command buffer created by h3_gpu_begin,
+     * which only runs when int8 quantization is active. With int8 off the read
+     * is pure CPU pread, so skip submit entirely (matches the non-streaming
+     * BF16 path and the original streaming behaviour). */
+    if (job->ok && (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) &&
+        !h3_gpu_submit(dit->gpu)) {
+        if (!job->error[0])
+            snprintf(job->error, sizeof(job->error),
+                     "DiT SSD stream submit failed");
+        job->ok = 0;
+    }
+    /* Preserve a specific upstream error (BF16 read/open failure, invalid
+     * request) instead of masking it with a generic int8 message. */
+    if (!job->ok && !job->error[0])
         snprintf(job->error, sizeof(job->error),
                  "int8 quantization of streamed DiT block failed");
     job->seconds = stream_now() - started;
