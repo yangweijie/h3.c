@@ -55,19 +55,122 @@ static h3_gpu_tensor *weight_f32_2d(const h3_weight_store *store, h3_gpu *gpu,
     return h3_weight_load_f32(store, gpu, name, 2, shape, error, error_size);
 }
 
-static h3_gpu_tensor *weight_bf16_1d(const h3_weight_store *store, h3_gpu *gpu,
-                                     const char *name, uint64_t width,
-                                     char *error, size_t error_size) {
-    uint64_t shape[] = {width};
-    return h3_weight_load_bf16(store, gpu, name, 1, shape, error, error_size);
+static float schedule_f16_to_f32(uint16_t value) {
+    uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
+    uint32_t exponent = (value >> 10) & 0x1fu;
+    uint32_t mantissa = value & 0x3ffu;
+    uint32_t bits;
+    if (exponent == 0x1f) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            uint32_t e = 113;
+            do { e--; mantissa <<= 1; } while (!(mantissa & 0x400u));
+            mantissa &= 0x3ffu;
+            bits = sign | (e << 23) | (mantissa << 13);
+        }
+    } else {
+        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
 }
 
-static h3_gpu_tensor *weight_bf16_2d(const h3_weight_store *store, h3_gpu *gpu,
-                                     const char *name, uint64_t rows,
-                                     uint64_t columns, char *error,
-                                     size_t error_size) {
+static uint16_t schedule_f32_to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    uint16_t high = (uint16_t)(bits >> 16);
+    if ((bits & 0xffffu) >= 0x8000u) high = (uint16_t)(high + 1);
+    return high;
+}
+
+/* ConvRot checkpoints keep the tiny AdaLN projections in F16 (the patch heads
+ * are F32); accept BF16 natively and convert F16/F32 to BF16 on the host. */
+static h3_gpu_tensor *weight_bf16_any(const h3_weight_store *store, h3_gpu *gpu,
+                                      const char *name, int ndim,
+                                      const uint64_t *shape,
+                                      char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return NULL;
+    }
+    if (tensor->dtype == H3_DTYPE_BF16)
+        return h3_weight_load_bf16(store, gpu, name, ndim, shape,
+                                   error, error_size);
+    if (tensor->dtype != H3_DTYPE_F16 && tensor->dtype != H3_DTYPE_F32) {
+        fail(error, error_size, "weight %s has unsupported dtype %s",
+             name, h3_dtype_name(tensor->dtype));
+        return NULL;
+    }
+    if (tensor->ndim != ndim) {
+        fail(error, error_size, "weight %s has rank %d, expected %d",
+             name, tensor->ndim, ndim);
+        return NULL;
+    }
+    uint64_t elements = 1;
+    for (int dimension = 0; dimension < ndim; dimension++) {
+        if (tensor->shape[dimension] != shape[dimension]) {
+            fail(error, error_size, "weight %s shape mismatch at dimension %d",
+                 name, dimension);
+            return NULL;
+        }
+        elements *= shape[dimension];
+    }
+    size_t raw_size = (size_t)elements *
+        (tensor->dtype == H3_DTYPE_F16 ? sizeof(uint16_t) : sizeof(float));
+    void *raw = malloc(raw_size);
+    uint16_t *bf16 = malloc((size_t)elements * sizeof(uint16_t));
+    if (!raw || !bf16) {
+        free(raw);
+        free(bf16);
+        fail(error, error_size, "cannot allocate conversion buffer for %s",
+             name);
+        return NULL;
+    }
+    if (!h3_st_read_data(header, tensor, raw, raw_size, error, error_size)) {
+        free(raw);
+        free(bf16);
+        return NULL;
+    }
+    if (tensor->dtype == H3_DTYPE_F16) {
+        const uint16_t *values = raw;
+        for (uint64_t index = 0; index < elements; index++)
+            bf16[index] =
+                schedule_f32_to_bf16(schedule_f16_to_f32(values[index]));
+    } else {
+        const float *values = raw;
+        for (uint64_t index = 0; index < elements; index++)
+            bf16[index] = schedule_f32_to_bf16(values[index]);
+    }
+    free(raw);
+    h3_gpu_tensor *result = h3_gpu_tensor_from_bf16(gpu, bf16,
+                                                    (size_t)elements);
+    free(bf16);
+    if (!result)
+        fail(error, error_size, "cannot upload %s: %s", name,
+             h3_gpu_error(gpu));
+    return result;
+}
+
+static h3_gpu_tensor *weight_bf16_any_1d(const h3_weight_store *store,
+                                         h3_gpu *gpu, const char *name,
+                                         uint64_t width, char *error,
+                                         size_t error_size) {
+    uint64_t shape[] = {width};
+    return weight_bf16_any(store, gpu, name, 1, shape, error, error_size);
+}
+
+static h3_gpu_tensor *weight_bf16_any_2d(const h3_weight_store *store,
+                                         h3_gpu *gpu, const char *name,
+                                         uint64_t rows, uint64_t columns,
+                                         char *error, size_t error_size) {
     uint64_t shape[] = {rows, columns};
-    return h3_weight_load_bf16(store, gpu, name, 2, shape, error, error_size);
+    return weight_bf16_any(store, gpu, name, 2, shape, error, error_size);
 }
 
 static void free_tensor(h3_gpu_tensor **tensor) {
@@ -78,6 +181,8 @@ static void free_tensor(h3_gpu_tensor **tensor) {
 static int prepare_rows(h3_dit_schedule *schedule,
                         const h3_sigma_schedule *sigmas,
                         int visual_condition, int audio_condition,
+                        uint32_t feature_dim, const float *table,
+                        uint32_t table_rows,
                         float **features_out, char *error,
                         size_t error_size) {
     schedule->steps = sigmas->steps;
@@ -132,7 +237,7 @@ static int prepare_rows(h3_dit_schedule *schedule,
         return 0;
     }
     float *times = calloc(count, sizeof(*times));
-    float *features = malloc((size_t)count * TIME_INPUT * sizeof(*features));
+    float *features = malloc((size_t)count * feature_dim * sizeof(*features));
     if (!times || !features) {
         free(times);
         free(features);
@@ -145,14 +250,51 @@ static int prepare_rows(h3_dit_schedule *schedule,
     }
     if (visual_condition) times[visual_condition_row] = 0.999f;
     if (audio_condition) times[audio_condition_row] = 1.0f;
-    for (uint32_t row = 0; row < count; row++) {
-        for (uint32_t index = 0; index < TIME_INPUT / 2; index++) {
-            float frequency = expf(-logf(10000.0f) *
-                                   (float)index / (float)(TIME_INPUT / 2));
-            float angle = times[row] * frequency;
-            features[(size_t)row * TIME_INPUT + index] = cosf(angle);
-            features[(size_t)row * TIME_INPUT + TIME_INPUT / 2 + index] =
-                sinf(angle);
+    if (getenv("H3_DEBUG_CONVROT")) {
+        fprintf(stderr, "convrot debug: count=%u times=[", count);
+        for (uint32_t i = 0; i < count; i++) fprintf(stderr, " %.4f", times[i]);
+        fprintf(stderr, " ] video_rows=");
+        for (int s = 0; s < sigmas->steps; s++) fprintf(stderr, " %u", schedule->video_rows[s]);
+        fprintf(stderr, "\n");
+    }
+    if (table) {
+        /* ConvRot pruned checkpoints replace the time-embedding MLP with a
+         * lookup table of raw AdaLN features per discrete timestep.
+         * Matches ComfyUI interpolate_curve_table: linear interp in [0,1]. */
+        uint32_t debug_index = 0;
+        float span = (float)(table_rows - 1);
+        for (uint32_t row = 0; row < count; row++) {
+            float pos = times[row] * span;
+            if (pos < 0.0f) pos = 0.0f;
+            if (pos > span) pos = span;
+            uint32_t lower = (uint32_t)floorf(pos);
+            if (lower > table_rows - 2) lower = table_rows - 2;
+            float w = pos - (float)lower;
+            if (row == 0) debug_index = lower;
+            for (uint32_t k = 0; k < feature_dim; k++) {
+                float a = table[(size_t)lower * feature_dim + k];
+                float b = table[(size_t)(lower + 1) * feature_dim + k];
+                features[(size_t)row * feature_dim + k] = a + w * (b - a);
+            }
+        }
+        if (getenv("H3_DEBUG_CONVROT")) {
+            fprintf(stderr,
+                    "convrot debug: time_rows=%u dim=%u row0 index=%u "
+                    "features=", count, feature_dim, debug_index);
+            for (uint32_t k = 0; k < feature_dim; k++)
+                fprintf(stderr, " %.6f", features[k]);
+            fprintf(stderr, "\n");
+        }
+    } else {
+        for (uint32_t row = 0; row < count; row++) {
+            for (uint32_t index = 0; index < TIME_INPUT / 2; index++) {
+                float frequency = expf(-logf(10000.0f) *
+                                       (float)index / (float)(TIME_INPUT / 2));
+                float angle = times[row] * frequency;
+                features[(size_t)row * TIME_INPUT + index] = cosf(angle);
+                features[(size_t)row * TIME_INPUT + TIME_INPUT / 2 + index] =
+                    sinf(angle);
+            }
         }
     }
     free(times);
@@ -234,6 +376,34 @@ cleanup:
     return result;
 }
 
+/* Table mode: ConvRot pruned checkpoints serve the AdaLN input straight from
+ * adaln_t_table (one feature row per discrete timestep); just cast it. */
+static h3_gpu_tensor *time_table_embeddings(h3_gpu *gpu, uint32_t rows,
+                                            uint32_t dim,
+                                            const float *features,
+                                            char *error, size_t error_size) {
+    h3_gpu_tensor *input = h3_gpu_tensor_from_f32(gpu, features,
+                                                  (size_t)rows * dim);
+    h3_gpu_tensor *bf16 = h3_gpu_tensor_new_bf16(gpu, (size_t)rows * dim);
+    if (!input || !bf16 ||
+        !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
+                "begin timestep table") ||
+        !gpu_op(gpu, h3_gpu_cast_f32_to_bf16(gpu, bf16, input,
+                                             (size_t)rows * dim),
+                error, error_size, "timestep table BF16 cast") ||
+        !gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+                "submit timestep table")) {
+        h3_gpu_tensor_free(input);
+        h3_gpu_tensor_free(bf16);
+        if (!error || !*error)
+            fail(error, error_size, "cannot build table AdaLN input: %s",
+                 h3_gpu_error(gpu));
+        return NULL;
+    }
+    h3_gpu_tensor_free(input);
+    return bf16;
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
@@ -253,12 +423,52 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     }
     schedule->gpu = gpu;
     float *features = NULL;
+    /* ConvRot pruned checkpoints shrink the AdaLN input from the 2688-dim
+     * time embedding to a few raw features served by adaln_t_table. */
+    uint32_t time_dim = H3_DIT_TIME_DIM;
+    float *table = NULL;
+    uint32_t table_rows = 0;
+    const h3_st_header *probe_header = NULL;
+    const h3_st_tensor *probe = h3_weight_find(
+        weights, "blocks.0.adaln_proj.linear.weight", &probe_header);
+    if (probe && probe->ndim == 2 && probe->shape[1] != H3_DIT_TIME_DIM) {
+        time_dim = (uint32_t)probe->shape[1];
+        const h3_st_header *table_header = NULL;
+        const h3_st_tensor *table_tensor =
+            h3_weight_find(weights, "adaln_t_table", &table_header);
+        if (!table_tensor || table_tensor->dtype != H3_DTYPE_F32 ||
+            table_tensor->ndim != 2 ||
+            table_tensor->shape[1] != time_dim || !table_tensor->shape[0]) {
+            fail(error, error_size,
+                 "checkpoint uses a %llu-wide AdaLN input but adaln_t_table "
+                 "is missing or incompatible",
+                 (unsigned long long)probe->shape[1]);
+            goto failed;
+        }
+        table_rows = (uint32_t)table_tensor->shape[0];
+        table = malloc((size_t)table_rows * time_dim * sizeof(*table));
+        if (!table) {
+            fail(error, error_size, "out of memory loading adaln_t_table");
+            goto failed;
+        }
+        if (!h3_st_read_data(table_header, table_tensor, table,
+                             (size_t)table_rows * time_dim * sizeof(*table),
+                             error, error_size))
+            goto failed;
+    }
+
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
+                      time_dim, table, table_rows,
                       &features, error, error_size)) goto failed;
-    h3_gpu_tensor *time = time_embeddings(weights, gpu, schedule->time_rows,
-                                           features, error, error_size);
+    h3_gpu_tensor *time = table ?
+        time_table_embeddings(gpu, schedule->time_rows, time_dim, features,
+                              error, error_size) :
+        time_embeddings(weights, gpu, schedule->time_rows, features,
+                        error, error_size);
     free(features);
     features = NULL;
+    free(table);
+    table = NULL;
     if (!time) goto failed;
 
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
@@ -267,17 +477,24 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                  "blocks.%u.adaln_proj.linear.weight", block);
         snprintf(bias_name, sizeof(bias_name),
                  "blocks.%u.adaln_proj.linear.bias", block);
-        h3_gpu_tensor *weight = weight_bf16_2d(
-            weights, gpu, weight_name, BLOCK_OUTPUT, H3_DIT_TIME_DIM,
+        h3_gpu_tensor *weight = weight_bf16_any_2d(
+            weights, gpu, weight_name, BLOCK_OUTPUT, time_dim,
             error, error_size);
-        h3_gpu_tensor *bias = weight_bf16_1d(
-            weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
+        /* Load the bias only after the weight succeeded: h3_st_read_data
+         * clears the shared error buffer on entry, which would otherwise wipe
+         * out the weight's failure message. */
+        h3_gpu_tensor *bias = NULL;
+        if (weight)
+            bias = weight_bf16_any_1d(weights, gpu, bias_name, BLOCK_OUTPUT,
+                                      error, error_size);
         schedule->blocks[block] = h3_gpu_tensor_new_bf16(
             gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
         if (!weight || !bias || !schedule->blocks[block]) {
             if (!error || !*error)
-                fail(error, error_size, "cannot allocate AdaLN block %u: %s",
-                     block, h3_gpu_error(gpu));
+                fail(error, error_size,
+                     "cannot allocate AdaLN block %u: weight=%d bias=%d out=%d (%s)",
+                     block, weight != NULL, bias != NULL,
+                     schedule->blocks[block] != NULL, h3_gpu_error(gpu));
             free_tensor(&weight);
             free_tensor(&bias);
             h3_gpu_tensor_free(time);
@@ -287,7 +504,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         int ok = gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
             gpu_op(gpu, h3_gpu_linear_bf16(
                 gpu, schedule->blocks[block], time, weight, bias,
-                schedule->time_rows, H3_DIT_TIME_DIM, BLOCK_OUTPUT),
+                schedule->time_rows, time_dim, BLOCK_OUTPUT),
                 error, error_size, operation) &&
             gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation);
         free_tensor(&weight);
@@ -296,14 +513,27 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             h3_gpu_tensor_free(time);
             goto failed;
         }
+        if (block == 0 && getenv("H3_DEBUG_CONVROT")) {
+            uint16_t probe[8];
+            if (h3_gpu_tensor_read_bf16(schedule->blocks[0], probe, 8)) {
+                fprintf(stderr, "convrot debug: mod0[0..7] =");
+                for (int k = 0; k < 8; k++) {
+                    uint32_t bits = (uint32_t)probe[k] << 16;
+                    float v;
+                    memcpy(&v, &bits, sizeof(v));
+                    fprintf(stderr, " %.6f", v);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         if (progress) progress((int)block + 1, (int)H3_DIT_BLOCKS,
                                progress_opaque);
     }
 
-    h3_gpu_tensor *final_w = weight_bf16_2d(
+    h3_gpu_tensor *final_w = weight_bf16_any_2d(
         weights, gpu, "final_layer.adaln_proj.linear.weight",
-        FINAL_OUTPUT, H3_DIT_TIME_DIM, error, error_size);
-    h3_gpu_tensor *final_b = weight_bf16_1d(
+        FINAL_OUTPUT, time_dim, error, error_size);
+    h3_gpu_tensor *final_b = weight_bf16_any_1d(
         weights, gpu, "final_layer.adaln_proj.linear.bias",
         FINAL_OUTPUT, error, error_size);
     schedule->final = h3_gpu_tensor_new_bf16(
@@ -313,7 +543,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                 "begin final AdaLN") ||
         !gpu_op(gpu, h3_gpu_linear_bf16(
             gpu, schedule->final, time, final_w, final_b, schedule->time_rows,
-            H3_DIT_TIME_DIM, FINAL_OUTPUT), error, error_size,
+            time_dim, FINAL_OUTPUT), error, error_size,
             "final AdaLN projection") ||
         !gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
                 "submit final AdaLN")) {
@@ -331,6 +561,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     return schedule;
 
 failed:
+    free(table);
     free(features);
     h3_dit_schedule_free(schedule);
     return NULL;

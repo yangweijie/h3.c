@@ -54,6 +54,9 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_convrot_test: tests/test_convrot_unrotate.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -113,7 +116,8 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
-	h3_real_multimodal_text_test h3_real_ref_video_text_test
+	h3_real_multimodal_text_test h3_real_ref_video_text_test \
+	h3_convrot_test
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -134,6 +138,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		echo "skip: MLX Qwen fixture is not installed"; \
 	fi
 	./h3_audio_gpu_tests
+	./h3_convrot_test
 	@if test -f MiniMax-H3/FL2VA/audio_vae/model.safetensors && \
 	         test -f misc/fixtures/h3_real_audio_vae_37.safetensors; then \
 		./h3_real_audio_vae_test; \

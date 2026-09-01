@@ -56,6 +56,97 @@ struct int8_group_quant_args {
     uint groups;
 };
 
+/* ConvRot int8 weight recovery. The stored weight is W_rot = W_true @ R where R
+ * is the block-diagonal Regular Hadamard (block size 256 along the input /
+ * column dimension). R is orthonormal and symmetric, so the true weight recovers
+ * as W_true = W_rot @ R. Dequantize (symmetric per-output-row scale) then undo
+ * the rotation per row:
+ *   block = o / 256, local = o % 256
+ *   W_true[i, o] = scale[i] * sum_{k=0}^{255} H[local, k] * int8[i, block*256+k]
+ * where H is the normalized Hadamard (±1/sqrt(256)). After this, the existing
+ * DiT (re)quantization and BF16 forward run unchanged.
+ *
+ * ConvRot checkpoints store the attention qkv_proj weight in a q/k/v-interleaved
+ * layout: output slot = head*3 + block (i.e. [q_0,k_0,v_0, q_1,k_1,v_1, ...]),
+ * whereas the engine's forward expects the separated layout slot = block*heads +
+ * head ([q_0..q_55, k_0..k_55, v_0..v_55]). When args.layout == 1 the output row
+ * is remapped from interleaved to separated so the recovered weight feeds the
+ * existing split-qkv attention unchanged. */
+struct unrotate_args {
+    uint rows;
+    uint columns;
+    uint heads;
+    uint head_dim;
+    uint layout;
+};
+
+kernel void h3_weight_dequant_unrotate_int8(
+    device const int8_t *weight [[buffer(0)]],
+    device const float *scales [[buffer(1)]],
+    device const bfloat *hadamard [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant unrotate_args &args [[buffer(4)]],
+    uint o [[thread_position_in_grid]]) {
+    uint columns = args.columns;
+    uint row = o / columns;
+    uint col = o % columns;
+    if (row >= args.rows) return;
+    uint block = col / 256u;
+    uint local = col % 256u;
+    uint base = row * columns + block * 256u;
+    float scale = scales[row];
+    float acc = 0.0f;
+    for (uint k = 0u; k < 256u; k++)
+        acc += (float)hadamard[local * 256u + k] * (float)weight[base + k];
+    uint out_row = row;
+    if (args.layout == 1u && args.head_dim != 0u) {
+        uint slot = row / args.head_dim;
+        uint dim = row % args.head_dim;
+        uint b = slot % args.heads;
+        uint h = slot / args.heads;
+        out_row = (3u * b + h) * args.head_dim + dim;
+    }
+    output[out_row * columns + col] = (bfloat)(scale * acc);
+}
+
+/* Reorder a BF16 QKV weight's output rows from ConvRot's interleaved storage
+ * back to the engine's separated (per-head q/k/v contiguous) layout. Pure
+ * permutation over the output (row) dimension; no Hadamard un-rotation (that
+ * applies only to int8 weights, handled by the dequant kernel above).
+ * `layout` selects the slot permutation:
+ *   1 -> dst = 3*(slot%heads) + slot/heads  (main DiT qkv; matches int8 path)
+ *   2 -> dst = 3*(slot%heads) + slot/heads  (token_refiner blocks) */
+struct convrot_remap_args {
+    uint rows;
+    uint columns;
+    uint heads;
+    uint head_dim;
+    uint layout;
+};
+kernel void h3_convrot_remap_qkv_bf16(
+    device const bfloat *input [[buffer(0)]],
+    device bfloat *output [[buffer(1)]],
+    constant convrot_remap_args &args [[buffer(2)]],
+    uint o [[thread_position_in_grid]]) {
+    uint columns = args.columns;
+    uint row = o / columns;
+    uint col = o % columns;
+    if (row >= args.rows) return;
+    uint slot = row / args.head_dim;
+    uint dim = row % args.head_dim;
+    uint out_row = row;
+    if (args.layout == 1u && args.head_dim != 0u) {
+        uint b = slot % args.heads;
+        uint h = slot / args.heads;
+        out_row = (3u * b + h) * args.head_dim + dim;
+    } else if (args.layout == 2u && args.head_dim != 0u) {
+        uint b = slot % args.heads;
+        uint h = slot / args.heads;
+        out_row = (3u * b + h) * args.head_dim + dim;
+    }
+    output[out_row * columns + col] = input[row * columns + col];
+}
+
 kernel void h3_linear_f32(device const float *input [[buffer(0)]],
                           device const float *weight [[buffer(1)]],
                           device const float *bias [[buffer(2)]],

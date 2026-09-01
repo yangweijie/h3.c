@@ -222,6 +222,122 @@ ds4 是同类 native 推理引擎，已解决"小内存 Mac + SSD streaming"问�
 - 剩余 0.9799 是 **bf16(B) vs fp16(A_local) 精度地板**：tok4 的 hidden 在 ClipProj MLP 处于高敏感方向，把 25 层累积的微小数值差放大（tok4 的 cos=0.88，其余 token≈0.999；`|B_h-A_h|` tok4 仅 0.94 与别无二致，说明 B 前向本身正确，只是精度放大）。`cos_test=0.814`（4B vs 32B）目标质量达成。
 - 结论：**token 0 爆炸是漏 final RMSNorm 导致，已修复**；0.9799 是 bf16/fp16 精度容差（golden 阈值 0.999 对 bf16 实现过严），非逻辑 bug。若需 B 与 A_local 逐位一致，须让 B 前向改用 fp16（非 bf16），代价大且不影响 cos_test。
 
+## ModelScope 量化权重可消费性（2026-09-01 调研）
+
+### 仓库内容（`Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot`）
+- DiT(FL2VA/Ref2VA) + 文本编码器(Qwen3-VL-32B) 的 **INT4 / INT8 / Mixed INT4-INT8（均带 Convrot）** 与 **nvfp4**（mixed）。
+- **VAE 未量化**：视频 VAE = FP16（5.21 GB）、音频 VAE = FP32（605 MB）。
+- tensor 类型含 BF16/U8/I8/F16/F32/F8_E4M3（INT4 = U8 打包）。
+- 硬件目标：**严格 NVIDIA GPU**（RTX 4070TiS/4080/4090/5090），无 Apple Silicon 适配/验证。
+
+### FL2VA DiT 体积对比（关键修正，2026-09-01 实测）
+| 格式 | 大小 | 相对 BF16 |
+|---|---|---|
+| BF16（本仓库当前） | 61.73 GiB (≈66.4 GB) | 基准 |
+| `pruned_int8_convrot` | **19.5 GB (≈18.2 GiB)** | **≈29%，3.4× 更小** |
+- 19.5 GB 不是单纯 int8（那只能到 ~33 GB），而是 **pruning（减块）+ int8（2×）叠加** → 3.4×。
+- 文本编码器 INT8-Convrot = 27.1 GB（BF16 62.13 GiB 的 ~2.3× 压缩）。
+- 对全模型：仅 DiT 一项 61.73→18.2 GiB，整模型 134→~90 GiB（若仅 DiT 走此格式）。
+
+### 对 h3.c 的兼容性（硬约束）
+- `nvfp4`：NVIDIA Blackwell 专用 → Apple Silicon Metal 不可跑，**出局**。
+- `INT4`：U8 打包，h3.c **零 int4 支持**（loader 能读 U8/I8，但无 unpack/dequant/matmul kernel）→ 需全新实现。
+- `INT8-Convrot`：loader 能读 I8；消费需 ①放宽 `h3_gpu.m` 的 "M5" 字符串门控（P7 同主题）②前向接 Convrot 逆旋转 ③int8 覆盖扩到 norm/adaln（当前仅 4 个 matmul）④匹配 "pruned" 块数（`H3_DIT_BLOCKS=50` 硬编码）。
+- Convrot 旋转矩阵**未单列文件**（页面无 rotation 元数据）→ 须确认烤进权重还是另有 side 矩阵。
+
+### 映射回三组件（回应"体积如何优化"）
+- **FL2VA DiT 61.73 GiB**：`pruned_int8_convrot` 可砍到 19.5 GB（3.4×），但需上述 4 处代码改动 → P8 重心。
+- **video VAE 9.70 GiB**：仓库未量化 → 仍靠自加量化 / 流式（已压 RAM）。
+- **audio VAE 0.56 GiB**：未量化，且本就忽略。
+- **文本编码器 62.13 GiB**：维持 **4B ClipProj**（5.5 GiB，cos≈0.81），比消费 INT8-32B(27GB) 小 5× 且已落地 → 不引入此仓库 32B 权重。
+
+### 元数据与 ComfyUI 取向（2026-09-01 下载分析）
+- 已下载 `README.md`(8.8KB)、`configuration.json`(77B，仅 `{"framework":"pytorch","task":"image-text-to-video","allow_remote":true}`)、`ref2.json`(53KB，一份 ComfyUI Ref2VA 工作流，引用 `MiniMax_H3_Ref2VA_pruned_int8_convrot.safetensors` 经 `UNETLoader` 以 "default" 权重类型加载)。
+- **三者均不含块数 / Convrot 旋转矩阵信息** → 消费前的硬证据只能来自 safetensors header 本身（待主文件下完跑 `dbg_parse_safetensors.py`）。
+- **文本编码器在此仓库并不存在**：README 提到 `qwen3vl_32b_minimax_h3_int8_convrot.safetensors`(27.1GB)/`int4_convrot`(15GB)，但仓库文件树（API 列 15 项）里**没有 `text_encoders/` 或任何 qwen3vl 文件** → 该仓库只含 DiT(FL2VA/Ref2VA) + VAE。进一步坐实：消费端仍用 **4B ClipProj**（5.5GiB）做文本编码器。
+- **权重是 ComfyUI 取向**：UNETLoader/CLIPLoaderGGUF + 自定义 MiniMax-H3 节点处理 convrot 逆旋转。h3.c 不读 ComfyUI 图，但 safetensors 张量是标准格式；要消费须自己实现 convrot 逆旋转（前向接逆旋转）。
+
+### 显存目标与 16GB Mac 的现实（重要修正）
+- README 显存指引：INT4/mixed→16GB dGPU；**INT8→24GB+ dGPU（~21GB）**；nvfp4→Blackwell。即 `pruned_int8_convrot`(19.5GB) 面向 **24GB 级**独显。
+- 但 16GB Mac 是**统一内存**，DiT+VAE+文本编码器同池竞争：即便 INT4 DiT(11.3GB)+VAE(9.7GiB)+ClipProj(5.5GiB) ≈ 26.5GiB 仍超 16GB → **量化权重在 16GB Mac 仍装不进 RAM**。
+- 故 P8 在 16GB Mac 的**真实价值不是"塞进内存"，而是"流式读盘更少"**：h3.c 当前每代从 USB SSD 流式读 ~72.5GiB（P5）。换成 19.5GB int8_convrot DiT 后，**每代 DiT 读量降到 ~1/3.4**，直接削减 P5 那个 79s I/O 停滞（瓶颈在盘速，非算力）。这与"16GB 跑起来"根目标一致——靠流式而非常驻。
+- 质量/IO 权衡：int8(19.5GB, 3.4× 少读) vs mixed_int4_int8(14.8GB, ~4.5× 少读) vs int4(11.3GB, ~5.8× 少读)。用户指定的是 int8(19.5GB)。
+
+### 头部分解结果（2026-09-01 实测，dbg_parse_safetensors.py）
+- 文件 `/Volumes/data/.lmstudio/models/Minimax-H3-Quantized/MiniMax_H3_FL2VA_pruned_int8_convrot.safetensors`（20970379688 bytes，SHA256 `f07a5427…`）头部解析：932 张量，≈19.5 GiB。
+- **dtype**：I8 = 17.94 GiB（主体），BF16 = 1.49 GiB（norm/adaln/embeddings 保留），F16 0.08 / F32 0.02 / U8 14.4KB。即 **仅每块的 4 个 matmul 被 int8 量化，norm/adaln/patch_proj/final 仍是 BF16** —— 比预想干净：h3.c 只需把 4 个 matmul 权重换成 I8+scale，其余走现有 BF16 路径。
+- **DiT 块数 = 50**（min0/max49/count50），与硬编码 `H3_DIT_BLOCKS=50` **完全对齐** → 不存在块数不匹配（"pruned" 指块内结构化剪枝/量化，非删块）。
+- **scale 布局**：200 个 `weight_scale`（50×4）F32 `[out,1]` = 逐输出通道对称量化，dequant `w=i8*scale`；无 zero-point（确认对称 int8）。200 个 I8 权重均有对应 scale，无遗漏。
+- **关键未知（P8 #1 阻塞）**：`rot`/`convrot`/`hadamard`/`ortho`/`zero` 类 key **命中数全 0** —— 文件里**没有独立 Convrot 旋转矩阵**。两种可能：① 旋转是参数无关固定变换（如 QuaRot 式 Hadamard，作用于激活，无需存储），h3.c 可实现等价旋转；② 旋转是存于别处的随机正交矩阵（本文件无 → 不可恢复，权重在旋转基下无法直接用）。**这是 P8 能否落地的唯一真障碍**，需从量化脚本 / ComfyUI 节点源码确认旋转配方。
+- **（2026-09-01 检索已破解）**：convrot = 已发表 **ConvRot (arXiv 2512.03673, 清华&华为)** 方法的 **Regular Hadamard Transform (RHT)**，参数无关、无需存储矩阵（见同章「ConvRot 旋转配方已破解」节）。P8 #1 阻塞解除 → 转为"在 h3.c DiT 前向复刻 RHT 的分组与应用点"。
+- I8 权重样例 `blocks.0.attn.out_proj.weight` shape `[5376, 7168]`（与 scale `[5376,1]` 对应逐行）；in_features=7168 与常见 hidden(5376) 不一致，提示 convrot 可能改变有效宽度/转置，h3.c 前向需按文件实际 shape 参数化而非硬编码。
+
+### ConvRot 旋转配方已破解（2026-09-01 检索）
+- "convrot" 不是自定义随机旋转，而是已发表方法 **ConvRot: Rotation-Based Plug-and-Play Quantization for DiTs**（arXiv 2512.03673，清华&华为，2025-12），官方实现 `github.com/feice-huang/ConvRot`，并有 `MiniMax-H3-W4A8-ConvRot` 专门项目 → 本仓库 `pruned_int8_convrot` 即由该法产出。
+- 核心是 **Regular Hadamard Transform（RHT，分组正则 Hadamard 变换）**：旋转矩阵是**固定、参数无关**的 ±1/√n Hadamard 矩阵，**无需存储** —— 正好解释头部分解中 `rot/convrot` key 命中数为 0 的现象。故 P8 #1 阻塞（"旋转矩阵缺失 → 不可恢复"）**已排除**：h3.c 可自行生成 RHT 矩阵，不必依赖 side 矩阵。
+- 真正的实现任务变为：**在 h3.c 的 DiT 块前向里，于 ConvRot 量化时施放的相同位置、相同分组粒度（group size）施加 RHT**（对权重已旋转者，需在激活侧施加 R^T）。具体"哪些张量、沿哪个 dim 分组、放在块的哪个位置"须照搬 ConvRot 官方实现 / MiniMax-H3-W4A8-ConvRot 项目，否则数值不对。
+- 含义：P8 从"可能不可行（缺矩阵）"转为"明确可行但需忠实复刻 ConvRot 前向"；难度集中在**对齐 RHT 的分组与应用点**，而非寻找缺失矩阵。
+
+### ConvRot 确切方案 + h3.c 消费蓝图（2026-09-01 检索+推导）
+- **官方 README（feice-huang/ConvRot）实锤**：旋转 = **Regular Hadamard Transform（RHT）**，`rot_size=256`（4 的幂，K 须被整除）；权重**离线预旋转+量化**（磁盘即 W·R），激活**在线旋转**（fused rotate+quant）。跳过层：`x_embedder`（in_dim 不整除 rot_size）、`time_text_embed`（时间/文本嵌入，质量敏感，保 BF16）。→ 与头部分解吻合：attn q/k/v/out + mlp fc1/fc2 被 int8（4 matmul/块），norm/adaln/embeddings 保 BF16。
+- **数值等价**：Y = (X·R)(W·R)^T = X·W^T（R 正交）。消费预旋转权重两种等价法：① 在线旋转激活 X→X·R 后用 W·R 做 GEMM；② **加载时反旋转回真值** W = (W_stored)·R^T = W_stored·R（R 对称），之后标准路径。
+- **h3.c 推荐消费路径（保住 19.5GB 流式收益，不写新 int8 Metal kernel）**：
+  1. 流式按层读 int8 权重 W_int8[out,K] + scale[out,1]。
+  2. 反旋转：`W_bf16 = (scale[out,1] * W_int8[out,K]) · R_K`，R_K = 沿 K 维、块 256 的**分块对角 Hadamard**（K/256 个 H_256 块，±1/√256，正交）。每代每层一次性，量级极小。
+  3. 现有 BF16 DiT 前向直跑（W_bf16 即真值权重）；norm/adaln/embeddings 本就 BF16 直读。
+  - 收益：磁盘仍只流式 19.5GB（较 61.7GiB 少 3.4×，削 P5 I/O 瓶颈），运行期按层暂存 BF16 真值，无需全局常驻；**完全复用现有 BF16 GEMM**，仅加 int8→BF16 反量化 + 分块 Hadamard 反旋转两个预处理算子。
+- **待精确核对（实现前）**：① 权重存 W·R 还是 R·W（决定反旋转乘在 K 还是 out 维，README 暗示沿 K/输入维）② 激活在线旋转是否 X·R ③ token_refiner/其他子模块是否旋转 ④ Hadamard 归一化（含 1/√n 方使 R·R^T=I 无损）。由读 `ops.py` 的 `hadamard_rotate` + MiniMax-H3 节点加载代码钉死。
+
+### h3.c 已内建 DiT int8 路径（2026-09-01 代码核查，重大修正）
+- 代码核查发现 h3.c **早已实现 DiT 的 int8 量化与推理**，`h3_dit.c` / `h3_gpu.m` 实证：
+  - `h3_dit_block` 同时持有 `qkv/qkv_int8/qkv_scales`、`out/out_int8/out_scales`、`fc1/fc1_int8/fc1_scales`、`fc2/fc2_int8/fc2_scales`。
+  - `h3_gpu_quantize_weight_int8(gpu, dst_int8, dst_scales, src_bf16, rows, cols)` 在流式加载时把 BF16 **逐行对称**量化成 int8 + 逐行 F32 scale（scale 长度 = rows = 输出通道）。
+  - Metal 端已有完整 int8 前向 kernel：`h3_linear_int8_nax_r128*`、`h3_fc1_swiglu_int8_*`、`h3_qkv_project_split_int8_*`、`h3_linear_int8_grouped_*`、`h3_gate_adaln_quantize_int8` 等；`run_block` 直接消费 int8 字段。
+- **格式完全对齐**：ConvRot 的 `int8 + 逐输出通道 weight_scale [out,1]` 与 h3.c 内部 int8+逐行 scale **同构**（均为对称逐输出量化）。→ 之前"h3.c 零 int8、P8 需从零造 int8 kernel"的判断**错误**，作废。
+- **P8 重写（远简单于预期）**：
+  1. 新增 DiT 的 int8+scale safetensors 加载：直接把 ConvRot `blocks.N.*.weight`(I8) + `*.weight_scale`(F32) 读入既有 `qkv_int8/qkv_scales/...` 字段（h3_safetensors 已支持 I8/U8 读取）。
+  2. **补唯一新算子：Hadamard 反旋转 R_K（块 256，沿 K/输入维分块对角）**：dequant(int8,scale)→BF16 → `W_true = W · R_K`（或 R_K·W，待核对）→ 再走既有 `h3_gpu_quantize_weight_int8` 回填 int8 字段，或直接作 BF16。run_block 以下完全复用。
+  3. 校验：用单 DiT block 的"int8+反旋转"输出 vs 现有 BF16 block 输出做数值对齐（经验证 R 约定，无需读外部源码）。
+- **收益叠加**：磁盘只流式 19.5GB（较 61.7GiB 少 3.4×，削 P5 I/O 瓶颈）**同时** 运行期享受既有 int8 显存减半。P8 从"造 int8"降级为"接 int8 + 一个 Hadamard 反旋转"。
+- 仍待核对：① R 的乘向(K 还是 out 维)与归一化(±1/√256) ② token_refiner/其他子模块是否也 int8 ③ h3.c 逐行 scale 与 ConvRot 同为对称(无 zero-point，头部已证无 zero→一致)。
+
+### 结论
+这把"自己写量化"变成"消费现成权重"——省掉造量化一步，但**消费端代码改动仍不可免**，且 VAE 体积问题本仓库完全没解决。P8 立项见 task_plan；第一步用 `dbg_parse_safetensors.py` 解析 INT8-Convrot header 取证。
+
+## ConvRot qkv 权重布局置换（2026-09-02，flat 输出根因实证）
+
+### 现象
+convrot INT8 模型（`MiniMax-H3-Convrot`）走 `--ssd-streaming` 生成画面**全灰（像素 std≈6.84）**，base（`MiniMax-H3`）同设置 std≈37.76。
+
+### 根因：qkv_proj 需 formula B 置换，原代码用错 formula A
+- ConvRot checkpoint 把 `qkv_proj` 存为 **q/k/v 交错布局**；引擎前向期望「按 head 分离的 q/k/v 连续布局」。两者差一次行置换。
+- 引擎内 `h3_dit.c` / `h3_shaders.metal` 的 convrot remap 用 `layout==1` 选择该置换，但两处都写成 **formula A**（`dst_slot = (slot%3)*heads + slot//3`），**错误**。
+- **正确置换 = formula B**：`dst_slot = 3*(src_slot % heads) + (src_slot / heads)`，其中 `heads=56`、`head_dim=128`（每 qkv 块 `21504 = 168*128 = 56*3*128` 行）。
+- 验证手段（离线 numpy，不依赖 GPU）：取 convrot `blocks.0.attn.qkv_proj.weight` I8 → `dequant = i8*scale` → 沿输入维块 256 做 Hadamard 反旋转（`H_256`，归一化 ±1/√256）→ 得 unrotated 行 → 按 per-slot 与 base BF16 qkv 做 cosine best-match。结果：**formula B 命中 168/168 slots（cos 每 slot≈0.90+，受 bf16 反旋转精度影响，方向完全吻合）；formula A 仅 2/168（flat）**。故 formula B 为唯一正确置换。
+- refiner 的 BF16 qkv（`token_refiner.blocks.*.attn.qkv_proj.weight`，同为 `[21504,5376]`）走独立 kernel `h3_convrot_remap_qkv_bf16`（`layout==2`），**本就已为 formula B**（cos≈1.0 验证通过），证实 B 正确。
+
+### 两处落地路径都必须改（关键陷阱）
+- **GPU kernel**（`h3_shaders.metal` `h3_weight_dequant_unrotate_int8`，`layout==1`）：非流式 int8 路径用。
+- **CPU unrotate**（`h3_dit.c` `convrot_unrotate_cpu`，`layout==1`）：**`--ssd-streaming` 流式路径用**（见 `h3_dit.c` 流式加载处 `layout = (field==STREAM_QKV)?1:0`）。
+- 本机生成走流式 → 实际走 CPU 路径。仅改 GPU kernel 对输出**零效果**（两次 std 均恰好 6.84 暴露）。两处统一改为 formula B 后 std 跃升到 51.64。
+
+### 配套事实（代码/权重实证）
+- `h3_dit.c:22`：`HEAD_DIM = 128`（**非** AGENTS.md 所写 96）。remap 的 `head_dim` 必须用 128，否则 `slot=row/96` 错位。
+- main DiT 与 refiner 的 `qkv_proj` 均为 `[21504, 5376]`；main DiT 是 I8（带 `weight_scale`），refiner 是 BF16。`out_proj` 为 `[5376, 7168]`（I8/BF16），无交错，走 `layout==0`（不置换）。
+- metal 库在**运行时**从 CWD 读 `h3_shaders.metal` 编译（`h3_gpu.m` 默认路径 `"h3_shaders.metal"`），故改 metal 不必重编二进制，但改 `h3_dit.c`（C 代码）必须 `make`。
+
+### 修复与验证
+- 三处 remap（GPU int8 / CPU int8 流式 / refiner BF16）现已统一为 formula B；`h3_dit.c` CPU 路径注释同步更正（旧注释描述的是 formula A 语义）。
+- `convrot_cpu_fixed.mp4`（steps 4 / 256×256 / ssd-streaming）：像素 std **6.84 → 51.64**，逐帧 std ~51.6 稳定、帧间差异 2.33 → 连贯视频，非噪声/灰屏。
+- 仍待：①base steps=4 同条件对照（确认亮度差来自步数而非置换，remap 纯置换不改数值尺度）；②全量 `--steps 20` parity + 单 block 数值 cosine 校验固化。
+
+## M4 的 INT8 支持澄清（2026-09-01）
+
+- 用户指出 M4 支持 INT8（ARM v8.2 Int8 dot/matmul）。需拆清：**那是 CPU 指令集**，而 h3.c 的 DiT 跑在 **Metal GPU**，CPU Int8 对其不适用。
+- 真正相关的是 **M4 GPU 经 Metal/MPS 的 Int8 算力**——`mps-bitsandbytes` 等仓库佐证 MPS 在 Apple Silicon 能做 int8/int4，故 M4 GPU 大概率支持 int8 计算。
+- h3.c 当前 int8 由 `h3_gpu.m:364` 的 `m5 = device.name contains "M5"` 字符串门控，**非 Metal 能力探测**；同引擎 `use_int8_row_fc2` 却按 `metal4` 能力门控（更宽）——口径不一致，强烈暗示 "M5" 只是作者只在 M5 测过的保守假设。
+- 但**不能断言放宽即正确**：`H3_METAL_HAS_TENSOR` 分支可能用了 M5-only Metal 特性，需 parity 实测。且即便跑通，int8 计算**不缩磁盘体积**、不覆盖 norm/adaln/VAE。
+
 ## 4B vs 50 层 计时对比（2026-09-01，本轮实测）
 
 ### 动机
@@ -253,3 +369,43 @@ B（引擎内化 ClipProj）已端到端验证通过，但"换 4B 生成快多�
 
 ### 关键陷阱（影响对比有效性）
 `H3_CLIPPROJ_DIR`（及 `H3_CLIPPROJ_PROJ`）在 shell 环境被**持久导出**。第一次我以为的"50 层"完整生成其实仍走了 4B（日志出现 `text encoder (clipproj) 0/50` + 25 层），导致两次 wall-clock 几乎相同（251.25 vs 251.05）。必须 `env -u` / `unset` 显式清除才能跑真 50 层。手动对比前务必 `unset H3_CLIPPROJ_DIR`。
+
+## 最小物理占用分析（2026-09-02）
+
+### 4B + INT8 DiT 的最小磁盘占用 = 39 GiB（已实测确认下限）
+- 组件（磁盘物理占用，非运行时显存）：INT8 DiT 20G + video_vae 9.7G + audio_vae 0.56G + tokenizer 0.01G + **4B 文本 BF16 8.3G** + ClipProj 0.48G = **≈39 GiB**。
+- **4B INT8 文本不可用**：in-engine `H3_CLIPPROJ_DIR` 加载器只实现 BF16 分支，`h3_weight_load_f32` 遇到 I8 直接报错退出（实测 `weight ... has dtype/rank I8/2, expected BF16/2`）。故 4B 文本必须用 8.3G BF16 版，不能换 4.5G int8 版。
+- **ModelScope INT8 VAE 不可用**：`Gluttony10/MiniMax-H3-INT8-CONVROT` 的 `video_vae.safetensors` 4.85 GiB（恰为本地 9.7G 一半 → INT8 量化）会被引擎拒绝。VAE 解码器走 `load_f32` → `h3_weight_load_f32` → `load_tensor(...,H3_DTYPE_F32)`；`h3_weights.c:154`：
+  ```c
+  if (tensor->dtype != dtype || tensor->ndim != ndim) {
+      fail(error, error_size, "weight %s has dtype/rank %s/%d, expected %s/%d", ...);
+      return NULL;
+  }
+  ```
+  文件 dtype=I8 与请求 F32 不符 → 报错退出（与 4B 文本 int8 失败同源）。`audio_vae.safetensors` 0.56G 与本地同大小（非 int8），可视为同款但无省空间收益。
+- 根因共性：**引擎只有 DiT 实现了 INT8 权重路径**（消费 `qkv_int8/qkv_scales` 字段 + int8 Metal kernel）；文本编码器（`h3_text_encoder.c` 的 clipproj 加载器）与 VAE 解码器均只认 BF16/F32，遇 I8 直接报错。
+- 结论：39 GiB 是 **in-engine 当前能力下的不可突破下限**。要再压（用 int8 4B 文本 → 35GiB，或用 int8 VAE → 34GiB），须给 `h3_text_encoder.c` / `h3_video_vae.c` 的加载器加 INT8 反量化分支（类似 DiT 既有 int8 路径）。
+
+## 系统盘 I/O 优化实测（2026-09-02）
+
+### 假设：瓶颈是数据盘（外置 SSD）流式读取
+- P5 诊断：模型权重在 `/Volumes/data`（HFS+ SSD，经 USB/外置接口），实测顺序读 ~0.59 GiB/s；每代流式读 72.136 GiB DiT+VAE 权重，纯等盘（unhidden wait）~93s。
+- 若瓶颈确为盘速，把 DiT+VAE 搬到系统内置盘（APFS NVMe）应显著提速。
+
+### 实测结果（4B ClipProj + convrot int8 DiT，256×256/steps4/16帧）
+| 配置 | 总耗时 | SSD 流读 | 纯等盘 | 说明 |
+|---|---|---|---|---|
+| 50层 Qwen + 数据盘 | 194 s | 0.590 | 93.2 s | 基线 |
+| 4B + 数据盘 | 153 s | 0.590 | 93.4 s | 换 4B 省 41s（编码器） |
+| 4B + 系统盘(仅 DiT/VAE) | 94 s | 1.021 | 43.5 s | **DiT/VAE 搬系统盘** |
+| 4B + 全模型系统盘 | 91 s | 1.018 | 43.7 s | 含 4B 文本也搬入 |
+
+- **瓶颈假设被证实**：DiT+VAE 流式读取从 0.59→1.02 GiB/s（×1.73），纯等盘 93→43 s，总耗时 153→91 s（提速 40%）。
+- 全模型版(91s) 与 混合版(94s) 仅差 3s → 4B 文本权重不计入那 72GiB 流式读取（仅一次性 load），放数据盘或系统盘对总时长影响极小。真正瓶颈纯粹是 **DiT+VAE 的流式 I/O**（占 43s 纯等盘）。
+- 系统盘 NVMe 实测仅 ~1.02 GiB/s，未达内置盘理论上限 → 仍可通过①引擎更深流式预取回收部分 unhidden wait；②换更快存储（Thunderbolt/USB4）进一步提速。但 **GPU compute 下限 ~70s** 是硬约束，无法靠存储消除。
+
+### 复制操作坑（供复现）
+- 系统盘起初仅剩 3.9–39 GiB，全量 39GiB 复制会填满致系统不稳 → 先复制核心 I/O 组件（DiT+VAE+tokenizer=30GiB），后复制 4B 文本+ClipProj。
+- `rsync` 默认先写 `.XXX` 临时文件再 rename，2× 峰值撑爆系统盘 → 改用 `cp -R -L`（直接写目标名，无临时文件峰值）。
+- Convrot 壳（`MiniMax-H3-Convrot`）是 24K symlink 壳；复制到系统盘须把 symlink 指向的真实文件/目录实体化，并补 `transformer/config.json` 与 `FL2VA/text_encoder` 目录（引擎存在性检查需要），否则报 "missing required model file"。
+- 全模型系统盘路径：`/Users/jay/h3_sys/MiniMax-H3-Convrot`（DiT+VAE+tokenizer+text_encoder→数据盘 symlink）、`/Users/jay/h3_sys/Qwen3-VL-4B-Instruct`、`/Users/jay/h3_sys/ClipProj-MiniMax-H3`。

@@ -4,6 +4,7 @@
 #include "h3_lora.h"
 #include "h3_weights.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -12,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 enum {
     TEXT_DIM = 5120,
@@ -62,6 +64,12 @@ typedef struct {
     uint64_t file_offset;
     size_t elements;
     unsigned field;
+    const char *scale_path;
+    uint64_t scale_offset;
+    size_t scale_elements;
+    char scale_name[64];
+    uint32_t rows;
+    uint32_t columns;
 } h3_dit_stream_source;
 
 typedef struct {
@@ -71,6 +79,7 @@ typedef struct {
 struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
+    h3_gpu_tensor *convrot_hadamard;
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
@@ -501,6 +510,268 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
            (local % spatial_width) / 2;
 }
 
+static uint16_t convrot_f32_to_bf16(float v) {
+    uint32_t b;
+    memcpy(&b, &v, sizeof(b));
+    uint16_t hi = (uint16_t)(b >> 16);
+    uint16_t lo = (uint16_t)(b & 0xffff);
+    if (lo >= 0x8000) hi = (uint16_t)(hi + 1);
+    return hi;
+}
+
+static float convrot_bf16_to_f32(uint16_t v) {
+    uint32_t b = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &b, sizeof(f));
+    return f;
+}
+
+/* Read a ConvRot per-output-row scale into a host float buffer, tolerating
+ * F32 or BF16 storage and either a 1D [rows] or 2D [rows,1] layout (the
+ * safetensors convention varies). Caller frees. */
+static float *load_convrot_scale_values(h3_dit *dit, const char *name,
+        uint64_t rows, char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *t = h3_weight_find(dit->weights, name, &header);
+    if (!t) { fail(error, error_size, "required weight_scale absent: %s", name); return NULL; }
+    uint64_t elems = h3_st_tensor_elements(t);
+    if (elems != rows) {
+        fail(error, error_size, "weight_scale %s has %llu elements, expected %llu",
+             name, (unsigned long long)elems, (unsigned long long)rows);
+        return NULL;
+    }
+    float *f = malloc(sizeof(float) * (size_t)rows);
+    if (!f) { fail(error, error_size, "oom scale %s", name); return NULL; }
+    if (t->dtype == H3_DTYPE_F32) {
+        if (!h3_st_read_data(header, t, f, (size_t)rows * sizeof(float), error, error_size)) {
+            free(f); return NULL;
+        }
+    } else if (t->dtype == H3_DTYPE_BF16) {
+        uint16_t *b = malloc(sizeof(uint16_t) * (size_t)rows);
+        if (!b) { free(f); fail(error, error_size, "oom scale %s", name); return NULL; }
+        if (!h3_st_read_data(header, t, b, (size_t)rows * sizeof(uint16_t), error, error_size)) {
+            free(f); free(b); return NULL;
+        }
+        for (uint64_t i = 0; i < rows; i++) f[i] = convrot_bf16_to_f32(b[i]);
+        free(b);
+    } else {
+        free(f);
+        fail(error, error_size, "weight_scale %s unsupported dtype %s",
+             name, h3_dtype_name(t->dtype));
+        return NULL;
+    }
+    return f;
+}
+
+/* Load a ConvRot per-output-row scale tensor as an F32 GPU tensor the
+ * un-rotate kernel indexes by output row. */
+static h3_gpu_tensor *load_convrot_scale(h3_dit *dit, const char *name,
+        uint64_t rows, char *error, size_t error_size) {
+    float *f = load_convrot_scale_values(dit, name, rows, error, error_size);
+    if (!f) return NULL;
+    h3_gpu_tensor *out = h3_gpu_tensor_from_f32(dit->gpu, f, (size_t)rows);
+    free(f);
+    if (!out) fail(error, error_size, "cannot upload scale %s: %s", name,
+                   h3_gpu_error(dit->gpu));
+    return out;
+}
+
+/* CPU ConvRot un-rotation: identical radix-4 butterfly to the official CUDA
+ * kernel (see build_convrot_hadamard), applied to the dequantized int8 weight
+ * along the input dim. Issues no GPU commands, so the SSD streaming thread can
+ * run it while the main thread owns the single command buffer. */
+/* Un-rotate a ConvRot int8 weight on the CPU. `start_row` is the absolute row
+ * index of this chunk (used to compute the destination row when `layout == 1`).
+ * ConvRot checkpoints store qkv_proj in a q/k/v-interleaved layout that is NOT
+ * the engine's separated (per-head q/k/v contiguous) layout; for those weights
+ * `layout == 1` permutes each source row to the separated layout via
+ * dst_slot = 3*(src_slot % heads) + (src_slot / heads). Both this CPU path and the
+ * matching Metal kernel (h3_weight_dequant_unrotate_int8) must stay in sync.
+ * Other mats pass layout == 0. Issues no GPU commands. */
+static void convrot_unrotate_cpu(const int8_t *weight, const float *scales,
+                                 uint16_t *out, uint32_t start_row,
+                                 uint32_t rows, uint32_t columns,
+                                 uint32_t layout, uint32_t heads,
+                                 uint32_t head_dim) {
+    enum { CONVROT_BLOCK = 256 };
+    float values[CONVROT_BLOCK];
+    for (uint32_t i = 0; i < rows; i++) {
+        uint32_t row = start_row + i;
+        const int8_t *source = weight + (size_t)i * columns;
+        uint32_t dst_row = row;
+        if (layout == 1u && head_dim != 0u) {
+            uint32_t slot = row / head_dim;
+            uint32_t dim = row % head_dim;
+            uint32_t b = slot % heads;
+            uint32_t h = slot / heads;
+            dst_row = (3u * b + h) * head_dim + dim;
+        }
+        uint16_t *target = out + (size_t)dst_row * columns;
+        float scale = scales[i];
+        for (uint32_t block = 0; block < columns; block += CONVROT_BLOCK) {
+            for (int k = 0; k < CONVROT_BLOCK; k++)
+                values[k] = (float)source[block + k];
+            for (int stride = 1; stride < CONVROT_BLOCK; stride *= 4) {
+                int span = stride * 4;
+                for (int base = 0; base < CONVROT_BLOCK; base += span)
+                    for (int lane = 0; lane < stride; lane++) {
+                        int i0 = base + lane, i1 = i0 + stride,
+                            i2 = i0 + 2 * stride, i3 = i0 + 3 * stride;
+                        float a = values[i0], b = values[i1],
+                            c = values[i2], d = values[i3];
+                        values[i0] = a + b + c - d;
+                        values[i1] = a + b - c + d;
+                        values[i2] = a - b + c + d;
+                        values[i3] = -a + b + c + d;
+                    }
+            }
+            for (int k = 0; k < CONVROT_BLOCK; k++)
+                target[block + k] = convrot_f32_to_bf16(
+                    scale * values[k] * (1.0f / 16.0f));
+        }
+    }
+}
+
+static int convrot_read_weight(const char *path, void *data, size_t bytes,
+                               uint64_t offset) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t count = pread(fd, (char *)data + done, bytes - done,
+                              (off_t)(offset + done));
+        if (count <= 0) { close(fd); return 0; }
+        done += (size_t)count;
+    }
+    close(fd);
+    return 1;
+}
+
+/* Build the normalized Walsh-Hadamard matrix of size 256 and upload it
+ * as a BF16 GPU tensor. ConvRot rotates every linear weight's input dimension in
+ * independent blocks of 256; this is the inverse rotation applied at load time so
+ * the existing DiT forward (and its own int8 requantization) can run unchanged. */
+/* Build the ConvRot rotation matrix of size 256: the official implementation
+ * (feice-huang/ConvRot, csrc/kernels.cu) runs a radix-4 butterfly over the
+ * input — stages stride=1,4,16,64, each quad (a,b,c,d) mapping to
+ * (a+b+c-d, a+b-c+d, a-b+c+d, -a+b+c+d) — then scales by 1/sqrt(256)=1/16.
+ * Capturing the butterfly over the identity yields the orthonormal matrix
+ * (symmetric, entries +-1/16, exactly representable in BF16). This is NOT the
+ * natural-order Sylvester Hadamard; using the popcount formula produces
+ * structurally corrupted output. */
+static int build_convrot_hadamard(h3_dit *dit, char *error, size_t error_size) {
+    const int n = 256;
+    float *h = malloc((size_t)n * n * sizeof(float));
+    if (!h) { fail(error, error_size, "cannot allocate hadamard buffer"); return 0; }
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            h[i * n + j] = (i == j) ? 1.0f : 0.0f;
+    for (int stride = 1; stride < n; stride *= 4) {
+        int span = stride * 4;
+        for (int base = 0; base < n; base += span)
+            for (int lane = 0; lane < stride; lane++)
+                for (int row = 0; row < n; row++) {
+                    float *r = h + (size_t)row * n;
+                    int i0 = base + lane, i1 = i0 + stride,
+                        i2 = i0 + 2 * stride, i3 = i0 + 3 * stride;
+                    float a = r[i0], b = r[i1], c = r[i2], d = r[i3];
+                    r[i0] = a + b + c - d;
+                    r[i1] = a + b - c + d;
+                    r[i2] = a - b + c + d;
+                    r[i3] = -a + b + c + d;
+                }
+    }
+    uint16_t *hb = malloc((size_t)n * n * sizeof(uint16_t));
+    if (!hb) { free(h); fail(error, error_size, "cannot allocate hadamard bf16"); return 0; }
+    for (int i = 0; i < n * n; i++)
+        hb[i] = convrot_f32_to_bf16(h[i] * (1.0f / 16.0f));
+    free(h);
+    dit->convrot_hadamard = h3_gpu_tensor_from_bf16(dit->gpu, hb, (size_t)n * n);
+    free(hb);
+    if (!dit->convrot_hadamard) {
+        fail(error, error_size, "cannot upload convrot hadamard: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    return 1;
+}
+
+/* Load a DiT weight, transparently handling ConvRot int8 (dequantize + Hadamard
+ * un-rotate) vs plain BF16 (e.g. token_refiner blocks). Returns a BF16 tensor
+ * holding the true (unrotated) weight, ready for the existing quantize/forward. */
+static h3_gpu_tensor *bf2_convrot(h3_dit *dit, const char *name,
+        uint64_t rows, uint64_t columns, char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *t = h3_weight_find(dit->weights, name, &header);
+    if (!t) { fail(error, error_size, "required weight is absent: %s", name); return NULL; }
+    if (t->dtype == H3_DTYPE_I8) {
+        if (!dit->convrot_hadamard &&
+            !build_convrot_hadamard(dit, error, error_size)) return NULL;
+        h3_gpu_tensor *w = h3_weight_load_i8(dit->weights, dit->gpu, name, 2,
+            (uint64_t[]){rows, columns}, error, error_size);
+        if (!w) return NULL;
+        char sname[256];
+        size_t nl = strlen(name);
+        snprintf(sname, sizeof(sname), "%.*s.weight_scale", (int)(nl - 7), name);
+        h3_gpu_tensor *scale = load_convrot_scale(dit, sname, rows, error, error_size);
+        if (!scale) { h3_gpu_tensor_free(w); return NULL; }
+        h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(dit->gpu, (size_t)rows * columns);
+        if (!out) {
+            h3_gpu_tensor_free(w); h3_gpu_tensor_free(scale);
+            fail(error, error_size, "cannot allocate convrot bf16 weight");
+            return NULL;
+        }
+        /* qkv_proj is stored in q/k/v-interleaved layout in ConvRot checkpoints;
+         * remap to the engine's separated layout during un-rotation. */
+        int is_qkv = strstr(name, "qkv_proj") != NULL;
+        int ok = h3_gpu_begin(dit->gpu) &&
+            h3_gpu_weight_dequant_unrotate_int8(dit->gpu, out, w, scale,
+                dit->convrot_hadamard, (uint32_t)rows, (uint32_t)columns,
+                is_qkv ? 1u : 0u, HEADS, HEAD_DIM) &&
+            h3_gpu_submit(dit->gpu);
+        h3_gpu_tensor_free(w);
+        h3_gpu_tensor_free(scale);
+        if (!ok) {
+            h3_gpu_tensor_free(out);
+            if (!*error) fail(error, error_size, "convrot dequant failed: %s",
+                             h3_gpu_error(dit->gpu));
+            return NULL;
+        }
+        return out;
+    }
+    /* BF16 qkv (e.g. token_refiner blocks) is stored q/k/v-interleaved but
+     * without the int8 Hadamard rotation, so it only needs the row permutation
+     * back to the engine's separated layout. The main DiT qkv is int8 and is
+     * handled by the un-rotate path above; here we remap the BF16 case.
+     * token_refiner uses layout 2, everything else layout 1. */
+    int is_qkv = strstr(name, "qkv_proj") != NULL;
+    h3_gpu_tensor *w = bf2(dit, name, rows, columns, error, error_size);
+    if (!w) return NULL;
+    if (is_qkv) {
+        h3_gpu_tensor *out = h3_gpu_tensor_new_bf16(dit->gpu,
+                                                    (size_t)rows * columns);
+        if (!out) {
+            h3_gpu_tensor_free(w);
+            fail(error, error_size, "cannot allocate convrot bf16 qkv remap");
+            return NULL;
+        }
+        uint32_t layout = strstr(name, "token_refiner") ? 2u : 1u;
+        int ok = h3_gpu_begin(dit->gpu) &&
+            h3_gpu_convrot_remap_qkv_bf16(dit->gpu, out, w, (uint32_t)rows,
+                (uint32_t)columns, layout, HEADS, HEAD_DIM) &&
+            h3_gpu_submit(dit->gpu);
+        h3_gpu_tensor_free(w);
+        if (!ok) {
+            h3_gpu_tensor_free(out);
+            if (!*error) fail(error, error_size, "convrot bf16 qkv remap: %s",
+                             h3_gpu_error(dit->gpu));
+            return NULL;
+        }
+        return out;
+    }
+    return w;
+}
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                       char *error, size_t error_size) {
     char name[160];
@@ -511,7 +782,7 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
 } while (0)
 #define LOAD2(field, suffix, rows, columns) do {                               \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
-    block->field = bf2(dit, name, rows, columns, error, error_size);            \
+    block->field = bf2_convrot(dit, name, rows, columns, error, error_size);     \
     if (!block->field) return 0;                                                \
 } while (0)
     LOAD1(norm1, "norm1.weight", HIDDEN);
@@ -626,6 +897,38 @@ static int prepare_stream_source(h3_dit *dit,
              name);
         return 0;
     }
+    source->scale_path = NULL;
+    source->scale_offset = 0;
+    source->scale_elements = 0;
+    source->rows = (uint32_t)rows;
+    source->columns = (uint32_t)columns;
+    source->field = field;
+    if (tensor->dtype == H3_DTYPE_I8) {
+        if (tensor->ndim != 2 || tensor->shape[0] != rows ||
+            tensor->shape[1] != columns || rows > SIZE_MAX / columns) {
+            fail(error, error_size, "int8 streaming weight schema mismatch: %s",
+                 name);
+            return 0;
+        }
+        source->path = header->path;
+        source->file_offset = tensor->file_offset;
+        source->elements = (size_t)(rows * columns);
+        char sname[256];
+        size_t nl = strlen(name);
+        snprintf(sname, sizeof(sname), "%.*s.weight_scale", (int)(nl - 7), name);
+        const h3_st_header *sheader = NULL;
+        const h3_st_tensor *st = h3_weight_find(dit->weights, sname, &sheader);
+        if (!st || (st->dtype != H3_DTYPE_F32 && st->dtype != H3_DTYPE_BF16) ||
+            h3_st_tensor_elements(st) != rows) {
+            fail(error, error_size, "int8 streaming scale absent/wrong: %s", sname);
+            return 0;
+        }
+        snprintf(source->scale_name, sizeof(source->scale_name), "%s", sname);
+        source->scale_path = sheader->path;
+        source->scale_offset = st->file_offset;
+        source->scale_elements = (size_t)rows;
+        return 1;
+    }
     if (!header || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
         tensor->shape[0] != rows || tensor->shape[1] != columns ||
         rows > SIZE_MAX / columns) {
@@ -636,7 +939,6 @@ static int prepare_stream_source(h3_dit *dit,
     source->path = header->path;
     source->file_offset = tensor->file_offset;
     source->elements = (size_t)(rows * columns);
-    source->field = field;
     return 1;
 }
 
@@ -731,28 +1033,114 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     job->ok = 1;
     job->bytes = 0;
     job->error[0] = '\0';
-    for (unsigned index = 0; index < STREAM_MATRICES; index++) {
+    h3_dit *dit = job->dit;
+    /* ConvRot int8 weights are dequantized and un-rotated on the CPU (no GPU
+     * commands from this thread); GPU work here is only the M5 streamed-block
+     * int8 requantization below. */
+    int gpu_work = dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out;
+    /* ConvRot int8: dequantize + undo the block-Hadamard rotation into the BF16
+     * slot; plain BF16: pread straight in. Either way the slot ends up holding the
+     * true (unrotated) weight, and the existing int8 requantization below halves
+     * the resident footprint exactly as for the BF16 checkpoint. */
+    if (gpu_work && !h3_gpu_begin(dit->gpu)) {
+        snprintf(job->error, sizeof(job->error),
+                 "DiT stream begin failed: %s", h3_gpu_error(dit->gpu));
+        job->ok = 0;
+    }
+    for (unsigned index = 0; index < STREAM_MATRICES && job->ok; index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
         h3_gpu_tensor *target = stream_slot_target(slot, source->field);
-        if (!target || !h3_gpu_tensor_stream_file_bf16(
-                target, source->path, source->file_offset, source->elements,
-                job->error, sizeof(job->error))) {
-            if (!job->error[0])
-                snprintf(job->error, sizeof(job->error),
-                         "invalid BF16 streaming destination");
-            job->ok = 0;
-            break;
+        if (!target) { job->ok = 0; break; }
+        if (source->scale_path) {
+            /* CPU path: pread int8 + scale, fast Walsh-Hadamard un-rotate,
+             * write the true BF16 weight straight into the shared-memory slot.
+             * No GPU commands — the main thread owns the command buffer. */
+            float *scales = load_convrot_scale_values(dit, source->scale_name,
+                source->rows, job->error, sizeof(job->error));
+            int8_t *raw = scales ? malloc(source->elements) : NULL;
+            uint16_t *full = (raw && source->elements)
+                ? malloc((size_t)source->rows * source->columns *
+                         sizeof(uint16_t)) : NULL;
+            if (!raw || !full) {
+                free(scales); free(raw); free(full);
+                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
+                    "cannot allocate ConvRot streaming buffers");
+                job->ok = 0; break;
+            }
+            if (!convrot_read_weight(source->path, raw, source->elements,
+                                     source->file_offset)) {
+                free(scales); free(raw); free(full);
+                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
+                    "cannot read convrot int8 weight");
+                job->ok = 0; break;
+            }
+            /* qkv_proj is stored q/k/v-interleaved; remap to separated layout
+             * (layout == 1) so the unrotated weight lands at its true row. */
+            uint32_t layout = (source->field == STREAM_QKV) ? 1u : 0u;
+            int write_ok = 1;
+            for (uint32_t start = 0; start < source->rows; start += 1024) {
+                uint32_t count = source->rows - start < 1024 ?
+                    source->rows - start : 1024;
+                convrot_unrotate_cpu(
+                    raw + (size_t)start * source->columns, scales + start,
+                    full, start, count, source->columns,
+                    layout, HEADS, HEAD_DIM);
+            }
+            if (!h3_gpu_tensor_write_bf16(target, full,
+                    (size_t)source->rows * source->columns))
+                write_ok = 0;
+            free(scales); free(raw); free(full);
+            if (write_ok && job->layer == 0 &&
+                source->field == STREAM_OUT && getenv("H3_DEBUG_CONVROT")) {
+                uint16_t probe[8];
+                if (h3_gpu_tensor_read_bf16_range(target, 0, probe, 8)) {
+                    fprintf(stderr, "convrot debug: out_proj[0][0..7] =");
+                    for (int k = 0; k < 8; k++) {
+                        uint32_t bits = (uint32_t)probe[k] << 16;
+                        float v;
+                        memcpy(&v, &bits, sizeof(v));
+                        fprintf(stderr, " %.6f", v);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+            if (write_ok && job->layer == 0 &&
+                source->field == STREAM_QKV && getenv("H3_DEBUG_CONVROT")) {
+                uint16_t probe[8];
+                uint32_t rows[3] = {0, 7168u, 14336u};
+                const char *labels[3] = {"q[0]", "k[0]", "v[0]"};
+                for (int r = 0; r < 3; r++) {
+                    if (h3_gpu_tensor_read_bf16_range(
+                            target, (size_t)rows[r], probe, 8)) {
+                        fprintf(stderr, "convrot debug: qkv %s[0..7] =",
+                                labels[r]);
+                        for (int k = 0; k < 8; k++) {
+                            uint32_t bits = (uint32_t)probe[k] << 16;
+                            float v;
+                            memcpy(&v, &bits, sizeof(v));
+                            fprintf(stderr, " %.4f", v);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+            if (!write_ok) {
+                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
+                    "cannot write convrot weight: %s",
+                    h3_gpu_error(dit->gpu));
+                job->ok = 0; break;
+            }
+            job->bytes += (uint64_t)source->elements;
+        } else {
+            if (!h3_gpu_tensor_stream_file_bf16(target, source->path,
+                    source->file_offset, source->elements, job->error,
+                    sizeof(job->error))) {
+                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
+                    "invalid BF16 streaming destination");
+                job->ok = 0; break;
+            }
+            job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
         }
-        job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
-    }
-    /* When int8 is enabled, quantize the freshly read BF16 slot into its int8
-     * buffers + scales. The streamed-block resident footprint (and the GPU
-     * working set used by run_block) is then halved, with no change to the on-
-     * disk BF16 checkpoint format. run_block reads the int8 fields directly. */
-    h3_dit *dit = job->dit;
-    if (job->ok && (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) &&
-        !h3_gpu_begin(dit->gpu)) {
-        job->ok = 0;
     }
     if (job->ok && dit->int8_qkv &&
         !h3_gpu_quantize_weight_int8(dit->gpu, slot->qkv_int8,
@@ -765,22 +1153,17 @@ static int read_stream_layer(h3_dit_stream_job *job) {
              slot->fc1_scales, slot->fc1, FFN * 2, HIDDEN) ||
          !h3_gpu_quantize_weight_int8(dit->gpu, slot->fc2_int8,
              slot->fc2_scales, slot->fc2, HIDDEN, FFN))) job->ok = 0;
-    /* h3_gpu_submit requires an active command buffer created by h3_gpu_begin,
-     * which only runs when int8 quantization is active. With int8 off the read
-     * is pure CPU pread, so skip submit entirely (matches the non-streaming
-     * BF16 path and the original streaming behaviour). */
-    if (job->ok && (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) &&
-        !h3_gpu_submit(dit->gpu)) {
-        if (!job->error[0])
-            snprintf(job->error, sizeof(job->error),
-                     "DiT SSD stream submit failed");
+    if (gpu_work && job->ok && !h3_gpu_submit(dit->gpu)) {
+        if (!job->error[0]) snprintf(job->error, sizeof(job->error),
+            "DiT SSD stream submit failed");
         job->ok = 0;
     }
     /* Preserve a specific upstream error (BF16 read/open failure, invalid
      * request) instead of masking it with a generic int8 message. */
     if (!job->ok && !job->error[0])
         snprintf(job->error, sizeof(job->error),
-                 "int8 quantization of streamed DiT block failed");
+                 "int8 quantization of streamed DiT block failed: %s",
+                 h3_gpu_error(dit->gpu));
     job->seconds = stream_now() - started;
     return job->ok;
 }
@@ -3125,6 +3508,7 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
+    if (dit->convrot_hadamard) h3_gpu_tensor_free(dit->convrot_hadamard);
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->row_maps[step]);

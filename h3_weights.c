@@ -174,11 +174,16 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
         fail(error, error_size, "weight %s is too large for this process", name);
         return NULL;
     }
-    h3_gpu_tensor *result = dtype == H3_DTYPE_BF16 ?
-        h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
-                                (size_t)elements) :
-        h3_gpu_tensor_load_f32(gpu, header->path, tensor->file_offset,
-                               (size_t)elements);
+    h3_gpu_tensor *result;
+    if (dtype == H3_DTYPE_BF16)
+        result = h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
+                                        (size_t)elements);
+    else if (dtype == H3_DTYPE_I8)
+        result = h3_gpu_tensor_load_i8(gpu, header->path, tensor->file_offset,
+                                       (size_t)elements);
+    else
+        result = h3_gpu_tensor_load_f32(gpu, header->path, tensor->file_offset,
+                                        (size_t)elements);
     if (!result) {
         fail(error, error_size, "cannot load %s: %s", name, h3_gpu_error(gpu));
     }
@@ -198,5 +203,12 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   const uint64_t *shape,
                                   char *error, size_t error_size) {
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F32,
+                       error, error_size);
+}
+
+h3_gpu_tensor *h3_weight_load_i8(const h3_weight_store *store, h3_gpu *gpu,
+                                const char *name, int ndim, const uint64_t *shape,
+                                char *error, size_t error_size) {
+    return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_I8,
                        error, error_size);
 }

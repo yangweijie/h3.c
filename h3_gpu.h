@@ -52,7 +52,9 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
-                                      uint64_t file_offset, size_t elements);
+                                     uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
  * accounting are unchanged, so this may run on an I/O thread while another
  * tensor is in flight on the GPU. */
@@ -317,6 +319,13 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns);
+int h3_gpu_weight_dequant_unrotate_int8(h3_gpu *gpu, h3_gpu_tensor *output,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *scales,
+    const h3_gpu_tensor *hadamard, uint32_t rows, uint32_t columns,
+    uint32_t layout, uint32_t heads, uint32_t head_dim);
+int h3_gpu_convrot_remap_qkv_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+    const h3_gpu_tensor *input, uint32_t rows, uint32_t columns,
+    uint32_t layout, uint32_t heads, uint32_t head_dim);
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
