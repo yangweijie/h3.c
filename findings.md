@@ -409,3 +409,68 @@ B（引擎内化 ClipProj）已端到端验证通过，但"换 4B 生成快多�
 - `rsync` 默认先写 `.XXX` 临时文件再 rename，2× 峰值撑爆系统盘 → 改用 `cp -R -L`（直接写目标名，无临时文件峰值）。
 - Convrot 壳（`MiniMax-H3-Convrot`）是 24K symlink 壳；复制到系统盘须把 symlink 指向的真实文件/目录实体化，并补 `transformer/config.json` 与 `FL2VA/text_encoder` 目录（引擎存在性检查需要），否则报 "missing required model file"。
 - 全模型系统盘路径：`/Users/jay/h3_sys/MiniMax-H3-Convrot`（DiT+VAE+tokenizer+text_encoder→数据盘 symlink）、`/Users/jay/h3_sys/Qwen3-VL-4B-Instruct`、`/Users/jay/h3_sys/ClipProj-MiniMax-H3`。
+
+## ConvRot 旋转矩阵真相：radix-4 butterfly，非 Sylvester（2026-09-02，P11.1 实测钉死）
+
+- 用 `dbg_block_parity.py` 对 block 0 的 4 个 matmul 做 `dequant(i8*scale)` → 反旋转 → 与 base BF16 同张量 cosine 比对。
+- **正确形式 = radix-4 ConvRot butterfly**（与 `h3_dit.c:654-661` 注释一致）：stride = 1,4,16,64 四阶段，每 quad `(a,b,c,d) → (a+b+c-d, a+b-c+d, a-b+c+d, -a+b+c+d)`，整块最后 ×1/16（=1/√256）。引擎 `convrot_unrotate_cpu`（`h3_dit.c:591-633`）即此实现。
+- **陷阱（实测踩坑）**：自然序 Sylvester Hadamard（`H_{2n}=[[H,H],[H,-H]]/√2`）是**另一个矩阵**。用 Sylvester 反旋转得到 cos≈0.004（噪声级），且**旋转后比不旋转更差**（0.0039 vs 0.062）——这是识别该错误的诊断信号。`h3_dit.c` 注释早已警告："This is **NOT** the natural-order Sylvester Hadamard; using the popcount formula produces structurally corrupted output."
+- **R 乘向钉死 = 沿 K（输入 / 最后一维）**：`W_true = W_stored · R_K`，rot_size=256 分块对角。沿 out 维（`R_out · W`）cos 仅 ≈0.004 → 错。
+- **qkv 必须 formula B 行置换**：`dst_slot = 3*(src_slot % 56) + (src_slot // 56)`（heads=56, head_dim=128）。无置换 cos≈0.0008；置换后 0.99996。
+
+### 实测（block 0，四个 matmul）
+| 张量 | shape | 最佳假设 | cosine |
+|---|---|---|---|
+| qkv_proj | [21504, 5376] | butterfly(K) + permB | **+0.999961** |
+| out_proj | [5376, 7168] | butterfly(K) | +0.999928 |
+| fc1 | [28672, 5376] | butterfly(K) | +0.999961 |
+| fc2 | [5376, 14336] | butterfly(K) | +0.999956 |
+
+- **结论**：convrot int8 是 base BF16 的**忠实量化**（权重复现 cos≈0.99996，量化误差极小）。P8.1 的 formula B 结论**独立确认正确**。
+- **修正 P8.1 旧记录**：P8.1 报告的 "cos 每 slot≈0.90+" 应是用 Sylvester 矩阵的度量；用正确 radix-4 butterfly 后实为 **0.99996**。结论（formula B 正确）不变，但量化精度远好于当时认知。
+
+## base steps=4 对照：std 差异主因是步数，非量化（P11.2）
+
+- base + 4B ClipProj + steps4 + 数据盘：像素 std **55.77**（逐帧 55.5–56.0，非常稳定，22 帧）。
+- 对照 convrot_4（修复后）= **51.64** → 同 steps 下仅差 **7.4%**。
+- 而 base_20 = 37.76 → **steps 4→20 使 std 降约 18**（55.77 → 37.76）。
+- **结论**：此前 "convrot 51.64 vs base 37.76" 的表面巨大差异**主要来自步数不同**（4 vs 20），并非置换/量化缺陷。修复后的 convrot 与 base 在同 steps 下高度一致（差 ~7%，源自 int8 量化与采样随机性）。P8 flat 问题确已解决。
+
+## P12 调研：DiT 预取 vs VAE 预取（收益点重新评估）
+
+### DiT：已是 depth=1 双缓冲流水线，加深收益有限
+- `h3_dit.c:2710-2804`：`stream_slots[2]`（双缓冲），主循环 `run_block(N)` 期间 `pthread_create` 异步预取 block N+1 到 `slot^1`，随后 `h3_gpu_submit` + `pthread_join` 等待 → **预取与计算已重叠**。
+- **稳态分析**：总 wall 91s 中，I/O ≈ 71s（72 GiB @ 1.018 GiB/s）、GPU compute ≈ 47.3s、纯等盘 43.7s。I/O 是吞吐瓶颈 → 流水线吞吐 = `min(compute_rate, io_rate) = io_rate`，**加深 DiT 预取（depth>1）对稳态吞吐无改善**，仅在 I/O 突发抖动时起平滑作用。
+
+### VAE：完全串行无流水线 —— 这才是真正的收益点
+- `h3_video_vae.c:594-630` `run_stream_tile`：`for (index=0..35) { load_block(index); run_block(index); free; }` —— **I/O 与计算零重叠**。
+- 注释（539-543）明示常驻模式 "avoids **rereading 9 GiB per spatial tile**" → 反证**流式模式每个 tile 都要重读 9.7 GiB**；多 tile 时 I/O 成倍放大。
+- **优化方案**：给 `run_stream_tile` 加双缓冲预取（`load(N+1)` ‖ `run(N)`），可重叠 VAE 的 ~9.7 GiB I/O（≈9.5s @1.018 GiB/s，多 tile 则 ×tile 数）。**风险低于改 DiT 流式核心**（VAE 的 load/run 边界清晰，不涉及 `stream_slots` / `block_active` / 跨步调度）。
+
+### 理论下限
+- 即便 DiT+VAE 的 I/O 被计算完全掩盖，总时间受 `max(I/O 总量 ≈71s, GPU compute ≈47s)` 约束 → **~71s 是 I/O 侧硬下限**（除非进一步减读量或提带宽）。当前 91s → 理论可收 ~20s。
+
+## P12 实测：预取不是瓶颈解法（2026-09-02，重要的负面结论）
+
+### 已实现：VAE 双缓冲预取（`h3_video_vae.c`）
+- 新增 `vae_prefetch_job` / `vae_prefetch_thread`（后台线程调 `load_block`）+ `H3_VAE_PREFETCH` 开关（默认开，`=0` 关闭作 A/B 与安全回退）。
+- `run_stream_tile` 改造：循环前 prime `blocks[0]`；循环中 `pthread_create` 后台加载 `blocks[N+1]`，主线程 `begin → run_block(N) → submit`，随后 `pthread_join` 并 `free_block(N)`。
+- **关键设计**：block 直接后台装进**它自己的槽位** `vae->blocks[N+1]`（因 `run_block` 取 `&vae->blocks[index]`），故 `run_block` 零改动；代价仅多驻留 1 个 block（≈+0.27 GiB）。
+- 线程安全依据：`load_block` 最终走 `h3_gpu_tensor_load_f32`（文件→GPU buffer，**无命令编码**），与 DiT 预取线程"只做数据、不碰命令编码"的既有约定一致。
+
+### A/B 实测（steps=4 / 全模型系统盘 / convrot int8 / 4B ClipProj，同参数）
+| 配置 | 总耗时 |
+|---|---|
+| `H3_VAE_PREFETCH=0`（基线） | **91.78 s** |
+| `H3_VAE_PREFETCH=1`（预取） | **90.99 s** |
+| 收益 | **0.79 s（0.86%）** |
+
+- **正确性验证**：两产物 std **26.3232** / mean **251.1122** / 大小 **29020 B** **三者完全相同** → 预取未引入任何数值或编码回归。
+- **收益为何远低于预期**（预期 ~9.5s，实得 0.79s）：VAE 的 I/O 本就不是瓶颈——单 tile 只加载一次、OS page cache 命中、VAE 阶段以 GPU 计算为主导。
+
+### 结论：软件预取已近极限
+- **DiT 侧**：加深 slot 对稳态吞吐无改善（吞吐 = `min(compute, io)`，I/O 已瓶颈）→ 不实施，避免动刚修复的流式核心。
+- **VAE 侧**：实测仅 0.86% → 预取同样不是解法。
+- **根因**：91s 中约 71s 是 I/O 带宽硬约束（72 GiB @ 1.018 GiB/s），**重叠消除不了带宽上限**。
+- **保留该改动**（默认开启）：已验证输出逐位一致、无回归；且在**高分辨率/多 tile** 场景下 VAE 每 tile 重读 9.7 GiB 会被放大，收益随之上升。
+- **真正提速路径只剩**：① 更快存储（Thunderbolt/USB4，2–3 GB/s → I/O 71s 压到 ~25s）② 更大内存常驻去流式（>64GB）③ 继续减读量（int8 已做，20G vs 61.7G）④ 降 steps/分辨率（质量权衡）。

@@ -176,3 +176,44 @@
 - 完整对比：50层+数据盘 194s / 4B+数据盘 153s / 4B+系统盘(仅DiT/VAE) 94s / 4B+全模型系统盘 91s。SSD 流读 0.590→1.021 GiB/s，纯等盘 93→43s。
 - 产物校验：256×256/22帧/h264+aac/0.92s，像素 std=26.32（与数据盘 4B 版一致，非 flat）。
 - **结论**：瓶颈假设证实；全模型系统盘 91s 为当前最优。4B 文本位置影响仅 3s；GPU compute 下限 ~70s 是硬约束。
+
+## 2026-09-02 — P11 单 block 校验 + base steps=4 对照 + P12 预取调研
+
+### P11.1 单 block 数值校验（脚本 `dbg_block_parity.py`，新建）
+- **踩坑**：第一版用 Sylvester 自然序 Hadamard 矩阵，四张量 cosine 全 ≈0.06，且旋转后比不旋转更差（0.0039 vs 0.062）→ 诊断信号指向"矩阵形式错"。
+- **根因**：`h3_dit.c:654-661` 注释明示引擎用 **radix-4 ConvRot butterfly**（stride 1/4/16/64，quad→`(a+b+c-d, a+b-c+d, a-b+c+d, -a+b+c+d)`，×1/16），"**NOT** the natural-order Sylvester Hadamard"。改用 butterfly 后：
+  | 张量 | 最佳假设 | cosine |
+  |---|---|---|
+  | qkv | butterfly(K) + permB | **+0.999961** |
+  | out | butterfly(K) | +0.999928 |
+  | fc1 | butterfly(K) | +0.999961 |
+  | fc2 | butterfly(K) | +0.999956 |
+- **钉死**：R 沿 K（输入）维、rot_size=256、radix-4；沿 out 维仅 0.004（错）；qkv 必须 formula B 置换（无置换 0.0008）。convrot int8 = base 的忠实量化（cos 0.99996）。
+
+### P11.2 base steps=4 对照（PID 57371，已完成）
+- 产物 `/tmp/h3out/base_4b_s4.mp4`（135288 B，256×256/22帧/h264+aac）。
+- 像素 std **55.77**（逐帧 55.5–56.0）。convrot_4 = 51.64 → 同 steps 差仅 7.4%。
+- base_20 = 37.76 → steps 4→20 使 std 降 ~18。**结论：先前 std 差异主因是步数，非量化/置换**。
+
+### P11.3 convrot steps=20（PID 63336，**已完成**）
+- 产物 `/tmp/h3out/convrot_4b_s20.mp4`（29576 B，256×256/22帧）。
+- 像素 std **37.40**（逐帧 35.83–44.84，avg 37.30），mean 248.2。
+- **parity 达成**：base_20 std = 37.76 → 差异仅 **0.96%**。
+- mean 248 符合 prompt 语义（"a red ball bouncing on a **white floor**"，白地板占画面主体）；steps 4→20 使 mean 从 153→248、std 从 ~55→37，即去噪更收敛、浮现出白地板与红球结构。
+- **P11 结论**：convrot INT8（P8.1 修复后）与 base BF16 在 steps=4（差 7.4%）与 steps=20（差 0.96%）下均高度一致 → **量化路径数值正确，P8 flat 问题彻底解决**。
+
+### P12 预取调研（结论：收益点在 VAE，不在 DiT）
+- DiT（`h3_dit.c:2710-2804`）**已有** depth=1 双缓冲流水线（`stream_slots[2]`，算 N ‖ 读 N+1）；I/O 是吞吐瓶颈（71s vs compute 47.3s）→ 加深预取对稳态吞吐无改善。
+- VAE（`h3_video_vae.c:594-630` `run_stream_tile`）**完全串行无流水线**：`load→run→free` 逐块，I/O 与计算零重叠；且流式模式每 tile 重读 9.7 GiB。
+- **下一步**：给 `run_stream_tile` 加双缓冲预取（load(N+1) ‖ run(N)），预期回收 ~9.5s（多 tile 则×N）；风险低于改 DiT 核心。理论下限 ~71s（当前 91s）。
+
+### P12 实施与 A/B 实测（已完成）
+- **实施**：`h3_video_vae.c` 加 `vae_prefetch_job`/`vae_prefetch_thread` + `H3_VAE_PREFETCH` 开关；`run_stream_tile` 改双缓冲（prime block0，循环中后台加载 `blocks[N+1]` 到自身槽位，`run_block` 零改动，+0.27 GiB）。编译通过（lint 0 错误）。
+- **DiT 加深预取：判定无收益，不实施**（稳态吞吐 = min(compute, io)，I/O 已瓶颈 → 加深不改吞吐；避免动刚修复的 `h3_dit.c` 核心）。
+- **A/B 实测**（steps=4，全模型系统盘，convrot，4B ClipProj，同参数）：
+  - `H3_VAE_PREFETCH=0` → **91.78s**
+  - `H3_VAE_PREFETCH=1` → **90.99s**
+  - 收益 **0.79s（0.86%）**
+- **正确性**：两产物 std 26.3232 / mean 251.1122 / 29020 B **完全相同** → 无回归。
+- **结论**：收益远低于预期（VAE I/O 非瓶颈：单 tile + page cache + 计算主导）。**预取不是瓶颈解法，I/O 带宽才是**。保留代码（默认开，高分辨率/多 tile 场景收益会放大）。
+- 真提速只剩：更快存储（TB/USB4）→ I/O 71s→~25s；更大内存常驻；继续减读量；降 steps/分辨率。

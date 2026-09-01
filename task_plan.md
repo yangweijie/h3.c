@@ -133,3 +133,38 @@
   | **4B + 全模型系统盘** | **91 s** | 1.018 GiB/s | 43.7 s |
 - 产物校验：256×256 / 22 帧 / h264+aac / 0.92s，像素 std=26.32（与数据盘 4B 版一致，非 flat），质量无差。
 - **结论**：瓶颈假设被证实——DiT+VAE 流式读取 0.59→1.02 GiB/s，纯等盘 93→43 s，总耗时 153→91 s（提速 40%）。全模型系统盘 91s 为当前最优；混合版(94s)与之仅差 3s（因 4B 文本权重不计入那 72GiB 流式读取，仅一次性 load）。系统盘 NVMe 实测仅 ~1.02 GiB/s（未达内置盘上限），仍有上行空间（引擎更深预取 / 更快盘）；GPU compute 下限 ~70s 为硬约束。
+
+### P11 全量 parity 与单 block 数值校验 — `in_progress`（2026-09-02）
+- 背景：P8.1 修复（qkv 置换 formula A→B）后 convrot 输出从 flat(std 6.84) 恢复到 std 51.64，但**尚未与 base 做同条件 parity**；且 P8.1 的校验只覆盖 `qkv_proj` 一张量。
+- 子任务（按"快且能定论"优先）：
+  - **P11.1 单 block 数值校验**（离线 numpy，优先）：把 P8.1 的 per-slot cosine best-match 从 `qkv_proj` 扩展到 block 0 的全部 4 个 int8 matmul（`qkv_proj` / `out_proj` / `fc1` / `fc2`）。对每张量做 `dequant(i8*scale)` → 块 256 Hadamard 反旋转 → 与 base BF16 同张量比对，钉死 ① R 乘向（W·R vs R·W）② rot_size=256 分组 ③ qkv 的 formula B 置换。
+  - **P11.2 base steps=4 对照**（当前缺失）：已知 base_20 std=37.76、convrot_4(修复后) std=51.64，但 **base steps=4 未跑** → 无法判定 std 差异来自"步数"还是"量化/置换"。须补跑 base steps=4（4B ClipProj 同配置）。
+  - **P11.3 convrot steps=20（修复后）**：与 base steps=20 (std 37.76) 直接 parity。已知 convrot_20 **未修复**时为 8.58，修复后未跑。
+- 判定标准：同 steps 下 convrot 与 base 的逐帧 std / 像素分布应接近；偏离过大说明 int8/反旋转仍有数值问题。
+
+### P12 引擎更深流式预取（回收剩余 43s 等盘）— `in_progress`（调研中，2026-09-02）
+- 背景：P10 证实瓶颈是 DiT+VAE 流式 I/O（全模型系统盘 91s，纯等盘 43.7s，流读 1.018 GiB/s）。
+- 目标：增大流式预取深度（prefetch depth / stream slots），让 I/O 与计算更好重叠，回收部分 43.7s unhidden wait。
+- 调研清单（**先摸清现状再改**）：
+  - `h3_dit.c` 的 `stream_slots` / `stream_thread` / slot 数常量：当前深度、调度方式（`read_stream_layer`、信号量/条件变量同步）。
+  - DiT 4 个 streamed matmul（`STREAM_QKV`/`STREAM_OUT`/`STREAM_FC1`/`STREAM_FC2`）的 slot 分配粒度。
+  - VAE 流式路径 `run_stream_tile`（`h3_video_vae.c`）的预取策略：是否仅常驻 1 块、有无流水线。
+  - **内存账**：加大深度 = 更多 slot 常驻权重。DiT 单块 4 matmul ≈ 61.7GiB/50 ≈ 1.23GiB（int8 减半 ≈0.6GiB）；VAE 单块 ≈9.7GiB/36≈0.27GiB。16GB 统一内存下能开几个 slot（须留激活/文本编码器/ClipProj 空间）。
+  - `h3_memory_plan.c` 的 streaming-aware 估算是否随 slot 数变化，需同步更新常量。
+- **风险（P5 已警示）**：改动刚修复的流式核心（`h3_dit.c` stream_thread）有回归风险；须保留 `--ssd-streaming` 开关与原有 slot 数作为对照，分步加深。
+- **收益上限**：即便预取完美隐藏 I/O，GPU compute 下限 ~70s 仍无法突破 → 理论最多回收 91→~75s（约 16s）。
+
+### P12 实测结论 — `complete`（2026-09-02）：预取不是瓶颈解法，I/O 带宽才是
+- **DiT 加深预取：判定为无收益（不实施）**。稳态流水线吞吐 = `min(compute_rate, io_rate)`；当前 I/O 71s > compute 47.3s，I/O 已是瓶颈 → 加深 slot 数不改变吞吐。避免了对刚修复的 `h3_dit.c` 流式核心做高风险改动。
+- **VAE 预取：已实现并 A/B 实测**（`h3_video_vae.c`）：新增 `vae_prefetch_job` / `vae_prefetch_thread` 与 `H3_VAE_PREFETCH` 开关；`run_stream_tile` 改为双缓冲——循环前 prime block 0，循环中后台线程加载 `blocks[N+1]`（直接装进它自己的槽位，故 `run_block` 无需改动，仅多驻留 1 个 block ≈ +0.27 GiB）。
+- **A/B 实测**（steps=4 / 全模型系统盘 / convrot / 4B ClipProj，同参数）：
+  | 配置 | 总耗时 |
+  |---|---|
+  | `H3_VAE_PREFETCH=0`（基线） | 91.78 s |
+  | `H3_VAE_PREFETCH=1`（预取） | 90.99 s |
+  | **收益** | **0.79 s（0.86%）** |
+- **正确性**：两产物 std 26.3232 / mean 251.1122 / 29020 bytes **完全相同** → 预取未破坏输出，无回归。
+- **收益远低于预期（预期 ~9.5s，实得 0.79s）的原因**：VAE 的 I/O 并非瓶颈——单 tile 只加载一次、OS page cache 命中、且 VAE 阶段以 GPU 计算为主导。
+- **最终结论**：结合 DiT（加深无稳态收益）与 VAE（实测 0.86%）两端，**软件层预取已接近极限**；91s 中的 ~71s 是 I/O 带宽硬约束，无法靠重叠消除。
+- **决定**：保留代码并默认开启（已验证输出逐位一致、无回归；高分辨率/多 tile 场景下 VAE 重读放大、收益会上升），并提供 `H3_VAE_PREFETCH=0` 开关。
+- **真正提速只剩硬件/质量权衡**：① 更快存储（Thunderbolt/USB4，2–3 GB/s 可把 71s 压到 ~25s）② 更大内存以常驻去流式（>64GB）③ 继续减读量（int8 已做）④ 降 steps/分辨率。

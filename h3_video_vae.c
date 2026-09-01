@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 enum {
     LATENT_CHANNELS = 24,
@@ -201,6 +202,33 @@ static int load_block(vae_context *vae, int index, char *error,
 #undef F2
     return 1;
 }
+
+/* --- P12: async VAE block prefetch ------------------------------------- */
+/* run_stream_tile() was fully serial (load -> run -> free for every block), so
+ * the ~9.7 GiB of VAE weights streamed with zero overlap against the GPU
+ * decode.  This prefetches block N+1 on a worker thread while block N decodes,
+ * turning the loop into a 2-deep pipeline; only one extra block stays resident
+ * at a time (~0.27 GiB more).  The block loads straight into its own slot in
+ * vae->blocks[], so run_block() needs no change.
+ * H3_VAE_PREFETCH=0 disables it (A/B switch + safe fallback). */
+typedef struct {
+    vae_context *vae;
+    int index;
+    int ok;
+    char error[256];
+} vae_prefetch_job;
+
+static void *vae_prefetch_thread(void *opaque) {
+    vae_prefetch_job *job = (vae_prefetch_job *)opaque;
+    job->ok = load_block(job->vae, job->index, job->error, sizeof(job->error));
+    return NULL;
+}
+
+static int vae_prefetch_enabled(void) {
+    const char *flag = getenv("H3_VAE_PREFETCH");
+    return !(flag && *flag && strcmp(flag, "0") == 0);
+}
+/* --- end P12 ----------------------------------------------------------- */
 
 static int load_input_weights(vae_context *vae, char *error,
                               size_t error_size) {
@@ -620,17 +648,45 @@ static int run_stream_tile(vae_context *vae, char *error,
     OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
         (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
        "pack streamed video VAE suffix");
+    /* P12: prime block 0, then keep block N+1 loading while block N decodes. */
+    if (!load_block(vae, 0, error, error_size)) {
+        h3_gpu_tensor_free(zero);
+        return 0;
+    }
+    int prefetch_on = vae_prefetch_enabled();
     for (int index = 0; index < LAYERS; index++) {
-        if (!load_block(vae, index, error, error_size)) {
-            h3_gpu_tensor_free(zero);
-            return 0;
+        pthread_t prefetch_thread;
+        int prefetch_started = 0;
+        vae_prefetch_job job;
+        int next = index + 1;
+        if (prefetch_on && next < LAYERS) {
+            job.vae = vae;
+            job.index = next;
+            job.ok = 0;
+            job.error[0] = '\0';
+            if (pthread_create(&prefetch_thread, NULL, vae_prefetch_thread,
+                               &job) == 0)
+                prefetch_started = 1;
         }
         OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE transformer block");
         if (!run_block(vae, index, error, error_size)) {
+            if (prefetch_started) {
+                (void)pthread_join(prefetch_thread, NULL);
+                if (job.ok) free_block(&vae->blocks[next]);
+            }
             h3_gpu_tensor_free(zero);
             return 0;
         }
         OP(h3_gpu_submit(vae->gpu), "submit streamed video VAE block");
+        if (prefetch_started) {
+            (void)pthread_join(prefetch_thread, NULL);
+            if (!job.ok) {
+                fail(error, error_size,
+                     "cannot prefetch video VAE block %d: %s", next, job.error);
+                h3_gpu_tensor_free(zero);
+                return 0;
+            }
+        }
         free_block(&vae->blocks[index]);
     }
     OP(h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
