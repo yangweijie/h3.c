@@ -2,10 +2,12 @@
 #include "h3_cli.h"
 #include "h3_host.h"
 #include "h3_terminal.h"
+#include "h3_ffmpeg.h"
 
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +62,12 @@ static void usage(const char *program) {
         "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
+        "      --sr               Super-resolve the output with Real-ESRGAN\n"
+        "      --sr-bin PATH      Directory holding realesrgan-ncnn-vulkan\n"
+        "      --sr-model-dir PATH  Real-ESRGAN models directory\n"
+        "      --sr-model NAME    Model name (default: realesrgan-x4plus)\n"
+        "      --sr-target WxH    Final resolution after SR (else inner*scale)\n"
+        "      --sr-scale N       Upscale 2/3/4 when no --sr-target (default 4)\n"
         "  -h, --help             Show this help\n",
         program, program, program);
 }
@@ -102,6 +110,26 @@ static uint64_t parse_u64(const char *value, const char *label) {
         exit(2);
     }
     return (uint64_t)parsed;
+}
+
+static void parse_wh(const char *value, int *width, int *height) {
+    char *middle = NULL;
+    char *end = NULL;
+    errno = 0;
+    long w = strtol(value, &middle, 10);
+    if (errno || middle == value || (*middle != 'x' && *middle != 'X')) {
+        fprintf(stderr, "h3: invalid WxH: %s\n", value);
+        exit(2);
+    }
+    errno = 0;
+    long h = strtol(middle + 1, &end, 10);
+    while (end && isspace((unsigned char)*end)) end++;
+    if (errno || end == middle + 1 || !end || *end || w < 1 || h < 1) {
+        fprintf(stderr, "h3: invalid WxH: %s\n", value);
+        exit(2);
+    }
+    *width = (int)w;
+    *height = (int)h;
 }
 
 static h3_reference *append_reference(h3_reference references[12],
@@ -253,7 +281,9 @@ int main(int argc, char **argv) {
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
-           OPT_PROFILE, OPT_INFO };
+           OPT_PROFILE, OPT_INFO,
+           OPT_SR, OPT_SR_BIN, OPT_SR_MODEL_DIR, OPT_SR_MODEL,
+           OPT_SR_TARGET, OPT_SR_SCALE };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -307,6 +337,12 @@ int main(int argc, char **argv) {
         {"zoom", required_argument, NULL, OPT_ZOOM},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
+        {"sr", no_argument, NULL, OPT_SR},
+        {"sr-bin", required_argument, NULL, OPT_SR_BIN},
+        {"sr-model-dir", required_argument, NULL, OPT_SR_MODEL_DIR},
+        {"sr-model", required_argument, NULL, OPT_SR_MODEL},
+        {"sr-target", required_argument, NULL, OPT_SR_TARGET},
+        {"sr-scale", required_argument, NULL, OPT_SR_SCALE},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
@@ -323,6 +359,12 @@ int main(int argc, char **argv) {
     int frames_given = 0;
     int seconds_given = 0;
     int seed_given = 0;
+    int sr_enabled = 0;
+    const char *sr_bin = NULL;
+    const char *sr_model_dir = NULL;
+    const char *sr_model = "realesrgan-x4plus";
+    int sr_target_w = 0, sr_target_h = 0;
+    int sr_scale = 4;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
         switch (option) {
@@ -465,11 +507,31 @@ int main(int argc, char **argv) {
                 break;
             case OPT_PROFILE: profile = 1; break;
             case OPT_INFO: info = 1; break;
+            case OPT_SR: sr_enabled = 1; break;
+            case OPT_SR_BIN: sr_bin = optarg; break;
+            case OPT_SR_MODEL_DIR: sr_model_dir = optarg; break;
+            case OPT_SR_MODEL: sr_model = optarg; break;
+            case OPT_SR_TARGET:
+                parse_wh(optarg, &sr_target_w, &sr_target_h);
+                break;
+            case OPT_SR_SCALE: {
+                int s = parse_int(optarg, "sr-scale");
+                if (s < 2 || s > 4) {
+                    fprintf(stderr, "h3: --sr-scale must be 2, 3, or 4\n");
+                    return 2;
+                }
+                sr_scale = s;
+                break;
+            }
             default: usage(argv[0]); return 2;
         }
     }
     if (!model_dir) {
         usage(argv[0]);
+        return 2;
+    }
+    if (sr_enabled && (!sr_bin || !sr_model_dir)) {
+        fprintf(stderr, "h3: --sr requires --sr-bin and --sr-model-dir\n");
         return 2;
     }
     if (frames_given && seconds_given) {
@@ -522,6 +584,35 @@ int main(int argc, char **argv) {
             return 1;
         }
         h3_result_free(result);
+        if (sr_enabled) {
+            char sr_error[512];
+            char lr_path[4096];
+            int lr_len = snprintf(lr_path, sizeof(lr_path), "%s.lr.mp4",
+                                  output);
+            if (lr_len < 0 || (size_t)lr_len >= sizeof(lr_path)) {
+                fprintf(stderr, "h3: SR output path too long\n");
+            } else if (rename(output, lr_path) != 0) {
+                fprintf(stderr, "h3: cannot stage low-res for SR: %s\n",
+                        strerror(errno));
+            } else {
+                fprintf(stderr,
+                        "h3: super-resolving with %s (x%d) -> %dx%d ...\n",
+                        sr_model, sr_scale,
+                        sr_target_w ? sr_target_w : 0,
+                        sr_target_h ? sr_target_h : 0);
+                if (h3_superres(lr_path, output, sr_bin, sr_model_dir,
+                                sr_model, sr_scale, sr_target_w,
+                                sr_target_h, sr_error, sizeof(sr_error))) {
+                    fprintf(stderr,
+                            "h3: super-resolved -> %s (low-res: %s)\n",
+                            output, lr_path);
+                } else {
+                    fprintf(stderr, "h3: super-resolution failed: %s\n",
+                            sr_error);
+                    rename(lr_path, output);
+                }
+            }
+        }
         if (output && *output) fprintf(stderr, "h3: wrote %s\n", output);
         if (cli.frames_dir)
             fprintf(stderr, "h3: wrote frames to %s\n", cli.frames_dir);

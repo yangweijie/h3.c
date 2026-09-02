@@ -44,6 +44,12 @@ typedef struct {
     int completed;
     int total;
     int display_failed;
+    int sr_enabled;
+    char *sr_bin;
+    char *sr_model_dir;
+    char *sr_model;
+    int sr_target_w, sr_target_h;
+    int sr_scale;
 } h3_cli_state;
 
 static char *skip_spaces(char *text) {
@@ -175,6 +181,8 @@ static void print_help(void) {
     puts("  !open [on|off]           Toggle opening completed videos");
     puts("  !output [DIR]            Set or show the output directory");
     puts("  !save [PATH]             Copy the last generated video");
+    puts("  !sr [on|off|bin PATH|model-dir PATH|model NAME|target WxH|scale N]");
+    puts("                           Super-resolution post-processing (Real-ESRGAN)");
     puts("  !again                   Repeat the last prompt");
     puts("  !cache                   Show reusable-session cache state");
     puts("  !cache clear             Clear reusable-session caches");
@@ -211,6 +219,11 @@ static void print_status(const h3_cli_state *state) {
     printf("Show: %s | open: %s | output: %s\n",
            state->show ? "on" : "off", state->open_output ? "on" : "off",
            state->output_dir);
+    if (state->sr_enabled)
+        printf("SR: on (%s x%d -> %dx%d)\n", state->sr_model, state->sr_scale,
+               state->sr_target_w ? state->sr_target_w : 0,
+               state->sr_target_h ? state->sr_target_h : 0);
+    else printf("SR: off\n");
 }
 
 static int parse_toggle(char *argument, int current, int *value) {
@@ -459,6 +472,34 @@ static int generate(h3_cli_state *state, const char *prompt) {
         return 0;
     }
     h3_result_free(result);
+    if (state->sr_enabled) {
+        char sr_error[512];
+        char lr_path[4096];
+        int lr_len = snprintf(lr_path, sizeof(lr_path), "%s.lr.mp4", output);
+        if (lr_len < 0 || (size_t)lr_len >= sizeof(lr_path))
+            fprintf(stderr, "h3: SR output path too long\n");
+        else if (rename(output, lr_path) != 0)
+            fprintf(stderr, "h3: cannot stage low-res for SR: %s\n",
+                    strerror(errno));
+        else {
+            fprintf(stderr,
+                    "h3: super-resolving with %s (x%d) -> %dx%d ...\n",
+                    state->sr_model, state->sr_scale,
+                    state->sr_target_w ? state->sr_target_w : 0,
+                    state->sr_target_h ? state->sr_target_h : 0);
+            if (h3_superres(lr_path, output, state->sr_bin,
+                            state->sr_model_dir, state->sr_model,
+                            state->sr_scale, state->sr_target_w,
+                            state->sr_target_h, sr_error, sizeof(sr_error))) {
+                fprintf(stderr, "h3: super-resolved -> %s (low-res: %s)\n",
+                        output, lr_path);
+            } else {
+                fprintf(stderr, "h3: super-resolution failed: %s\n",
+                        sr_error);
+                rename(lr_path, output);
+            }
+        }
+    }
     double elapsed = (double)(end.tv_sec - begin.tv_sec) +
         (double)(end.tv_nsec - begin.tv_nsec) / 1e9;
     snprintf(state->last_output, sizeof(state->last_output), "%s", output);
@@ -731,6 +772,51 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                    state->params.video_vae_streaming,
                    state->params.encoder_streaming, state->params.dit_layers);
         }
+    } else if (!strcasecmp(command, "sr")) {
+        char *sub = skip_spaces(argument);
+        if (!*sub) {
+            state->sr_enabled = !state->sr_enabled;
+            printf("SR: %s\n", state->sr_enabled ? "on" : "off");
+        } else {
+            char *tok = sub;
+            while (*tok && !isspace((unsigned char)*tok)) tok++;
+            int had = *tok;
+            if (had) *tok = '\0';
+            char *val = had ? skip_spaces(tok + 1) : (char *)"";
+            if (!strcasecmp(sub, "off")) {
+                state->sr_enabled = 0; puts("SR: off");
+            } else if (!strcasecmp(sub, "on")) {
+                state->sr_enabled = 1; puts("SR: on");
+            } else if (!strcasecmp(sub, "bin")) {
+                free(state->sr_bin);
+                state->sr_bin = *val ? strdup(val) : NULL;
+                printf("SR bin: %s\n", state->sr_bin ? state->sr_bin : "none");
+            } else if (!strcasecmp(sub, "model-dir")) {
+                free(state->sr_model_dir);
+                state->sr_model_dir = *val ? strdup(val) : NULL;
+                printf("SR model-dir: %s\n",
+                       state->sr_model_dir ? state->sr_model_dir : "none");
+            } else if (!strcasecmp(sub, "model")) {
+                free(state->sr_model);
+                state->sr_model = *val ? strdup(val)
+                                       : strdup("realesrgan-x4plus");
+                printf("SR model: %s\n", state->sr_model);
+            } else if (!strcasecmp(sub, "target")) {
+                int w, h;
+                if (parse_size(val, &w, &h)) {
+                    state->sr_target_w = w; state->sr_target_h = h;
+                    printf("SR target: %dx%d\n", w, h);
+                } else fprintf(stderr, "h3: target must be WxH\n");
+            } else if (!strcasecmp(sub, "scale")) {
+                int v;
+                if (parse_i32(val, 2, 4, &v)) {
+                    state->sr_scale = v;
+                    printf("SR scale: %d\n", v);
+                } else fprintf(stderr, "h3: scale must be 2/3/4\n");
+            } else fprintf(stderr,
+                     "h3: !sr [on|off|bin PATH|model-dir PATH|model NAME"
+                     "|target WxH|scale N]\n");
+        }
     } else {
         fprintf(stderr, "h3: unknown command; type !help\n");
     }
@@ -759,6 +845,13 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     state.random_seed = !seed_was_given;
     state.terminal = h3_terminal_detect();
     state.show = show && state.terminal != H3_TERM_NONE;
+    state.sr_enabled = 0;
+    state.sr_bin = NULL;
+    state.sr_model_dir = NULL;
+    state.sr_model = strdup("realesrgan-x4plus");
+    state.sr_target_w = 0;
+    state.sr_target_h = 0;
+    state.sr_scale = 4;
     if (initial->first_frame) state.first_frame = strdup(initial->first_frame);
     if (initial->last_frame) state.last_frame = strdup(initial->last_frame);
     if ((initial->first_frame && !state.first_frame) ||
@@ -836,6 +929,9 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     free(state.first_frame);
     free(state.last_frame);
     free(state.last_prompt);
+    free(state.sr_bin);
+    free(state.sr_model_dir);
+    free(state.sr_model);
     clear_references(&state);
     puts("Goodbye.");
     return 0;

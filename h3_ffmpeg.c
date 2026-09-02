@@ -1,6 +1,7 @@
 #include "h3_ffmpeg.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -752,4 +753,167 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         return 0;
     }
     return 1;
+}
+
+/* h3 always emits 24 fps video; mirror H3_FPS from h3_host.h locally. */
+#define H3_SR_FPS 24
+
+/* Spawn an external program (searched via PATH) and wait for it to exit.
+ * Returns 0 on success, -1 on spawn/wait failure or non-zero exit. */
+static int run_command(char *const argv[], char *error, size_t error_size) {
+    pid_t child = -1;
+    int code = posix_spawnp(&child, argv[0], NULL, NULL, argv, environ);
+    if (code != 0) {
+        fail(error, error_size, "cannot start %s: %s", argv[0], strerror(code));
+        return -1;
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        fail(error, error_size, "cannot wait for %s: %s", argv[0],
+             strerror(errno));
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail(error, error_size, "%s failed (exit %d)", argv[0],
+             WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return -1;
+    }
+    return 0;
+}
+
+int h3_superres(const char *input_path, const char *output_path,
+                const char *sr_bin_dir, const char *sr_model_dir,
+                const char *sr_model_name, int scale,
+                int target_width, int target_height,
+                char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!input_path || !*input_path || !output_path || !*output_path ||
+        !sr_bin_dir || !*sr_bin_dir || !sr_model_dir || !*sr_model_dir ||
+        !sr_model_name || !*sr_model_name) {
+        fail(error, error_size, "invalid super-resolution arguments");
+        return 0;
+    }
+    if (scale < 2) scale = 2;
+    if (scale > 4) scale = 4;
+
+    char bin[PATH_MAX];
+    snprintf(bin, sizeof(bin), "%s/realesrgan-ncnn-vulkan", sr_bin_dir);
+    if (access(bin, X_OK) != 0) {
+        fail(error, error_size, "realesrgan binary not executable: %s (%s)",
+             bin, strerror(errno));
+        return 0;
+    }
+    char mbin[PATH_MAX], mpar[PATH_MAX];
+    snprintf(mbin, sizeof(mbin), "%s/%s.bin", sr_model_dir, sr_model_name);
+    snprintf(mpar, sizeof(mpar), "%s/%s.param", sr_model_dir, sr_model_name);
+    if (access(mbin, R_OK) != 0 || access(mpar, R_OK) != 0) {
+        fail(error, error_size, "realesrgan model missing: %s / %s", mbin, mpar);
+        return 0;
+    }
+
+    int inner_w = 0, inner_h = 0;
+    if (!h3_ffprobe_visual_size(input_path, &inner_w, &inner_h,
+                                error, error_size))
+        return 0;
+
+    int resize_after = 0;
+    if (target_width > 0 && target_height > 0) {
+        if (inner_w > 0 && target_width % inner_w == 0 &&
+            target_height % inner_h == 0 &&
+            target_width / inner_w == target_height / inner_h) {
+            int quotient = target_width / inner_w;
+            if (quotient >= 2 && quotient <= 4) scale = quotient;
+            else { scale = 4; resize_after = 1; }
+        } else {
+            scale = 4; resize_after = 1;
+        }
+    } else {
+        target_width = inner_w * scale;
+        target_height = inner_h * scale;
+    }
+
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "/tmp/h3-sr-XXXXXX");
+    if (!mkdtemp(tmp)) {
+        fail(error, error_size, "cannot create SR temp dir: %s", strerror(errno));
+        return 0;
+    }
+    char indir[PATH_MAX], outdir[PATH_MAX];
+    snprintf(indir, sizeof(indir), "%s/in", tmp);
+    snprintf(outdir, sizeof(outdir), "%s/out", tmp);
+    if (mkdir(indir, 0755) != 0 || mkdir(outdir, 0755) != 0) {
+        fail(error, error_size, "cannot create SR work dirs: %s", strerror(errno));
+        run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+        return 0;
+    }
+
+    char frame_pattern[PATH_MAX];
+    snprintf(frame_pattern, sizeof(frame_pattern), "%s/%%05d.png", indir);
+    char *const extract_argv[] = {
+        (char *)ffmpeg_program(), "-y", "-loglevel", "error",
+        "-i", (char *)input_path,
+        frame_pattern, NULL
+    };
+    if (run_command(extract_argv, error, error_size) != 0) {
+        run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+        return 0;
+    }
+
+    char scale_buf[8];
+    snprintf(scale_buf, sizeof(scale_buf), "%d", scale);
+    char *const sr_argv[] = {
+        bin, "-i", indir, "-o", outdir, "-n", (char *)sr_model_name,
+        "-s", scale_buf, "-m", (char *)sr_model_dir, "-j", "1:2:2", NULL
+    };
+    if (run_command(sr_argv, error, error_size) != 0) {
+        run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+        return 0;
+    }
+
+    char out_pattern[PATH_MAX];
+    snprintf(out_pattern, sizeof(out_pattern), "%s/%%05d.png", outdir);
+    char fps_buf[8];
+    snprintf(fps_buf, sizeof(fps_buf), "%d", H3_SR_FPS);
+
+    const char *frames_for_encode = out_pattern;
+    char resize_pattern[PATH_MAX];
+    if (resize_after) {
+        snprintf(resize_pattern, sizeof(resize_pattern), "%s/r%%05d.png", tmp);
+        char scale_filter[64];
+        snprintf(scale_filter, sizeof scale_filter, "scale=%d:%d",
+                 target_width, target_height);
+        char *const resize_argv[] = {
+            (char *)ffmpeg_program(), "-y", "-loglevel", "error",
+            "-i", out_pattern, "-vf", scale_filter, resize_pattern, NULL
+        };
+        if (run_command(resize_argv, error, error_size) != 0) {
+            run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+            return 0;
+        }
+        frames_for_encode = resize_pattern;
+    }
+    char *enc_argv[40] = {0};
+    int next = 0;
+    enc_argv[next++] = (char *)ffmpeg_program();
+    enc_argv[next++] = "-y"; enc_argv[next++] = "-loglevel"; enc_argv[next++] = "error";
+    enc_argv[next++] = "-r"; enc_argv[next++] = fps_buf;
+    enc_argv[next++] = "-i"; enc_argv[next++] = (char *)frames_for_encode;
+
+    enc_argv[next++] = "-i"; enc_argv[next++] = (char *)input_path;
+    enc_argv[next++] = "-map"; enc_argv[next++] = "0:v:0";
+    enc_argv[next++] = "-map"; enc_argv[next++] = "1:a:0?";
+    enc_argv[next++] = "-c:v"; enc_argv[next++] = "libx264";
+    enc_argv[next++] = "-preset"; enc_argv[next++] = "fast";
+    enc_argv[next++] = "-crf"; enc_argv[next++] = "16";
+    enc_argv[next++] = "-pix_fmt"; enc_argv[next++] = "yuv420p";
+    enc_argv[next++] = "-c:a"; enc_argv[next++] = "aac";
+    enc_argv[next++] = "-b:a"; enc_argv[next++] = "192k";
+    enc_argv[next++] = "-shortest";
+    enc_argv[next++] = "-movflags"; enc_argv[next++] = "+faststart";
+    enc_argv[next++] = (char *)output_path;
+    enc_argv[next] = NULL;
+    int ok = run_command(enc_argv, error, error_size) == 0;
+    run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+    return ok;
 }

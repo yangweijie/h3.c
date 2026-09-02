@@ -46,4 +46,15 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
                                  int channels, int sample_rate,
                                  char *error, size_t error_size);
 
+/* Post-process a generated video with an external Real-ESRGAN ncnn-vulkan
+ * binary: extract frames, upscale by `scale` (2/3/4) or to an explicit target
+ * resolution, then re-mux preserving the original audio track. `target_width`
+ * / `target_height` of 0 means auto (inner * scale). The inner (pre-SR)
+ * resolution is detected from the input file. */
+int h3_superres(const char *input_path, const char *output_path,
+                const char *sr_bin_dir, const char *sr_model_dir,
+                const char *sr_model_name, int scale,
+                int target_width, int target_height,
+                char *error, size_t error_size);
+
 #endif
