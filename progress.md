@@ -217,3 +217,23 @@
 - **正确性**：两产物 std 26.3232 / mean 251.1122 / 29020 B **完全相同** → 无回归。
 - **结论**：收益远低于预期（VAE I/O 非瓶颈：单 tile + page cache + 计算主导）。**预取不是瓶颈解法，I/O 带宽才是**。保留代码（默认开，高分辨率/多 tile 场景收益会放大）。
 - 真提速只剩：更快存储（TB/USB4）→ I/O 71s→~25s；更大内存常驻；继续减读量；降 steps/分辨率。
+
+## 2026-09-02 — P13 加载器 dtype 转换分支（突破 39 GiB 下限）
+
+### 调研（含更正）
+- 4B INT8 文本（4.53 GiB）：I8+`_scale`[out,1]，对拍 BF16 → cos(dequant) 0.062 / cos(unrotate) **0.99996** → 必须 radix-4 反旋转；q/k/v 分离无需 formula B。
+- **VAE 更正**：ModelScope "INT8-CONVROT" 包的 video_vae 实为 **FP16**（560 张量全 F16，4.85 GiB = 本地 F32 10.4G 的一半），需 F16→F32 加宽而非 int8 反量化。
+
+### 实现（h3_weights.c，编译通过）
+- `load_int8_dequantized`（dequant + ConvRot radix-4 反旋转，`H3_INT8_UNROTATE=0` 可跳过）+ `load_f16_as_float`（f16→f32 加宽）；`load_tensor` 的 dtype 检查为两类放行并分流。
+
+### 验证（steps4 / 256×256，22 帧产物）
+| 配置 | 耗时 | std | mean |
+|---|---|---|---|
+| BF16-text + F32-VAE（基线） | 90.99 s | 26.3232 | 251.1122 |
+| INT8-text + F32-VAE | 94.53 s | 25.0403 | 251.4139 |
+| BF16-text + FP16-VAE | 91.19 s | 26.3390 | 251.1147 |
+| **INT8-text + FP16-VAE（最小）** | 93.85 s | **25.0432** | 251.4139 |
+
+- FP16 VAE 近乎无损（+0.06%）；INT8 文本 −4.9%；误差可加无交互劣化。
+- **新下限 ≈30.0 GiB**（原 39 GiB，省 9 GiB / 23%）。

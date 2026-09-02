@@ -474,3 +474,32 @@ B（引擎内化 ClipProj）已端到端验证通过，但"换 4B 生成快多�
 - **根因**：91s 中约 71s 是 I/O 带宽硬约束（72 GiB @ 1.018 GiB/s），**重叠消除不了带宽上限**。
 - **保留该改动**（默认开启）：已验证输出逐位一致、无回归；且在**高分辨率/多 tile** 场景下 VAE 每 tile 重读 9.7 GiB 会被放大，收益随之上升。
 - **真正提速路径只剩**：① 更快存储（Thunderbolt/USB4，2–3 GB/s → I/O 71s 压到 ~25s）② 更大内存常驻去流式（>64GB）③ 继续减读量（int8 已做，20G vs 61.7G）④ 降 steps/分辨率（质量权衡）。
+
+## P13 突破 39 GiB 下限：加载器 dtype 转换分支（2026-09-02）
+
+### 根因
+引擎只有 DiT 实现了 INT8 路径；文本编码器与 VAE 走 `h3_weight_load_f32/bf16`，而 `h3_weights.c` 的 `load_tensor` 对 `tensor->dtype != dtype` 直接 fail（P9 实测的 `I8/2, expected BF16/2`）。→ 只需在**加载器**加转换，不必给每个模块写 int8 kernel。
+
+### 实现（`h3_weights.c`）
+`load_tensor` 增加两类转换分支，并把 dtype 检查改为对其放行：
+- `load_int8_dequantized`：I8 + `{name}_scale`（F32 `[out,1]`）→ `dequant = i8 * scale[row]` → **ConvRot 反旋转**（radix-4 butterfly 沿 K 维、块 256、×1/16，与 `h3_dit.c convrot_unrotate_cpu` 同约定）→ 转 BF16/F32 上传。`H3_INT8_UNROTATE=0` 可跳过旋转（兼容纯 int8 文件）。
+- `load_f16_as_float`：F16 → `f16_to_f32` 加宽 → 转 BF16/F32 上传。
+
+### 格式调研（含一处重要更正）
+- **4B INT8 文本**（`qwen3vl_4b_int8_convrot.safetensors`，4.53 GiB）：1421 张量（I8 354 / BF16 359 / F32 354 / U8 354）；scale = `{key}_scale` F32 `[out,1]` 逐输出通道，带 `comfy_quant`。对拍 BF16 原版：**cos(dequant)=0.062 → cos(unrotate(K))=0.99996** → **必须反旋转**。q/k/v 是分离的 `q_proj/k_proj/v_proj`，**无需** formula B 置换。
+- **VAE 更正**：`Gluttony10/MiniMax-H3-INT8-CONVROT` 的 `MiniMax-H3-video_vae.safetensors`（4.85 GiB）解析后 **560 张量全为 F16，无 I8、无量化 scale**（那 72 个 `scale` 是 AdaLN 的 `scale1/scale2`，非量化 scale）。即它是 **FP16 VAE**（本地 F32 版 10.4 GB 的一半），需要的是 **F16→F32 加宽**，不是 int8 反量化。
+
+### 验证（同 prompt / steps4 / 256×256）
+| 配置 | std | mean | 相对基线 |
+|---|---|---|---|
+| BF16-text + F32-VAE（基线） | 26.3232 | 251.1122 | — |
+| INT8-text + F32-VAE | 25.0403 | 251.4139 | std −4.9% |
+| BF16-text + FP16-VAE | 26.3390 | 251.1147 | std **+0.06%** |
+| **INT8-text + FP16-VAE（最小）** | **25.0432** | 251.4139 | std −4.9% |
+
+- **FP16 VAE 近乎无损**（0.06%，符合"F32→F16 存储、加载时加宽"的预期）；**INT8 文本误差 4.9%**（int8 量化 + bf16 反旋转的累积，可接受）。
+- **误差可加、无交互劣化**：25.0432 ≈ 26.3232 − 1.28(文本) + 0.016(VAE) ✓
+
+### 新下限
+DiT 19.53 + FP16 VAE 4.85 + audio VAE 0.56 + tokenizer 0.01 + INT8 4B 文本 4.53 + ClipProj 0.48 = **≈30.0 GiB**（原 39 GiB，**省 9 GiB / 23%**）。
+- 若要再降：VAE 走真 int8（需另找 int8 VAE，当前 FP16 已是该包提供的形态）；4B 文本改 int4（引擎无 int4 支持）。

@@ -1,10 +1,13 @@
 #include "h3_weights.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 struct h3_weight_store {
     h3_st_header *headers;
@@ -141,6 +144,230 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
     return NULL;
 }
 
+/* --- P13: INT8 (ConvRot) -> BF16/F32 dequantisation --------------------- */
+/* Quantized MiniMax checkpoints store the big matmuls as I8 plus a
+ * per-output-channel F32 scale `{name}_scale` of shape [rows, 1], and the
+ * weights are stored pre-rotated by the ConvRot transform.  Callers that ask
+ * for BF16/F32 (video VAE, ClipProj text encoder) previously just failed the
+ * dtype check; we now dequantise on the CPU and undo the rotation so those
+ * callers can consume the quantized files directly.
+ *   dequant: w = i8 * scale[row]
+ *   unrotate: radix-4 butterfly over the input dim in blocks of 256, x1/16
+ * The butterfly mirrors h3_dit.c convrot_unrotate_cpu (stages 1,4,16,64).
+ * H3_INT8_UNROTATE=0 skips the butterfly for plain (non-ConvRot) INT8 files. */
+#define H3_INT8_BLOCK 256
+
+static int int8_unrotate_enabled(void) {
+    const char *flag = getenv("H3_INT8_UNROTATE");
+    return !(flag && *flag && strcmp(flag, "0") == 0);
+}
+
+static void convrot_unrotate_row(float *values) {
+    for (int stride = 1; stride < H3_INT8_BLOCK; stride *= 4) {
+        int span = stride * 4;
+        for (int base = 0; base < H3_INT8_BLOCK; base += span)
+            for (int lane = 0; lane < stride; lane++) {
+                int i0 = base + lane, i1 = i0 + stride,
+                    i2 = i0 + 2 * stride, i3 = i0 + 3 * stride;
+                float a = values[i0], b = values[i1],
+                      c = values[i2], d = values[i3];
+                values[i0] = a + b + c - d;
+                values[i1] = a + b - c + d;
+                values[i2] = a - b + c + d;
+                values[i3] = -a + b + c + d;
+            }
+    }
+    for (int k = 0; k < H3_INT8_BLOCK; k++)
+        values[k] *= (1.0f / 16.0f);
+}
+
+static uint16_t f32_to_bf16_u16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += ((bits >> 16) & 1u) + 0x7fffu; /* round to nearest even */
+    return (uint16_t)(bits >> 16);
+}
+
+static int pread_bytes(const char *path, uint64_t offset, void *destination,
+                       size_t bytes) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t count = pread(fd, (char *)destination + done, bytes - done,
+                              (off_t)(offset + done));
+        if (count <= 0) { close(fd); return 0; }
+        done += (size_t)count;
+    }
+    close(fd);
+    return 1;
+}
+
+static h3_gpu_tensor *load_int8_dequantized(const h3_weight_store *store,
+                                            h3_gpu *gpu, const char *name,
+                                            const h3_st_tensor *tensor,
+                                            const h3_st_header *header,
+                                            size_t elements, h3_dtype dtype,
+                                            char *error, size_t error_size) {
+    char scale_name[512];
+    int written = snprintf(scale_name, sizeof(scale_name), "%s_scale", name);
+    if (written < 0 || (size_t)written >= sizeof(scale_name)) {
+        fail(error, error_size, "weight name is too long: %s", name);
+        return NULL;
+    }
+    const h3_st_header *scale_header = NULL;
+    const h3_st_tensor *scale = h3_weight_find(store, scale_name, &scale_header);
+    if (!scale) {
+        fail(error, error_size, "int8 weight %s is missing %s", name,
+             scale_name);
+        return NULL;
+    }
+    if (scale->dtype != H3_DTYPE_F32 || scale->shape[1] != 1) {
+        fail(error, error_size,
+             "int8 weight %s: %s must be F32 [rows,1], got %s [%llu,%llu]",
+             name, scale_name, h3_dtype_name(scale->dtype),
+             (unsigned long long)scale->shape[0],
+             (unsigned long long)scale->shape[1]);
+        return NULL;
+    }
+    size_t rows = (size_t)scale->shape[0];
+    if (rows == 0 || elements % rows) {
+        fail(error, error_size,
+             "int8 weight %s: %zu scale rows do not divide %zu elements",
+             name, rows, elements);
+        return NULL;
+    }
+    size_t columns = elements / rows;
+    int unrotate = int8_unrotate_enabled();
+    if (unrotate && columns % H3_INT8_BLOCK) {
+        fail(error, error_size,
+             "int8 weight %s: input dim %zu is not a multiple of %d",
+             name, columns, H3_INT8_BLOCK);
+        return NULL;
+    }
+
+    int8_t *quantized = malloc(elements);
+    float *scales = malloc(rows * sizeof(float));
+    float *values = malloc(elements * sizeof(float));
+    if (!quantized || !scales || !values) {
+        free(quantized); free(scales); free(values);
+        fail(error, error_size, "out of memory dequantizing %s", name);
+        return NULL;
+    }
+    if (!pread_bytes(header->path, tensor->file_offset, quantized, elements) ||
+        !pread_bytes(scale_header->path, scale->file_offset, scales,
+                     rows * sizeof(float))) {
+        free(quantized); free(scales); free(values);
+        fail(error, error_size, "cannot read int8 payload for %s", name);
+        return NULL;
+    }
+
+    for (size_t row = 0; row < rows; row++) {
+        const int8_t *source = quantized + row * columns;
+        float *target = values + row * columns;
+        float scale_value = scales[row];
+        for (size_t block = 0; block < columns; block += H3_INT8_BLOCK) {
+            for (int k = 0; k < H3_INT8_BLOCK; k++)
+                target[block + k] = (float)source[block + k] * scale_value;
+            if (unrotate) convrot_unrotate_row(target + block);
+        }
+    }
+    free(quantized);
+    free(scales);
+
+    h3_gpu_tensor *result = NULL;
+    if (dtype == H3_DTYPE_BF16) {
+        uint16_t *packed = malloc(elements * sizeof(*packed));
+        if (!packed) {
+            free(values);
+            fail(error, error_size, "out of memory packing %s", name);
+            return NULL;
+        }
+        for (size_t index = 0; index < elements; index++)
+            packed[index] = f32_to_bf16_u16(values[index]);
+        result = h3_gpu_tensor_from_bf16(gpu, packed, elements);
+        free(packed);
+    } else {
+        result = h3_gpu_tensor_from_f32(gpu, values, elements);
+    }
+    free(values);
+    if (!result)
+        fail(error, error_size, "cannot upload dequantized %s: %s", name,
+             h3_gpu_error(gpu));
+    return result;
+}
+/* FP16 -> F32/BF16 widening.  The video VAE shipped in the INT8-ConvRot bundle
+ * is FP16 (4.85 GiB, exactly half the F32 original) rather than INT8, so it
+ * needs a widen-on-load path instead of the dequantize path above. */
+static float f16_to_f32(uint16_t half) {
+    uint32_t sign = (uint32_t)(half & 0x8000u) << 16;
+    uint32_t exponent = (uint32_t)(half >> 10) & 0x1fu;
+    uint32_t mantissa = (uint32_t)(half & 0x3ffu);
+    uint32_t bits;
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            bits = sign;                        /* +-0 */
+        } else {                                /* subnormal: renormalise */
+            exponent = 127u - 15u + 1u;
+            while ((mantissa & 0x400u) == 0u) { mantissa <<= 1; exponent--; }
+            mantissa &= 0x3ffu;
+            bits = sign | (exponent << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 31u) {
+        bits = sign | 0x7f800000u | (mantissa << 13);   /* inf / nan */
+    } else {
+        bits = sign | ((exponent + 127u - 15u) << 23) | (mantissa << 13);
+    }
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static h3_gpu_tensor *load_f16_as_float(h3_gpu *gpu, const char *name,
+                                        const h3_st_tensor *tensor,
+                                        const h3_st_header *header,
+                                        size_t elements, h3_dtype dtype,
+                                        char *error, size_t error_size) {
+    uint16_t *halves = malloc(elements * sizeof(*halves));
+    float *values = malloc(elements * sizeof(*values));
+    if (!halves || !values) {
+        free(halves); free(values);
+        fail(error, error_size, "out of memory widening fp16 weight %s", name);
+        return NULL;
+    }
+    if (!pread_bytes(header->path, tensor->file_offset, halves,
+                     elements * sizeof(*halves))) {
+        free(halves); free(values);
+        fail(error, error_size, "cannot read fp16 payload for %s", name);
+        return NULL;
+    }
+    for (size_t index = 0; index < elements; index++)
+        values[index] = f16_to_f32(halves[index]);
+    free(halves);
+
+    h3_gpu_tensor *result = NULL;
+    if (dtype == H3_DTYPE_BF16) {
+        uint16_t *packed = malloc(elements * sizeof(*packed));
+        if (!packed) {
+            free(values);
+            fail(error, error_size, "out of memory packing %s", name);
+            return NULL;
+        }
+        for (size_t index = 0; index < elements; index++)
+            packed[index] = f32_to_bf16_u16(values[index]);
+        result = h3_gpu_tensor_from_bf16(gpu, packed, elements);
+        free(packed);
+    } else {
+        result = h3_gpu_tensor_from_f32(gpu, values, elements);
+    }
+    free(values);
+    if (!result)
+        fail(error, error_size, "cannot upload widened fp16 weight %s: %s",
+             name, h3_gpu_error(gpu));
+    return result;
+}
+/* --- end P13 ------------------------------------------------------------ */
+
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape, h3_dtype dtype,
@@ -151,7 +378,14 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
         fail(error, error_size, "required weight is absent: %s", name);
         return NULL;
     }
-    if (tensor->dtype != dtype || tensor->ndim != ndim) {
+    /* P13: INT8 weights can be dequantized and FP16 weights widened on the fly
+     * for callers that ask for BF16/F32. */
+    int int8_dequant = tensor->dtype == H3_DTYPE_I8 &&
+                       (dtype == H3_DTYPE_F32 || dtype == H3_DTYPE_BF16);
+    int f16_widen = tensor->dtype == H3_DTYPE_F16 &&
+                    (dtype == H3_DTYPE_F32 || dtype == H3_DTYPE_BF16);
+    if (!int8_dequant && !f16_widen &&
+        (tensor->dtype != dtype || tensor->ndim != ndim)) {
         fail(error, error_size, "weight %s has dtype/rank %s/%d, expected %s/%d",
              name, h3_dtype_name(tensor->dtype), tensor->ndim,
              h3_dtype_name(dtype), ndim);
@@ -174,6 +408,15 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
         fail(error, error_size, "weight %s is too large for this process", name);
         return NULL;
     }
+    /* P13: INT8 -> BF16/F32 (dequantize + undo the ConvRot rotation). */
+    if (int8_dequant)
+        return load_int8_dequantized(store, gpu, name, tensor, header,
+                                     (size_t)elements, dtype, error,
+                                     error_size);
+    /* P13: FP16 -> F32/BF16 (widen on load). */
+    if (f16_widen)
+        return load_f16_as_float(gpu, name, tensor, header, (size_t)elements,
+                                 dtype, error, error_size);
     h3_gpu_tensor *result;
     if (dtype == H3_DTYPE_BF16)
         result = h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,

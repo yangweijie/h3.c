@@ -168,3 +168,28 @@
 - **最终结论**：结合 DiT（加深无稳态收益）与 VAE（实测 0.86%）两端，**软件层预取已接近极限**；91s 中的 ~71s 是 I/O 带宽硬约束，无法靠重叠消除。
 - **决定**：保留代码并默认开启（已验证输出逐位一致、无回归；高分辨率/多 tile 场景下 VAE 重读放大、收益会上升），并提供 `H3_VAE_PREFETCH=0` 开关。
 - **真正提速只剩硬件/质量权衡**：① 更快存储（Thunderbolt/USB4，2–3 GB/s 可把 71s 压到 ~25s）② 更大内存以常驻去流式（>64GB）③ 继续减读量（int8 已做）④ 降 steps/分辨率。
+
+### P13 给 VAE/文本编码器加 int8 反量化分支（突破 39 GiB 下限）— `in_progress`（2026-09-02）
+- 目标：P9 的 39 GiB 下限源于"引擎只有 DiT 支持 INT8，文本编码器与 VAE 只认 BF16/F32"。给 `h3_weights.c` 加载器加"非原生 dtype → 目标 dtype"的转换分支，让量化/半精度权重也能被消费。
+- **P13.1 格式调研（已完成，含一个重要更正）**：
+  - **4B INT8 文本**（`qwen3vl_4b_int8_convrot.safetensors`，4.53 GiB）：1421 张量（I8 354 / BF16 359 / F32 354 / U8 354）；scale = `{key}_scale` F32 `[out,1]` 逐输出通道，带 `comfy_quant`。与 BF16 原版对拍：**`cos(dequant)`=0.062 → `cos(unrotate(K))`=0.99996** → **必须做 convrot 反旋转**（radix-4 butterfly，与 DiT 同约定）。q/k/v 分离，**无需** formula B 置换。
+  - **VAE 更正**：`Gluttony10/MiniMax-H3-INT8-CONVROT` 的 `MiniMax-H3-video_vae.safetensors`（4.85 GiB）解析后 **560 张量全为 F16，无 I8、无量化 scale**（那 72 个 `scale` 是 AdaLN 的 `scale1/scale2`）。即它是 **FP16 VAE**（本地 F32 版 10.4 GB，正好一半），需要的是 **F16→F32 加宽**，不是 int8 反量化。
+- **P13.2 实现（`h3_weights.c`，已编译通过）**：
+  - `load_int8_dequantized`：I8 + `{name}_scale` → dequant(`i8*scale[row]`) → ConvRot 反旋转（radix-4 butterfly 沿 K 维、块 256、×1/16）→ 转 BF16/F32 上传。`H3_INT8_UNROTATE=0` 跳过旋转（兼容纯 int8 文件）。
+  - `load_f16_as_float`：F16 → `f16_to_f32` 加宽 → 转 BF16/F32 上传。
+  - `load_tensor`：dtype 检查为两类放行（`int8_dequant` / `f16_widen`），加载前分流。
+- **P13.3 验证**：
+  - **4B INT8 文本 ✅ 通过**：端到端生成成功（94.5 s），std **25.04** vs BF16 参考 26.32（差 4.9%），mean 251.41 vs 251.11（差 0.12%）→ 精度损失合理。**省 3.8 GiB（8.3 → 4.5）**。
+  - **FP16 VAE**：测试目录 `/tmp/h3_fp16vae` 已搭好（其余组件 symlink 复用，仅 VAE 换 FP16），验证中。
+- **预期收益**：39 GiB → 39 − 3.8(文本) − 4.85(VAE) = **≈30.4 GiB**。
+- **P13.3 验证全部通过**（同 prompt / steps4 / 256，产物均为 22 帧 h264+aac）：
+  | 配置 | 耗时 | std | mean | 相对基线 |
+  |---|---|---|---|---|
+  | BF16-text + F32-VAE（基线） | 90.99 s | 26.3232 | 251.1122 | — |
+  | INT8-text + F32-VAE | 94.53 s | 25.0403 | 251.4139 | std −4.9% |
+  | BF16-text + FP16-VAE | 91.19 s | 26.3390 | 251.1147 | std **+0.06%** |
+  | **INT8-text + FP16-VAE（最小）** | 93.85 s | **25.0432** | 251.4139 | std −4.9% |
+  - FP16 VAE **近乎无损**（0.06%）；INT8 文本误差 4.9%（可接受，远小于 ClipProj cos≈0.81 的近似量级）。
+  - **误差可加、无交互劣化**：25.0432 ≈ 26.3232 − 1.28(文本) + 0.016(VAE) ✓
+- **新下限（按实测文件字节）**：DiT 19.53 + FP16 VAE 4.85 + audio VAE 0.56 + tokenizer 0.01 + INT8 4B 文本 4.53 + ClipProj 0.48 = **≈30.0 GiB**（原 39 GiB，**省 9 GiB / 23%**）。
+- 状态：**`complete`**。
