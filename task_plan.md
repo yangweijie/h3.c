@@ -193,3 +193,15 @@
   - **误差可加、无交互劣化**：25.0432 ≈ 26.3232 − 1.28(文本) + 0.016(VAE) ✓
 - **新下限（按实测文件字节）**：DiT 19.53 + FP16 VAE 4.85 + audio VAE 0.56 + tokenizer 0.01 + INT8 4B 文本 4.53 + ClipProj 0.48 = **≈30.0 GiB**（原 39 GiB，**省 9 GiB / 23%**）。
 - 状态：**`complete`**。
+
+### P14 864×480 输出质量/速度横评 — `in_progress`（2026-09-02，本轮新线程）
+- 目标：在 864×480 输出下扫内部画布(`--render-width/height`)、`--steps`、`--layers`、`--token-reduction`、`--reuse` 组合，建立"清晰度 vs 速度"决策矩阵，回应"画质不够/太慢"的调参诉求。
+- 固定前置：模型 `/Users/jay/h3_sys/MiniMax-H3-Convrot`（P10 系统盘最优）；4B ClipProj（`H3_CLIPPROJ_DIR`/`H3_CLIPPROJ_PROJ`）；prompt "a red ball bouncing on a white floor"；`--ssd-streaming --reuse 1 --seconds 2`（48 帧）`--width 864 --height 480`。
+- 自变量：内部画布 {288×160, 576×320, 864×480 全画布, 256×256 参照} × {steps4, +token-reduction, +layers40}；另 288×160 单因素扫 steps3/4/5/6 与 layers45/50。
+- 关键发现（详见 findings「864×480 横评」与 progress 本轮）：
+  - 内部画布是**第一提速杠杆且超线性**：288→88s、576→246s、864→507s；同时也是 288 档清晰度的**硬天花板**（上采样模糊，steps/layers 救不回）。
+  - `--token-reduction` 稳定 1.4–1.5×（246→163、507→363），不损锐度（改构图），全画布可用。
+  - `--layers 40` 仅 ~10% 且质量无损；`--layers` 合法范围 [35,50]（`h3.c:527` 校验，`H3_DIT_BLOCKS=50`），70/80 会报错（用户曾想试）。
+  - 288×160 steps3→6 仅降噪、不增锐；layers45→50 锐度无变化（文件 338K→259K 仅编码抖动）。
+- 待决（pending，用户未回复）：288 档已确认无法靠 steps/layers 变清晰 → 下一步 ①跳 576×320 求清晰（576+layers50+steps6，~4min）②先看已有档B(576+token-red,163s) ③试 768×432 ④接受 288 糊。
+- 运维坑：并行/批量跑会被环境跳过 → 每条配置单跑（串行 `time sh -c "..."`）。

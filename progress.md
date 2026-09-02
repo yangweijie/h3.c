@@ -237,3 +237,26 @@
 
 - FP16 VAE 近乎无损（+0.06%）；INT8 文本 −4.9%；误差可加无交互劣化。
 - **新下限 ≈30.0 GiB**（原 39 GiB，省 9 GiB / 23%）。
+
+## 2026-09-02 — 864×480 质量/速度横评（本轮新线程，P14）
+
+### 动机
+- 用户目标：864×480 输出下既要能看（清晰）又要不太慢。P1–P13 解决"16GB Mac 能否跑起来 + I/O 瓶颈"，本轮转向"输出画质 vs 生成速度"的调参横评。
+
+### 固定命令骨架
+- `H3_CLIPPROJ_DIR=/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot H3_CLIPPROJ_PROJ=/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3 ./h3 -d /Users/jay/h3_sys/MiniMax-H3-Convrot -p "a red ball bouncing on a white floor" --ssd-streaming --reuse 1 --seconds 2 --width 864 --height 480 --render-width W --render-height H [--steps N] [--layers L] [--token-reduction] -o OUT.mp4`
+- 注：每条配置**单跑**（环境会跳过并行/批量命令，须串行 `time sh -c "..."`）。
+
+### 实测时间线（耗时 mm:ss，括号内秒）
+- 三档内部画布对比（steps4）：288×160 档A=1:27.8(88s,338K) / 576×320 baseline=4:06(246s) / 576×320+token-red 档B=2:42.6(163s,173K) / 576×320+layers40 档C=3:13.1(193s,148K) / 864×480 全画布=8:26.8(507s,239K) / 864全画布+token-red=6:03(363s,172K) / 864全画布+layers40=7:38.5(458s,218K) / 256×256 参照=0:56.6(57s)。
+- 288×160 steps 扫描：steps3=70s(298K) / steps4=88s(338K) / steps5=1:38.9(99s,324K) / steps6=1:53.4(113s,397K)。
+- 288×160 layers 扫描：layers45=88s(338K) / layers50=1:37.8(98s,259K)。
+- 注：864 全画布 + reuse1（无降画布）是 864 最慢档（507s），比 576 baseline(246s) 慢一倍多；"仅加 reuse1 不降画布"开销极大。
+
+### 诊断结论（已与用户对齐两次）
+- 内部画布是速度/清晰度第一杠杆；288 档模糊是上采样结构性问题。
+- 用户曾问"288 加 steps 到 5/6"→ 跑完：steps5/6 仅降噪、不增锐。
+- 用户曾问"288 加 layers 到 70/80"→ 先查代码：`--layers` 上限 50（[35,50] 校验），70/80 必报错；改跑 layers50 实证：锐度无变化（98s, 文件还更小）。→ **确认 288 无法靠 steps/layers 变清晰**。
+
+### 待决（pending）
+- 用户被问"下一步清晰度路线"，未回复：①跳 576×320 求清晰（576+layers50+steps6，~4min）②先看已有档B(576+token-red,163s) ③试 768×432 ④接受 288 糊。

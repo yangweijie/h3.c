@@ -1465,7 +1465,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
         const char *cp_dir = getenv("H3_CLIPPROJ_DIR");
-        if (cp_dir) {
+        if (!cp_dir || !*cp_dir)
+            /* Default to the 4B + ClipProj text encoder so the 62 GiB encoder
+               is never loaded. Set H3_CLIPPROJ_DIR=0 (or =off) to fall back to
+               the 50-layer encoder at FL2VA/text_encoder. */
+            cp_dir = "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct";
+        int use_clipproj = strcmp(cp_dir, "0") != 0 && strcmp(cp_dir, "off") != 0;
+        if (use_clipproj) {
             const char *cp_proj = getenv("H3_CLIPPROJ_PROJ");
             if (!cp_proj)
                 cp_proj = "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3";
