@@ -1,61 +1,78 @@
-# Task Plan: 把 Real-ESRGAN 超分集成进 h3.c 命令行
+# Task Plan: h3.c — 超分集成 + 视频生成参数调优
 
 ## Goal
-为 `h3.c` 增加命令行超分参数(`--sr` / `--sr-bin` / `--sr-model-dir` / `--sr-model` / `--sr-target` / `--sr-scale`),在视频生成成功后调用 `realesrgan-ncnn-vulkan` 把低清内分辨率超分到目标分辨率,并保留原音轨。交互模式加 `!sr` 命令。
+1. (已完成) 把 Real-ESRGAN 超分作为 CLI 后处理集成进 h3.c，保留音轨。
+2. (进行中) 诊断"生成只有色块、无画面"问题，并调出可用的 15s 视频参数组合（分辨率 / token-reduction / 超分）。
 
 ## Current Phase
-Phase 5（已完成，待交付）
+Phase 7：2×2 参数对照已完成；15s 基准（原生 512×384 / 无 token-reduction / 无超分）已产出。
+下一步：用户决定是否①给 15s 基准加超分出品（×2→1024×768 或 纯×4→2048×1536），②或把 `--steps` 提到 10/20。
 
-## Phases
+## Phases (SR 集成 — 已完成)
+### Phase 1: Requirements & Discovery — complete
+### Phase 2: Planning & Structure — complete
+### Phase 3: Implementation — complete
+### Phase 4: Testing & Verification — complete
+### Phase 5: Delivery — complete（口头说明，git 未提交）
 
-### Phase 1: Requirements & Discovery
-- [x] 理解意图:生成后做 SR 后处理(非 VAE 自带上采样),复用真实 realesrgan 二进制
-- [x] 确认工程用 getopt_long + Apple clang,H3_FPS=24
+## Phases (色块诊断 + 参数调优 — 进行中)
+### Phase 6: 色块根因定位
+- [x] 最初失败运行：target 256×192 / render 128×96 / layer 40 / token-reduction / SR→1024×768 / 15s → 全屏 3 段水平色带，无画面
+- [x] 假设① --steps 4 过低（模型原生 20 步，且本机无 Turbo/distill LoRA）→ 被用户推翻："之前 2s token-reduction 没问题"
+- [x] 对照：2s + 原生 256×192（无降 render）即出现内容 → 证伪 render 之外的因素
+- [x] **结论：根因是 128×96 内部渲染分辨率过低**（latent token 网格仅 8×6=48 token/帧，token-reduction 再对半后约 24，不足以表达结构化场景）
 - **Status:** complete
 
-### Phase 2: Planning & Structure
-- [x] 集成点选定:生成写入 output_path 后,改名 `.lr.mp4` → 抽帧 → realesrgan → ffmpeg 重编码(带原音轨)写回 output_path,失败则还原
-- [x] 目标分辨率语义:正好是内分辨率整数倍(2/3/4)直接该倍超分;否则 ×4 后再缩到目标
+### Phase 7: 2×2 参数对照（2s / layer 40 / steps 4 / target 512×384）
+- [x] 原生 512×384 + token-reduction + 无 SR → OK（223K）
+- [x] 原生 512×384 + 无 token-reduction + 无 SR → OK（283K，最不糊基准）
+- [x] 256×192 render + token-reduction + SR→1024×768 → OK（1.5M）
+- [x] 256×192 render + 无 token-reduction + SR→1024×768 → OK（1.9M，比上者细节多）
+- [x] 手跑 realesrgan-x4plus ×4（512×384 LR → 2048×1536）→ 最清晰（4.1M）
 - **Status:** complete
 
-### Phase 3: Implementation
-- [x] `h3_ffmpeg.h`:声明 `h3_superres()`
-- [x] `h3_ffmpeg.c`:加 `#include <limits.h>`、`run_command()`、`h3_superres()`(抽帧 + realesrgan + 重编码;缩放走独立单输入 pass)
-- [x] `main.c`:加 include、枚举、options[]、解析、校验、`prompt` 分支里 SR 后处理、usage 文本
-- [x] `h3_cli.c`:状态字段、初始化、清理释放、`generate()` 后调 SR、`!sr` 命令、help/status
+### Phase 8: 15s 正式基准
+- [x] 原生 512×384 / 无 token-reduction / 无 SR / 15s → `/tmp/h3_512_384_native_notr_15s.mp4`（1.0M, exit=0, ~33min）
 - **Status:** complete
 
-### Phase 4: Testing & Verification
-- [x] `make CC="xcrun clang"` 编译通过(`-Wall -Wextra -Wpedantic -Wshadow -Wconversion` 无警告)
-- [x] 端到端测试:独立 C 程序调用 `h3_superres` 对真实低清视频做 256→864,产物 864×864 且含 audio,`ok=1`
-- [x] CLI 接线校验:`--help` 含 SR 选项;`--sr` 缺 bin/model-dir 时报错退出 2
+### Phase 9: 最小清晰分辨率扫描（进行中）
+- [x] 脚本 /tmp/h3_res_scan.sh：6 档 4:3 分辨率（384×288/320×240/256×192/192×144/160×120/128×96）× layer 40/45/50
+- [x] 统一：原生（无 --render 降采样）/ 无 token-reduction / 不超分 / --seconds 0.5 / --steps 4
+- [ ] 产出 18 个文件 /tmp/h3_<W>x<H>_L<L>_05s.mp4，等用户肉眼挑最小清晰档
+- **Status:** in_progress
+
+### Phase 10: 人脸清晰度 1:1 矩阵（完成）
+- [x] 脚本 /tmp/h3_face_matrix.sh：1:1 分辨率 256→640（32 倍数，13 档）× layer 40/45/50（39 档）
+- [x] 统一：原生（无 render）/ 无 token-reduction / 不超分 / `--steps 4` / **`--seconds 0.5`（=12 帧，因 `--frames 5` 被 VAE 22-frame chunk 限制拒掉）/ 保留音轨
+- [x] 提示词改为"整画面人脸特写"，便于肉眼比清晰度
+- [x] 39 个文件全部 EXIT=0，记录耗时+体积（见 progress.md 表）；用户挑最清晰
 - **Status:** complete
 
-### Phase 5: Delivery
-- [ ] 向用户汇报用法(已完成口头说明,待确认是否提交 git)
-- **Status:** complete
+### Phase 11: 加超分出品（待用户决定）
+- [ ] 在选定最清晰档上加 `--sr --sr-target 1024x768`（×2）或 `2048x1536`（纯×4）
+- [ ] 可选：把 `--steps` 抬到 10/20 看细节变化
+- **Status:** pending
 
 ## Key Questions
-1. 内分辨率如何取得 → 用 `h3_ffprobe_visual_size()` 从生成产物自动探测
-2. 目标非整数倍时怎么办 → ×4 超分后再 ffmpeg 缩放(独立 pass)
-3. realesrgan-x4plus 固定 ×4 → 精确 ×4 用 `--sr-target 1024x1024` 或 216→864
+1. 色块根因 → 128×96 渲染分辨率过低（非 steps / 非 token-reduction）
+2. 内分辨率如何取得 → `h3_ffprobe_visual_size()` 自动探测
+3. 目标非整数倍 → ×4 超分后再 ffmpeg 缩放
+4. 本机无 Turbo/distill LoRA → steps=4 在"渲染分辨率足够"时仍可用（不是色块元凶）
 
 ## Decisions Made
 | Decision | Rationale |
 |----------|-----------|
-| 生成后做 SR 后处理(改名 .lr.mp4,写回原路径,失败还原) | 与已验证的 bash 脚本一致,最简单且不影响主生成流程 |
-| 缩放拆成独立单输入 ffmpeg pass,不在双输入命令里用 `-vf` | ffmpeg 会把双输入命令里的 `-vf` 误判为输入选项而报错 |
-| 抽帧不用 `-vf format=rgb24` | realesrgan 直接读 PNG 即可,避免 `-vf` 放置导致的 ffmpeg 报错 |
-| 用 posix_spawnp 跑外部程序(复用已有 run_ffmpeg 模式) | 与工程既有风格一致,二进制经 PATH 查找 |
+| 诊断用 2s 短片 + 原生分辨率做 A/B，而非直接 15s | 快速、低成本定位根因 |
+| 最终 15s 基准用原生 512×384 + 无 token-reduction（最不糊）| 内部分辨率越高画面结构越完整；token-reduction 关掉后细节更多（代价更吃内存）|
+| 长任务用 `nohup ... & disown` 后台跑（macOS 无 setsid）| 避免命令超时被杀；h3 stdout 非 TTY 全缓冲，靠进程 PID/mp4/FINAL_EXIT 监控 |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| ffmpeg "Option vf cannot be applied to input url" (抽帧命令带 -vf) | 1 | 去掉 `-vf format=rgb24`,直接抽 PNG |
-| ffmpeg 同样报错(重编码双输入命令里带 -vf scale) | 2 | 把缩放拆成独立单输入 pass,再与音轨混流 |
-| replace_in_file 失败(old_str 用 `sizeof out_pattern` 无括号) | 3 | 实际文件是 `sizeof(out_pattern)` 带括号,按精确文本重写 |
+| `setsid: command not found`（macOS）| 1 | 改用 `nohup bash -c '...' & disown` |
+| 长命令疑似超时风险（15s 原生 512×384 约 27–33min）| — | 后台 detached 启动 + 轮询（每 30s 查 FINAL_EXIT / mp4 / 进程存活）|
 
 ## Notes
-- 修改文件:`h3_ffmpeg.c` `h3_ffmpeg.h` `main.c` `h3_cli.c`(git 已显示 modified)
-- 之前的 `/tmp/sr_pipeline.sh` bash 版可丢弃(功能现已在 C 里)
-- 未提交 git(用户未要求)
+- 修改文件（SR 集成）：`h3_ffmpeg.c` `h3_ffmpeg.h` `main.c` `h3_cli.c`（git 显示 modified，未提交）
+- 模型路径见 findings.md
+- 参数校验不捕捉"分辨率过低导致的画质崩坏"：128×96 render 与 256×192 target 校验通过却出色块

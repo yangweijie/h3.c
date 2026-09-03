@@ -424,13 +424,36 @@ h3_ctx *h3_load_dir(const char *model_dir) {
     }
     if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
         !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
-        !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
         !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer) ||
         !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
         !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
         h3_free(ctx);
         return NULL;
+    }
+    /* When the ClipProj text encoder is active (H3_CLIPPROJ_DIR set and not
+     * "0"/"off"), FL2VA/text_encoder is never loaded at runtime: the 4B+ClipProj
+     * path replaces the 50-layer encoder. A missing/partial text_encoder
+     * directory is therefore tolerated. It stays required for the
+     * H3_CLIPPROJ_DIR=0/off fallback to the 50-layer encoder. */
+    {
+        const char *cp_dir = getenv("H3_CLIPPROJ_DIR");
+        int clipproj_active = cp_dir && *cp_dir &&
+                              strcmp(cp_dir, "0") != 0 &&
+                              strcmp(cp_dir, "off") != 0;
+        if (!h3_inventory(ctx, "FL2VA/text_encoder",
+                          &ctx->model.text_encoder)) {
+            if (!clipproj_active) {
+                snprintf(h3_global_error, sizeof(h3_global_error), "%s",
+                         ctx->error);
+                h3_free(ctx);
+                return NULL;
+            }
+            memset(&ctx->model.text_encoder, 0,
+                   sizeof(ctx->model.text_encoder));
+            h3_global_error[0] = '\0';
+            ctx->error[0] = '\0';
+        }
     }
     /* Ref2VA is selected only by ordered-reference requests. Keep prompt-only
      * FL2VA usable while that optional 62 GiB checkpoint is not installed. */

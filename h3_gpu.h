@@ -555,6 +555,16 @@ int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
+/* First-block cache probe. Refresh `previous` with the residual
+ * `current - input` and reduce sum|residual - previous| and sum|previous| into
+ * `partials` as one [delta, magnitude] pair per dispatched threadgroup. The
+ * dispatch uses 256 threads per threadgroup, so `partials` needs
+ * `threads / 256 * 2` F32 slots. */
+int h3_gpu_fb_cache_probe_bf16(h3_gpu *gpu, const h3_gpu_tensor *current,
+                               const h3_gpu_tensor *input,
+                               h3_gpu_tensor *previous,
+                               h3_gpu_tensor *partials, uint32_t elements,
+                               uint32_t threads);
 int h3_gpu_token_pool_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *input,
                            size_t input_offset,

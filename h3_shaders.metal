@@ -4138,6 +4138,54 @@ kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
                                   h3_bf16_to_f32(right[gid]));
 }
 
+struct h3_fb_cache_args {
+    uint elements;
+};
+
+/* First-block cache probe. Each dispatched threadgroup reduces a strided slice
+ * of the first-block residual (current - input) into one [delta, magnitude]
+ * pair; the host finishes the sum and applies the relative-L1 threshold.
+ * `previous` is refreshed with the residual that was just measured, so a step
+ * that ends up skipped still leaves the next step's comparison meaningful. */
+kernel void h3_fb_cache_probe_bf16(
+                         device const ushort *current [[buffer(0)]],
+                         device const ushort *input [[buffer(1)]],
+                         device ushort *previous [[buffer(2)]],
+                         device float *partials [[buffer(3)]],
+                         constant h3_fb_cache_args &args [[buffer(4)]],
+                         uint gid [[thread_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint group [[threadgroup_position_in_grid]],
+                         uint threads [[threads_per_threadgroup]],
+                         uint groups [[threadgroups_per_grid]]) {
+    uint stride = groups * threads;
+    float delta = 0.0f;
+    float magnitude = 0.0f;
+    for (uint index = gid; index < args.elements; index += stride) {
+        float previous_value = h3_bf16_to_f32(previous[index]);
+        float value = h3_bf16_to_f32(current[index]) -
+                      h3_bf16_to_f32(input[index]);
+        delta += fabs(value - previous_value);
+        magnitude += fabs(previous_value);
+        previous[index] = h3_f32_to_bf16(value);
+    }
+    threadgroup float reductions[2][256];
+    reductions[0][tid] = delta;
+    reductions[1][tid] = magnitude;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = threads / 2; step; step >>= 1) {
+        if (tid < step) {
+            reductions[0][tid] += reductions[0][tid + step];
+            reductions[1][tid] += reductions[1][tid + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (!tid) {
+        partials[group * 2u] = reductions[0][0];
+        partials[group * 2u + 1u] = reductions[1][0];
+    }
+}
+
 struct h3_token_pool_args {
     uint input_offset;
     uint original_offset;

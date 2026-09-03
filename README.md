@@ -354,7 +354,54 @@ For example:
   -o ''
 ```
 
-### 8. Add image, video, and audio references
+### 8. Super-resolution (Real-ESRGAN) post-processing
+
+Generate at a small internal resolution, then upscale the finished clip with
+`realesrgan-ncnn-vulkan` while keeping its original audio track. This is a
+post-processing step on the encoded video, not part of the diffusion pipeline,
+so a failure falls back to the low-res clip instead of aborting the whole run.
+
+Two flags turn it on; both are required:
+
+- `--sr` — enable super-resolution after generation.
+- `--sr-bin DIR` — directory that contains the `realesrgan-ncnn-vulkan`
+  executable.
+- `--sr-model-dir DIR` — directory that contains the model `.bin` / `.param`
+  files (e.g. `realesrgan-x4plus`).
+- `--sr-model NAME` — model name, default `realesrgan-x4plus` (a fixed ×4
+  model, so `--sr-scale` is effectively 4).
+- `--sr-target WxH` — explicit output resolution after upscaling, e.g.
+  `1280x720`. When omitted, the target is the inner resolution × `--sr-scale`.
+- `--sr-scale N` — upscale factor `2`/`3`/`4` when no `--sr-target` is given
+  (default `4`).
+
+The inner (pre-SR) resolution is whatever the video was actually generated at
+(`--width` × `--height`), detected automatically from the output file. If
+`--sr-target` is an exact integer multiple of the inner size in the range 2–4,
+the model runs at that exact factor; otherwise it runs at ×4 and a final
+`ffmpeg` resize lands on the requested target.
+
+Pick a low internal resolution that is a multiple of 32 in each dimension
+(H3 requires width/height to be multiples of 32; see §5) and matches your
+target aspect ratio. For 16:9 output, `512x288` (×4 → `2048x1152`, then resized
+to `1280x720`) is a safe, fast low-res choice.
+
+```sh
+# 15s, 16:9 720p from a 256x144 low-res render, fastest preset, ×4 super-res.
+./h3 -d ./MiniMax-H3 \
+  -p "A 15-second cinematic sequence: wide shot of a misty train platform at dawn, then a close cut to a traveller's face." \
+  --seconds 15 \
+  --width 512 --height 288 \
+  --steps 4 --layers 45 --reuse 1 --ssd-streaming \
+  --sr --sr-bin /tmp/h3_realesrgan --sr-model-dir /tmp/h3_realesrgan/models \
+  --sr-target 1280x720 \
+  -o outputs/drama-720p.mp4
+```
+
+The fastest generation preset (`--steps 4 --layers 45 --reuse 1 --ssd-streaming`)
+keeps the diffusion cheap; the ×4 upscale does the visual heavy lifting.
+
+### 9. Add image, video, and audio references
 
 First/last-frame anchors select the FL2VA path:
 
@@ -510,6 +557,26 @@ settings: on the same 512 benchmark it reduced that profile from 16.69 to
 coherent. Do not combine it with both `--layers 40` and `--reuse 3`; that
 6.47-second experiment produced chromatic ringing and ghosted limbs despite
 acceptable latent norms.
+
+### First-block cache
+
+`H3_FB_CACHE=1` enables the first-block cache. Every denoising step runs the
+first active DiT block, then compares that block's residual against the previous
+step's using the relative L1 metric `sum|r - r_prev| / sum|r_prev|`. One Metal
+kernel reduces it into 1024 `[delta, magnitude]` partial pairs that the host
+finishes, and refreshes the cached first-block residual in the same pass. Below
+the threshold the remaining blocks are skipped and the cached full-stack residual
+is replayed, because a first-block residual that barely moved implies the whole
+block stack will produce nearly the same update.
+`H3_FB_CACHE_THRESHOLD` sets the threshold, which defaults to `0.12`; larger
+values reuse more steps and drift further from the reference. The first step
+seeds the cache, the final step always runs in full because its velocity is never
+reused, and `H3_PROFILE=1` reports the reuse rate at teardown. The probe needs
+snapshots of the packed hidden state, so it allocates up to three more
+full-hidden BF16 buffers (input, full residual, first-block residual) and shares
+the first two with `--core-reuse`. It is disabled under `--ssd-streaming`, whose
+prefetch ring assumes every block is consumed in order, and on any step where
+token reduction is active.
 
 ### Internal canvas and video VAE
 

@@ -32,6 +32,12 @@ enum {
     FINAL_SLOTS = 2
 };
 
+/* First-block cache probe grid. 256 threads per threadgroup is what the 1-D
+ * dispatch helper uses, and each group reduces to one [delta, magnitude] pair
+ * that the host sums into the relative-L1 decision. */
+#define H3_FB_CACHE_GROUPS 1024u
+#define H3_FB_CACHE_THREADS (H3_FB_CACHE_GROUPS * 256u)
+
 typedef struct {
     h3_gpu_tensor *norm1;
     h3_gpu_tensor *norm2;
@@ -114,6 +120,12 @@ struct h3_dit {
     unsigned core_reuse_interval;
     unsigned core_forward_count;
     int core_residual_ready;
+    int fb_cache;
+    float fb_cache_threshold;
+    unsigned fb_cache_probes;
+    unsigned fb_cache_skips;
+    h3_gpu_tensor *fb_cache_residual;
+    h3_gpu_tensor *fb_cache_partials;
     unsigned active_block_count;
     uint8_t block_active[H3_DIT_BLOCKS];
     h3_layout layout;
@@ -2015,7 +2027,7 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (dit->core_reuse_interval > 1) {
+    if (dit->core_reuse_interval > 1 || dit->fb_cache) {
         dit->core_input = h3_gpu_tensor_new_bf16(
             dit->gpu, sequence * HIDDEN);
         dit->core_residual = h3_gpu_tensor_new_bf16(
@@ -2023,6 +2035,18 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         if (!dit->core_input || !dit->core_residual) {
             fail(error, error_size,
                  "cannot allocate DiT core residual cache: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (dit->fb_cache) {
+        dit->fb_cache_residual = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * HIDDEN);
+        dit->fb_cache_partials = h3_gpu_tensor_new_f32(
+            dit->gpu, H3_FB_CACHE_GROUPS * 2);
+        if (!dit->fb_cache_residual || !dit->fb_cache_partials) {
+            fail(error, error_size,
+                 "cannot allocate DiT first-block cache: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -2092,6 +2116,26 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->core_reuse_interval = core_reuse_interval;
     dit->ssd_streaming = ssd_streaming;
     dit->spatial_rope_scale = spatial_rope_scale;
+    /* First-block cache is opt-in because it trades a little motion fidelity
+     * for skipping most of the block stack. SSD streaming is excluded: its
+     * prefetch ring assumes every block is consumed in order, so a step that
+     * bails out after the first block would desynchronize it. */
+    const char *fb_cache = getenv("H3_FB_CACHE");
+    dit->fb_cache = !ssd_streaming && fb_cache && *fb_cache &&
+                    strcmp(fb_cache, "0");
+    dit->fb_cache_threshold = 0.12f;
+    const char *fb_cache_threshold = getenv("H3_FB_CACHE_THRESHOLD");
+    if (fb_cache_threshold && *fb_cache_threshold) {
+        char *end = NULL;
+        float parsed = strtof(fb_cache_threshold, &end);
+        if (end == fb_cache_threshold || *end || !isfinite(parsed) ||
+            parsed < 0.0f || parsed > 1.0f) {
+            fail(error, error_size,
+                 "H3_FB_CACHE_THRESHOLD must be a finite value in [0, 1]");
+            goto failed;
+        }
+        dit->fb_cache_threshold = parsed;
+    }
     if (lora_path && *lora_path) {
         if (ssd_streaming) {
             fail(error, error_size,
@@ -2547,6 +2591,48 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     return 1;
 }
 
+/* First-block cache decision. Runs once the first active block has produced
+ * `hidden`: it refreshes the cached first-block residual with this step's, and
+ * reports whether the relative L1 change is small enough to replay the cached
+ * full-stack residual instead of running the remaining blocks. Both outcomes
+ * leave a live command buffer behind, so the caller keeps encoding. */
+static int fb_cache_probe(h3_dit *dit, uint32_t elements, int *skipped,
+                          char *error, size_t error_size) {
+    *skipped = 0;
+    if (!gpu_op(dit, h3_gpu_fb_cache_probe_bf16(
+            dit->gpu, dit->hidden, dit->core_input, dit->fb_cache_residual,
+            dit->fb_cache_partials, elements, H3_FB_CACHE_THREADS),
+        error, error_size, "DiT first-block cache probe"))
+        return 0;
+    if (!gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                "submit DiT first-block cache probe")) return 0;
+    float partials[H3_FB_CACHE_GROUPS * 2];
+    if (!h3_gpu_tensor_read_f32(dit->fb_cache_partials, partials,
+                                H3_FB_CACHE_GROUPS * 2)) {
+        fail(error, error_size, "cannot read DiT first-block cache metric");
+        return 0;
+    }
+    double delta = 0.0;
+    double magnitude = 0.0;
+    for (size_t index = 0; index < H3_FB_CACHE_GROUPS; index++) {
+        delta += partials[2 * index];
+        magnitude += partials[2 * index + 1];
+    }
+    dit->fb_cache_probes++;
+    if (magnitude > 0.0 &&
+        delta < (double)dit->fb_cache_threshold * magnitude) {
+        dit->fb_cache_skips++;
+        *skipped = 1;
+        return gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                      "continue after skipped DiT blocks") &&
+               gpu_op(dit, h3_gpu_add_bf16(
+                   dit->gpu, dit->hidden, dit->core_input, dit->core_residual,
+                   elements), error, error_size, "replay DiT core residual");
+    }
+    return gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                  "continue after first-block cache probe");
+}
+
 static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                           int disable_command_split, char *error,
                           size_t error_size) {
@@ -2668,8 +2754,18 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         dit->token_reduction_early_steps &&
         (unsigned)step < dit->token_reduction_early_steps ?
             dit->token_reduction_early_end : dit->token_reduction_end;
+    /* First-block cache: the first active block always runs, then its residual
+     * is compared against the previous step's. Under threshold the rest of the
+     * stack is skipped and the cached full residual is replayed. The final step
+     * always runs in full because its velocity is never reused. */
+    unsigned fb_probe_block = first_active_block(dit);
+    int fb_probe = evaluate_core && dit->fb_cache && !use_token_reduction &&
+                   dit->core_residual_ready &&
+                   fb_probe_block < H3_DIT_BLOCKS &&
+                   step != h3_dit_schedule_steps(dit->schedule) - 1;
     uint32_t hidden_elements = dit->sequence * HIDDEN;
-    if (evaluate_core && dit->core_reuse_interval > 1)
+    if (evaluate_core &&
+        (dit->core_reuse_interval > 1 || fb_probe))
         OP(h3_gpu_copy_bf16(dit->gpu, dit->core_input, 0, dit->hidden, 0,
                             hidden_elements), "save DiT core input");
     if (evaluate_core) {
@@ -2677,6 +2773,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             ? 0 : command_block_interval(dit);
         if (dit->ssd_streaming) command_blocks = 0;
         unsigned completed_blocks = 0;
+        int fb_skipped = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
@@ -2813,11 +2910,17 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 OP(h3_gpu_begin(dit->gpu),
                    "continue after streamed DiT block");
             }
+            if (fb_probe && block == fb_probe_block) {
+                if (!fb_cache_probe(dit, hidden_elements, &fb_skipped,
+                                    error, error_size)) return 0;
+                if (fb_skipped) break;
+            }
         }
         if (use_token_reduction &&
             token_reduction_end == H3_DIT_BLOCKS &&
             !leave_token_reduction(dit, error, error_size)) return 0;
-        if (dit->core_reuse_interval > 1) {
+        if (!fb_skipped &&
+            (dit->core_reuse_interval > 1 || dit->fb_cache)) {
             OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,
                                dit->core_input, hidden_elements),
                "cache DiT core residual");
@@ -3558,7 +3661,12 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_output);
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
+    FREE(fb_cache_residual); FREE(fb_cache_partials);
 #undef FREE
+    if (dit->fb_cache_probes && getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: first-block cache reused %u/%u probed steps "
+                "(threshold %.3f)\n", dit->fb_cache_skips, dit->fb_cache_probes,
+                (double)dit->fb_cache_threshold);
     h3_dit_schedule_free(dit->schedule);
     if (dit->lora) h3_lora_close(dit->lora);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {

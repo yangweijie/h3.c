@@ -423,6 +423,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
+            @"h3_fb_cache_probe_bf16",
             @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
             @"h3_token_expand_delta_bf16",
             @"h3_token_expand_adaln_bf16",
@@ -1045,6 +1046,7 @@ typedef struct {
 } gqa_args;
 typedef struct { uint32_t sample_offset, elements; float delta, ratio; }
     euler_args;
+typedef struct { uint32_t elements; } fb_cache_args;
 
 static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
@@ -4444,6 +4446,28 @@ int h3_gpu_sub_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(right).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_fb_cache_probe_bf16(h3_gpu *opaque, const h3_gpu_tensor *current,
+                               const h3_gpu_tensor *input,
+                               h3_gpu_tensor *previous,
+                               h3_gpu_tensor *partials, uint32_t elements,
+                               uint32_t threads) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, current, elements, @"first-block current") ||
+        !h3_gpu_require_bf16(gpu, input, elements, @"first-block input") ||
+        !h3_gpu_require_bf16(gpu, previous, elements, @"first-block previous") ||
+        !h3_gpu_require_elements(gpu, partials, (size_t)(threads / 256u) * 2u,
+                                 @"first-block partials")) return 0;
+    fb_cache_args args = { elements };
+    return h3_gpu_dispatch_1d(gpu, @"h3_fb_cache_probe_bf16", threads,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(current).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(previous).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(partials).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
         });
 }
 
