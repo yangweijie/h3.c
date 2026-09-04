@@ -1,0 +1,73 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>序列布局与位置编码</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>序列布局与位置编码</h1>
+<p>H3 把<strong>文本、条件、参考、目标视频、目标音频</strong>拼成一条统一的 1-D token 序列，每个 token 带一个 <code>(t, h, w)</code> 三元组位置。这份布局（<code>h3_layout</code>）是 DiT 唯一的结构信息来源。</p>
+<h2>段类型</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef enum {
+    H3_SEG_TEXT,        /* 语言 token */
+    H3_SEG_COND,        /* FL2VA 首/末帧条件行 */
+    H3_SEG_REF_IMAGE,   /* Ref2VA 图像或视频呈现行 */
+    H3_SEG_REF_AUDIO,   /* Ref2VA 音频条件行 */
+    H3_SEG_AUDIO,       /* 目标音频 token */
+    H3_SEG_VIDEO        /* 目标视频 token */
+} h3_segment_kind;</code></pre></div>
+<h2>布局构造顺序</h2>
+<p><code>h3_layout_build</code> 严格按下图顺序 emit，游标 <code>cursor</code> 沿时间轴单调推进：</p>
+<pre class="mermaid">flowchart LR
+    T[&quot;TEXT&lt;br/&gt;t = 0..text_len-1&quot;]
+    --&gt; C[&quot;COND（FL2VA 键帧）&lt;br/&gt;首帧 t=text_len&lt;br/&gt;末帧 t=text_len+span-Δ&quot;]
+    --&gt; R[&quot;REF_*（按引用顺序）&lt;br/&gt;图：1 行时间；音频：audio_t；视频：max(audio_t, span)&quot;]
+    --&gt; A[&quot;AUDIO 目标&lt;br/&gt;audio_t&quot;]
+    --&gt; V[&quot;VIDEO 目标&lt;br/&gt;latent_t × frame_rows&quot;]</pre>
+<p>关键规则：</p>
+<ul><li><strong>文本</strong>：<code>t = index</code>，<code>h = w = 0</code>。</li><li><strong>FL2VA 键帧</strong>：只接受首帧（<code>keyframe == 0</code>）与末帧（<code>keyframe == frame_count - 1</code>），其它值直接报错。末帧的时间是 <code>text_len + h3_video_span_sum(latent_t) - h3_frame_rescale</code>，即整段视频时间跨度的最末端。</li><li><strong>Ref2VA 图像</strong>：整幅图挤在同一个时间 <code>cursor</code> 上，游标前进 <code>1.0</code>。</li><li><strong>Ref2VA 视频</strong>：若有音轨，音频段先 emit（用该引用的 w 轴范围），再 emit 视频段；游标前进 <code>max(audio_t, video_span)</code>。</li><li><strong>键帧与引用互斥</strong>。</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_host.c&amp;s=313&amp;e=464&amp;mode=part" data-f="h3_host.c" data-s="313" data-e="464">h3_host.c<span class="rng">L313-464</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=28&amp;e=41&amp;mode=part" data-f="h3_host.h" data-s="28" data-e="41">h3_host.h<span class="rng">L28-41</span></a></p>
+<h2>空间网格</h2>
+<p><code>h3_frame_grid</code> 生成 <code>latent_h × latent_w</code> 的 <code>(h, w)</code> 网格。同一 <code>latent_t</code> 帧内的所有空间位置共享同一个 <code>t</code>。</p>
+<p><code>t</code> 的推进不是等距的：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">time += h3_frame_rescale * h3_frame_per_token[index % 5];</code></pre></div>
+<p><code>h3_frame_per_token</code> 是一个 <strong>5 元素周期表</strong>，对应发布的视频时间压缩节奏——这也是为什么帧数必须对齐到 <code>5 + 17*n</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_host.c&amp;s=231&amp;e=311&amp;mode=part" data-f="h3_host.c" data-s="231" data-e="311">h3_host.c<span class="rng">L231-311</span></a>, <a class="src-ref" href="../source.html?f=h3_host.c&amp;s=12&amp;e=13&amp;mode=part" data-f="h3_host.c" data-s="12" data-e="13">h3_host.c<span class="rng">L12-13</span></a></p>
+<h2>时间形状</h2>
+<table><thead><tr><th>函数</th><th>语义</th></tr></thead><tbody><tr><td><code>h3_align_frame_count(requested)</code></td><td>向上对齐到 <code>5 + 17*n</code>，上限 362</td></tr><tr><td><code>h3_video_latent_t(frames)</code></td><td>目标视频潜变量的 T</td></tr><tr><td><code>h3_video_encoder_latent_t(frames)</code></td><td>VAE 编码器的因果 <code>ceil(T/4)</code> 压缩</td></tr><tr><td><code>h3_temporal(frames)</code></td><td>一次算出 <code>{frame_count, video_t, audio_t}</code></td></tr></tbody></table>
+<p>音频潜变量按 40 fps 推进（<code>H3_AUDIO_LATENT_FPS</code>），视频 24 fps，因此 <code>audio_t</code> 与 <code>video_t</code> 是两条独立的时间轴。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=7&amp;e=20&amp;mode=part" data-f="h3_host.h" data-s="7" data-e="20">h3_host.h<span class="rng">L7-20</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=95&amp;e=98&amp;mode=part" data-f="h3_host.h" data-s="95" data-e="98">h3_host.h<span class="rng">L95-98</span></a></p>
+<h2>画布换算</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">void  h3_latent_canvas(int width, int height, int *latent_w, int *latent_h);
+int   h3_adapt_canvas(int width, int height, int *adapted_w, int *adapted_h);
+int   h3_reference_image_canvas(int w, int h, int tw, int th,
+                                int max_short_edge, int *aw, int *ah);
+int   h3_reference_video_canvas(int w, int h, int *aw, int *ah);</code></pre></div>
+<p>视频潜变量空间比是 16（<code>H3_VAE_SPATIAL_RATIO</code>），因此 <code>latent = pixel / 16</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=11&amp;e=110&amp;mode=part" data-f="h3_host.h" data-s="11" data-e="110">h3_host.h<span class="rng">L11-110</span></a></p>
+<h2>256×256 的 RoPE 自适应</h2>
+<p>在<strong>恰好 256×256</strong> 的原生画布上，H3 只有 <code>8×8</code> 的有效空间 token 网格，细部与复杂构图空间紧张。引擎默认把空间 RoPE 坐标<strong>减半</strong>：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">float spatial_rope_scale = !params-&gt;use_reference_rope &amp;&amp;
+    render_width == 256 &amp;&amp; render_height == 256 ? 0.5f : 1.0f;</code></pre></div>
+<p>这消除了长渲染里重复的格状伪影，在独立人像测试上也保持连贯，且不增加 token 与运行时间。<code>--use-reference-rope</code> 可恢复发布/MLX 的坐标用于对齐检查。</p>
+<p><strong>128×128 仍然不支持</strong>：其 <code>4×4</code> token 网格即使调整 RoPE 也无法恢复可识别的主体。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1556&amp;e=1557&amp;mode=part" data-f="h3.c" data-s="1556" data-e="1557">h3.c<span class="rng">L1556-1557</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=272&amp;e=291&amp;mode=part" data-f="README.md" data-s="272" data-e="291">README.md<span class="rng">L272-291</span></a></p>
+<h2>行映射：从布局到 AdaLN 行</h2>
+<p><code>h3_dit_schedule_row_map</code> 把布局转换成融合 AdaLN / 门控内核直接消费的行映射表。输入包含：</p>
+<ul><li><code>layout</code>：段区间</li><li><code>text_tags</code>：每行的模态 tag（语言=1，Qwen 视觉跨度及其边界 token=0）</li></ul>
+<p>段类型决定该行吃<strong>目标时间步还是条件时间步</strong>，以及打到哪个模态。详见 <a href="../pages/dit-schedule.html">AdaLN 调度与门控排序</a>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=49&amp;e=55&amp;mode=part" data-f="h3_dit_schedule.h" data-s="49" data-e="55">h3_dit_schedule.h<span class="rng">L49-55</span></a>, <a class="src-ref" href="../source.html?f=h3_dit_schedule.c&amp;s=665&amp;e=716&amp;mode=part" data-f="h3_dit_schedule.c" data-s="665" data-e="716">h3_dit_schedule.c<span class="rng">L665-716</span></a></p>
+<h2>随机流</h2>
+<p>去噪初始化用<strong>两个独立的 PCG 风格 RNG，同一种子</strong>——与发布服务端一致：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">h3_rng_seed(&amp;video_rng, params-&gt;seed);
+h3_rng_seed(&amp;audio_rng, params-&gt;seed);
+h3_rng_fill_normal(&amp;video_rng, video, video_count);
+h3_rng_fill_normal(&amp;audio_rng, audio, audio_count);</code></pre></div>
+<p>RNG 状态是一个 64 位 LCG 加一个正态 spare（Box-Muller 成对产出，缓存另一半）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1665&amp;e=1671&amp;mode=part" data-f="h3.c" data-s="1665" data-e="1671">h3.c<span class="rng">L1665-1671</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=88&amp;e=93&amp;mode=part" data-f="h3_host.h" data-s="88" data-e="93">h3_host.h<span class="rng">L88-93</span></a>, <a class="src-ref" href="../source.html?f=h3_host.c&amp;s=494&amp;e=528&amp;mode=part" data-f="h3_host.c" data-s="494" data-e="528">h3_host.c<span class="rng">L494-528</span></a></p></div></body></html>

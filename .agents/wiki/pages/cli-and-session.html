@@ -1,0 +1,60 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>命令行与交互会话</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>命令行与交互会话</h1>
+<p>CLI 由两个文件分担：<code>main.c</code> 负责一次性命令行解析与执行，<code>h3_cli.c</code> 负责交互式会话（基于 vendored 的 <code>linenoise</code>）。</p>
+<h2>main.c：一次性模式</h2>
+<p><code>main()</code> 解析 argv 后构造 <code>h3_params</code> 并调用 <code>h3_generate</code>；<code>--info</code> 走另一条只探测的分支。</p>
+<pre class="mermaid">flowchart LR
+    A[解析 argv] --&gt; B{&quot;--info ?&quot;}
+    B --&gt;|是| C[print_info: 设备 + 组件清单]
+    B --&gt;|否| D{&quot;给了 -p ?&quot;}
+    D --&gt;|否| E[&quot;h3_cli_run(): 进入交互会话&quot;]
+    D --&gt;|是| F[构建 h3_params]
+    F --&gt; G[&quot;h3_generate()&quot;]
+    G --&gt; H{&quot;--sr ?&quot;}
+    H --&gt;|是| I[&quot;h3_superres() 后处理&quot;]
+    H --&gt;|否| J[结束]</pre>
+<p>完整的选项清单见 <code>usage()</code>。几个值得注意的解析细节：</p>
+<ul><li><code>--seconds N</code> 与 <code>--frames N</code> 互斥：秒数先乘 24 fps，再向上对齐到合法的 H3 时间形状。</li><li><code>--sr-target WxH</code> 用 <code>parse_wh()</code> 解析；<code>--sr-scale</code> 只在没有 <code>--sr-target</code> 时生效。</li><li>参考类选项（<code>--ref-image</code>、<code>--ref-video</code>、<code>--ref-audio</code> 等）<strong>可重复，命令行顺序被保留</strong>，直接对应 <code>&lt;Picture N&gt;</code> 的编号。</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=main.c&amp;s=17&amp;e=73&amp;mode=part" data-f="main.c" data-s="17" data-e="73">main.c<span class="rng">L17-73</span></a>, <a class="src-ref" href="../source.html?f=main.c&amp;s=86&amp;e=135&amp;mode=part" data-f="main.c" data-s="86" data-e="135">main.c<span class="rng">L86-135</span></a></p>
+<h2>h3_cli.c：交互会话</h2>
+<p>会话状态集中在 <code>h3_cli_state</code>（<code>h3_cli.c:27</code>），包含一份 <code>h3_params</code>、锚点路径、引用数组、输出目录、SR 设置等。</p>
+<h3>命令一览</h3>
+<table><thead><tr><th>类别</th><th>命令</th></tr></thead><tbody><tr><td>元信息</td><td><code>!help</code> <code>!status</code> <code>!quit</code></td></tr><tr><td>采样</td><td>`!seed [N\</td><td>random]<code> </code>!steps [N]<code> </code>!reuse [N]<code> </code>!layers [N]<code> </code>!core-reuse [N]`</td></tr><tr><td>画布</td><td><code>!size [WxH]</code> `!render-size [WxH\</td><td>native]<code> </code>!frames [N]<code> </code>!seconds [N]`</td></tr><tr><td>加速开关</td><td><code>!token-reduction</code> <code>!ssd-streaming</code> <code>!int8-row-fc2</code> <code>!reference-rope</code>（均为 `[on\</td><td>off]`）</td></tr><tr><td>条件</td><td>`!first [PATH\</td><td>clear]<code> </code>!last [PATH\</td><td>clear]<code> </code>!ref-image PATH<code> </code>!refs [clear]<code> </code>!ref-remove N`</td></tr><tr><td>输出</td><td>`!show [on\</td><td>off]<code> </code>!zoom N<code> </code>!open [on\</td><td>off]<code> </code>!output [DIR]<code> </code>!save [PATH]<code> </code>!sr ...`</td></tr><tr><td>复用</td><td><code>!again</code> <code>!cache [clear]</code> `!memory-plan [auto\</td><td>off]`</td></tr></tbody></table>
+<p><code>!status</code> 会打印当前对齐后的帧数、实际秒数、各加速档位，以及当前权重驻留方式（resident / SSD BF16 / int8 分组 / int8 row）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_cli.c&amp;s=157&amp;e=227&amp;mode=part" data-f="h3_cli.c" data-s="157" data-e="227">h3_cli.c<span class="rng">L157-227</span></a></p>
+<h3>会话内生成</h3>
+<pre class="mermaid">flowchart TD
+    A[读入一行] --&gt; B{&quot;以 ! 开头 ?&quot;}
+    B --&gt;|是| C[process_command 分发]
+    B --&gt;|否| D[当作 prompt]
+    D --&gt; E{&quot;配置了锚点/引用 ?&quot;}
+    E --&gt;|是| F[&quot;h3_generate(带条件)&quot;]
+    E --&gt;|否| G[&quot;h3_generate(纯文本)&quot;]
+    F --&gt; H[&quot;cli_frame: 终端显示 / 写 PPM&quot;]
+    G --&gt; H
+    H --&gt; I{&quot;open 开启 ?&quot;}
+    I --&gt;|是| J[调用系统 open]</pre>
+<p><code>generate()</code> 位于 <code>h3_cli.c:442</code>，在调用 <code>h3_generate</code> 之前把会话状态同步进 <code>h3_params</code>。<code>cli_frame</code> 回调（<code>h3_cli.c:136</code>）负责终端图像显示与可选的 PPM 落盘。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_cli.c&amp;s=442&amp;e=512&amp;mode=part" data-f="h3_cli.c" data-s="442" data-e="512">h3_cli.c<span class="rng">L442-512</span></a>, <a class="src-ref" href="../source.html?f=h3_cli.c&amp;s=136&amp;e=155&amp;mode=part" data-f="h3_cli.c" data-s="136" data-e="155">h3_cli.c<span class="rng">L136-155</span></a></p>
+<h2>终端图像显示</h2>
+<p><code>h3_terminal.c</code> 探测两种图形协议并直接向终端写转义序列：</p>
+<table><thead><tr><th>协议</th><th>终端</th></tr></thead><tbody><tr><td><code>H3_TERM_KITTY</code></td><td>Kitty、Ghostty</td></tr><tr><td><code>H3_TERM_ITERM2</code></td><td>iTerm2、WezTerm、Konsole</td></tr></tbody></table>
+<p><strong>显示尺寸默认为 2 倍</strong>，以适配 macOS Retina；<code>--zoom N</code> / <code>!zoom N</code> 可改，只影响显示，不改变生成视频或编码图像。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_terminal.h&amp;s=7&amp;e=23&amp;mode=part" data-f="h3_terminal.h" data-s="7" data-e="23">h3_terminal.h<span class="rng">L7-23</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=337&amp;e=340&amp;mode=part" data-f="README.md" data-s="337" data-e="340">README.md<span class="rng">L337-340</span></a></p>
+<h2>超分后处理</h2>
+<p><code>--sr</code> 需要配合 <code>--sr-bin</code>（含 <code>realesrgan-ncnn-vulkan</code> 的目录）与 <code>--sr-model-dir</code>（含 <code>.bin</code> / <code>.param</code> 的目录）。这是<strong>对已编码视频的后处理</strong>，不是扩散流水线的一部分，因此失败会回退到低分辨率片段而不是中断整次运行。</p>
+<p>分辨率策略：</p>
+<ul><li>给了 <code>--sr-target WxH</code> 且是内部分辨率的 2–4 整数倍 → 按该倍率精确放大；否则先 ×4 再用 ffmpeg 缩放到目标。</li><li>未给 target → 内部分辨率 × <code>--sr-scale</code>（默认 4）。</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.h&amp;s=49&amp;e=58&amp;mode=part" data-f="h3_ffmpeg.h" data-s="49" data-e="58">h3_ffmpeg.h<span class="rng">L49-58</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=357&amp;e=402&amp;mode=part" data-f="README.md" data-s="357" data-e="402">README.md<span class="rng">L357-402</span></a></p></div></body></html>

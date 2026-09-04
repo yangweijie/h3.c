@@ -1,0 +1,82 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DiT 去噪与采样器</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>DiT 去噪与采样器</h1>
+<p>DiT 是整条流水线里最贵的一段：一个 50 块的变换器，在 20 个 Euler 步上迭代，同时推进视频与音频两条潜变量。入口在 <code>h3_dit.c</code>，常量定义在文件头部的匿名枚举。</p>
+<h2>核心常量</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">enum {
+    TEXT_DIM = 5120,      HIDDEN = 5376,
+    HEADS = 56,           HEAD_DIM = 128,
+    INNER = HEADS * HEAD_DIM,   /* 7168 */
+    FFN = 14336,
+    VIDEO_CHANNELS = 24,  VIDEO_PATCH = 96,
+    AUDIO_CHANNELS = 32,  AUDIO_STREAMS = 2,
+    ROPE_FREQS = 16,      ROPE_HALF = 48,
+    SLOTS = 6,            FINAL_SLOTS = 2
+};</code></pre></div>
+<p><code>H3_DIT_BLOCKS=50</code>、<code>H3_DIT_HIDDEN=5376</code>、<code>H3_DIT_TIME_DIM=2688</code>、<code>H3_DIT_MODALITIES=3</code>、<code>H3_DIT_ADALN_SLOTS=6</code> 在 <code>h3_dit_schedule.h</code> 中<strong>有意重复定义</strong>——改动时必须两处同步。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=18&amp;e=33&amp;mode=part" data-f="h3_dit.c" data-s="18" data-e="33">h3_dit.c<span class="rng">L18-33</span></a>, <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=11&amp;e=15&amp;mode=part" data-f="h3_dit_schedule.h" data-s="11" data-e="15">h3_dit_schedule.h<span class="rng">L11-15</span></a></p>
+<h2>加载：两条入口</h2>
+<table><thead><tr><th>入口</th><th>场景</th></tr></thead><tbody><tr><td><code>h3_dit_load_t2va</code></td><td>纯文本 FL2VA</td></tr><tr><td><code>h3_dit_load_conditioned</code></td><td>FL2VA 锚点 / Ref2VA 有序参考</td></tr></tbody></table>
+<p>两者签名几乎相同，差别只在后者多接收视觉/音频条件行。加载顺序是<strong>先文本精化与 AdaLN 预计算，后加载持久核心</strong>——这样 498 MiB 的块投影在加载下一块前就已被释放。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=20&amp;e=79&amp;mode=part" data-f="h3_dit.h" data-s="20" data-e="79">h3_dit.h<span class="rng">L20-79</span></a>, <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=22&amp;e=30&amp;mode=part" data-f="h3_dit_schedule.h" data-s="22" data-e="30">h3_dit_schedule.h<span class="rng">L22-30</span></a></p>
+<h2>每一步做什么</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;h3_dit_forward(step, video, audio)&quot;] --&gt; B[&quot;patchify + pack&lt;br/&gt;F32 主机边界 → 打包隐藏流&quot;]
+    B --&gt; C[&quot;逐块 run_block×N&quot;]
+    C --&gt; D{&quot;首块缓存开启?&quot;}
+    D --&gt;|是| E[&quot;fb_cache_probe: 相对 L1 比较&quot;]
+    E --&gt;|低于阈值| F[&quot;跳过剩余块，重放缓存残差&quot;]
+    E --&gt;|高于阈值| G[&quot;完整跑完&quot;]
+    G --&gt; H[&quot;最终 AdaLN + 输出头&quot;]
+    F --&gt; H
+    H --&gt; I[&quot;unpatchify / unpack → 速度场&quot;]
+    I --&gt; J[&quot;Euler 更新 sample += Δ·(last + ratio·(last-prev))&quot;]</pre>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=2420&amp;e=2598&amp;mode=part" data-f="h3_dit.c" data-s="2420" data-e="2598">h3_dit.c<span class="rng">L2420-2598</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=2599&amp;e=2635&amp;mode=part" data-f="h3_dit.c" data-s="2599" data-e="2635">h3_dit.c<span class="rng">L2599-2635</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=2636&amp;e=3014&amp;mode=part" data-f="h3_dit.c" data-s="2636" data-e="3014">h3_dit.c<span class="rng">L2636-3014</span></a></p>
+<h2>采样器：独立位移 Euler 网格</h2>
+<p>默认采样器使用<strong>视频与音频各自独立的位移 schedule</strong>：</p>
+<ul><li>视频 sigma shift = 12.0，音频 sigma shift = 3.0</li><li><code>--steps N</code> <strong>永远表示恰好 N 次去噪</strong>，终端零在最后一次之后补上</li><li><code>h3_serving_schedule_build(evaluations, &amp;schedule)</code> 用「线性基准网格 + 一个终端点」</li></ul>
+<p><code>h3_dit_denoise_euler</code> 与 <code>h3_dit_denoise_euler_preview</code> 的差别只在后者每步后调用预览回调（会引入同步点，因此是 opt-in）。<code>h3_dit_denoise</code> 是更早的 RES 多步实现，仍保留。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=12&amp;e=13&amp;mode=part" data-f="h3_host.h" data-s="12" data-e="13">h3_host.h<span class="rng">L12-13</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=112&amp;e=117&amp;mode=part" data-f="h3_host.h" data-s="112" data-e="117">h3_host.h<span class="rng">L112-117</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=101&amp;e=121&amp;mode=part" data-f="h3_dit.h" data-s="101" data-e="121">h3_dit.h<span class="rng">L101-121</span></a></p>
+<h2>三种省算策略</h2>
+<table><thead><tr><th>策略</th><th>参数</th><th>机制</th><th>互斥性</th></tr></thead><tbody><tr><td><strong>整体速度场复用</strong></td><td><code>--reuse N</code></td><td>评估首步、末步及每第 N 步，跳过的步在各自 schedule 上外推速度场</td><td>与 <code>core_reuse</code> 互斥</td></tr><tr><td><strong>核心残差复用</strong></td><td><code>--core-reuse N</code></td><td>保留上一次的完整残差，每步只刷新 patch 投影与时间步感知头</td><td>与 <code>denoise_reuse</code> 互斥</td></tr><tr><td><strong>层精简</strong></td><td><code>--layers N</code></td><td>按 AdaLN 门控分数排序，保留前 N 块（保护结构上重要的首/末块）</td><td>可与前两者叠加</td></tr></tbody></table>
+<p><code>h3_dit_reuse_schedule(steps, reuse_interval, selected, count)</code> 生成评估掩码，返回评估次数。在 20 步下：reuse=1/2/3 分别对应 20 / 11 / 8 次全新 DiT 评估。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=123&amp;e=127&amp;mode=part" data-f="h3_dit.h" data-s="123" data-e="127">h3_dit.h<span class="rng">L123-127</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=3157&amp;e=3173&amp;mode=part" data-f="h3_dit.c" data-s="3157" data-e="3173">h3_dit.c<span class="rng">L3157-3173</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=546&amp;e=558&amp;mode=part" data-f="h3.c" data-s="546" data-e="558">h3.c<span class="rng">L546-558</span></a></p>
+<h2>首块缓存（实验性）</h2>
+<p><code>H3_FB_CACHE=1</code> 启用。每一步都跑第一个活跃 DiT 块，用相对 L1 度量比较其残差：</p>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>sum|r - r_prev| / sum|r_prev|</code></pre></div>
+<p>一个 Metal 内核把它规约成 1024 个 <code>[delta, magnitude]</code> 部分对，主机端收尾，<strong>同一个 pass 里刷新缓存的首块残差</strong>。低于阈值（<code>H3_FB_CACHE_THRESHOLD</code>，默认 0.12）就跳过剩余块、重放缓存的完整栈残差——首块残差几乎没动，意味着整叠块也会给出几乎相同的更新。</p>
+<p>约束：</p>
+<ul><li>首步用于播种缓存；<strong>末步永远完整跑</strong>（其速度场从不被复用）</li><li><code>--ssd-streaming</code> 下禁用（预取环假设每个块都被按序消费）</li><li>token reduction 活跃的步上禁用</li><li>需要最多三个额外的全隐藏 BF16 缓冲；其中两个与 <code>--core-reuse</code> 共享</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=35&amp;e=39&amp;mode=part" data-f="h3_dit.c" data-s="35" data-e="39">h3_dit.c<span class="rng">L35-39</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=558&amp;e=567&amp;mode=part" data-f="h3_gpu.h" data-s="558" data-e="567">h3_gpu.h<span class="rng">L558-567</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=561&amp;e=579&amp;mode=part" data-f="README.md" data-s="561" data-e="579">README.md<span class="rng">L561-579</span></a></p>
+<h2>数据边界：patchify 与 pack</h2>
+<p>主机边界的格式是 F32：<code>[24,T,H,W]</code> 视频、<code>[32,2,T]</code> 音频。进出 DiT 需要行序转换：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_dit_patchify_video(const float *latent, int channels, int time,
+                          int height, int width, float *rows, size_t row_elements);
+int h3_dit_unpatchify_video(const float *rows, int channels, int time,
+                            int height, int width, float *latent, size_t latent_elements);
+int h3_dit_pack_audio(const float *latent, int channels, int time,
+                      float *rows, size_t row_elements);
+int h3_dit_unpack_audio(const float *rows, int channels, int time,
+                        float *latent, size_t latent_elements);</code></pre></div>
+<p>这四个函数被<strong>刻意导出到内部头文件</strong>，以便用便宜的主机测试钉住行序，而无需 62 GiB 的完整 checkpoint。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=131&amp;e=142&amp;mode=part" data-f="h3_dit.h" data-s="131" data-e="142">h3_dit.h<span class="rng">L131-142</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=3688&amp;e=3775&amp;mode=part" data-f="h3_dit.c" data-s="3688" data-e="3775">h3_dit.c<span class="rng">L3688-3775</span></a></p>
+<h2>M5 GPU 采样器</h2>
+<p>M5 上默认的 serving Euler 采样器把 patch 打包后的 F32 潜变量与缓存的 BF16 速度场<strong>都留在 Metal 缓冲里</strong>：每次选定的去噪刷新在编码下一次之前完成，既避开 MPSGraph 背压，又消除了所有中间潜变量/速度场的回读与重打包。</p>
+<p>这还省下每个视频潜变量元素约 16 字节的瞬态主机状态（768p 形状下约 136 MB）。M3 及更老的 GPU 默认保留 CPU 采样器。</p>
+<table><thead><tr><th>环境变量</th><th>作用</th></tr></thead><tbody><tr><td><code>H3_CPU_SAMPLER=1</code></td><td>在 M5 上恢复 CPU 采样器</td></tr><tr><td><code>H3_GPU_SAMPLER=1</code></td><td>显式选择 GPU 状态路径</td></tr><tr><td><code>H3_GPU_SAMPLER_WINDOW=0</code></td><td>开启较慢的无界提前编码诊断模式</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=3196&amp;e=3230&amp;mode=part" data-f="h3_dit.c" data-s="3196" data-e="3230">h3_dit.c<span class="rng">L3196-3230</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=710&amp;e=719&amp;mode=part" data-f="README.md" data-s="710" data-e="719">README.md<span class="rng">L710-719</span></a></p>
+<h2>命令缓冲拆分与激活别名</h2>
+<p>DiT 核心被拆成<strong>两个有序的 Metal 命令缓冲</strong>，使第一部分的 GPU 执行与第二部分的 CPU 编码重叠。热平衡 ABBA 实测：M5 选 60% 深度拆分（30/50、27/45、24/40），M3 只拆实测有效的 30/50。</p>
+<p>激活缓冲按<strong>块内真实生命周期</strong>别名复用：QKV 投影竞技场先后被注意力头、归一化后的 MLP 输入复用；注意力输出竞技场在其分支被消费后变成 MLP 输出。512 类几何下省 61.25 MiB，864 类下省 99.63 MiB，<strong>不改变 dispatch 与算术</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=231&amp;e=243&amp;mode=part" data-f="h3_dit.c" data-s="231" data-e="243">h3_dit.c<span class="rng">L231-243</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=1852&amp;e=2056&amp;mode=part" data-f="h3_dit.c" data-s="1852" data-e="2056">h3_dit.c<span class="rng">L1852-2056</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=685&amp;e=697&amp;mode=part" data-f="README.md" data-s="685" data-e="697">README.md<span class="rng">L685-697</span></a></p></div></body></html>

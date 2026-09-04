@@ -1,0 +1,60 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>构建与运行</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>构建与运行</h1>
+<h2>构建</h2>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">make -j8          # 产出 h3 CLI 与 libh3.a
+make clean        # 清除所有产物</code></pre></div>
+<p>Makefile 默认 <code>CC := xcrun clang</code>。<strong>必须使用 Apple clang，不能是 Homebrew LLVM</strong>：Homebrew clang（如 LLVM 16）在 macOS 26 SDK 的 Accelerate/vecLib 头文件上会报 <code>unrecognized platform name visionOS</code>，而 Apple clang 21 可以正常处理。同时，旧 SDK（15.4）虽然能绕过该错误，但缺少 <code>h3_metal.m</code> 需要的 <code>MTLGPUFamilyMetal4</code>，因此 <strong>26.x SDK + Apple clang 是唯一可用组合</strong>。</p>
+<p>编译开关为严格 C11：</p>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>-std=c11 -O3 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion</code></pre></div>
+<p><code>.m</code> 文件额外加 <code>-fobjc-arc</code>，链接 Foundation / Metal / MetalPerformanceShaders / MetalPerformanceShadersGraph / Accelerate 五个 framework 加 <code>-licucore -lm</code>。<code>linenoise.c</code> 是 vendored 的终端编辑器，单独豁免 <code>-Wconversion</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=1&amp;e=9&amp;mode=part" data-f="Makefile" data-s="1" data-e="9">Makefile<span class="rng">L1-9</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=219&amp;e=221&amp;mode=part" data-f="Makefile" data-s="219" data-e="221">Makefile<span class="rng">L219-221</span></a></p>
+<h2>库源文件必须登记</h2>
+<p><code>LIB_C</code> / <code>LIB_M</code> 列出所有参与 <code>libh3.a</code> 的源文件。<strong>只被 <code>#include</code> 而未加进 <code>LIB_C</code> 的源文件会在链接期报 <code>Undefined symbols</code></strong>（<code>h3_memory_plan.c</code> 就是这样被漏掉的）。新增 <code>.c</code> 文件时务必同步登记。</p>
+<div class="codeblock"><div class="cb-bar"><span>make</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-make">LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
+	h3_dit_schedule.c h3_dit.c h3_lora.c h3_memory_plan.c
+LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
+	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
+LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=11&amp;e=16&amp;mode=part" data-f="Makefile" data-s="11" data-e="16">Makefile<span class="rng">L11-16</span></a></p>
+<h2>运行时依赖</h2>
+<ul><li><strong>ffmpeg / ffprobe 必须在 <code>PATH</code> 上</strong>，用于参考媒体解码与 MP4 输出。可用 <code>H3_FFMPEG</code> / <code>H3_FFPROBE</code> 指定可执行文件。</li><li>无需 Xcode 的完整 Metal 工具链：Metal 源码在<strong>运行时编译</strong>，走的是 Iris 的做法。</li><li>可选的 <code>realesrgan-ncnn-vulkan</code> 用于 <code>--sr</code> 超分后处理。</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.c&amp;s=16&amp;e=26&amp;mode=part" data-f="h3_ffmpeg.c" data-s="16" data-e="26">h3_ffmpeg.c<span class="rng">L16-26</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=469&amp;e=472&amp;mode=part" data-f="README.md" data-s="469" data-e="472">README.md<span class="rng">L469-472</span></a></p>
+<h2>三种运行形态</h2>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh"># 1) 只检查模型与设备，不映射权重
+./h3 --info -d ./MiniMax-H3
+
+# 2) 一次性生成
+./h3 --profile -d ./MiniMax-H3 \
+     -p &quot;A red fox walks through fresh snow in a pine forest.&quot; \
+     --width 512 --height 512 --frames 22 --steps 20 \
+     --layers 45 --reuse 2 --show -o outputs/fox-fast.mp4
+
+# 3) 交互式会话（不给 -p 即进入）
+./h3 -d ./MiniMax-H3 --width 512 --height 512 --steps 6</code></pre></div>
+<p>会话模式下，精确的 BF16 条件、已准备好的 DiT 与视频解码器都保留在内存里，换种子重跑同一 prompt 无需重新加载与编码。完整命令列表见 <a href="../pages/cli-and-session.html">命令行与交互会话</a>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=12&amp;e=64&amp;mode=part" data-f="README.md" data-s="12" data-e="64">README.md<span class="rng">L12-64</span></a>, <a class="src-ref" href="../source.html?f=main.c&amp;s=17&amp;e=73&amp;mode=part" data-f="main.c" data-s="17" data-e="73">main.c<span class="rng">L17-73</span></a></p>
+<h2>测试</h2>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">make test          # 全量：自动跳过缺少权重/fixture 的用例
+make parity        # Metal vs MLX BF16 数值对齐（toy 块 fixture）
+make real-parity   # 同上，但针对真实发布权重</code></pre></div>
+<p>没有安装任何权重时，实际只跑 <code>h3_tests</code> 和 <code>h3_audio_gpu_tests</code>。fixture 位于 <code>misc/fixtures/</code>，模型目录为 <code>./MiniMax-H3</code>。详见 <a href="../pages/test-suite.html">测试与数值对齐</a>。</p>
+<p>也可以直接跑单个测试二进制，部分需要参数：</p>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">./h3_tests
+./h3_metal_tests misc/fixtures/h3_dit.safetensors
+./h3_tokenizer_tests MiniMax-H3/tokenizer/tokenizer.json</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=115&amp;e=133&amp;mode=part" data-f="Makefile" data-s="115" data-e="133">Makefile<span class="rng">L115-133</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=198&amp;e=205&amp;mode=part" data-f="Makefile" data-s="198" data-e="205">Makefile<span class="rng">L198-205</span></a></p>
+<h2>常见构建陷阱</h2>
+<table><thead><tr><th>症状</th><th>原因</th><th>处理</th></tr></thead><tbody><tr><td><code>unrecognized platform name visionOS</code></td><td>用了 Homebrew clang</td><td><code>make CC=&quot;xcrun clang&quot;</code></td></tr><tr><td><code>MTLGPUFamilyMetal4</code> 未声明</td><td>SDK 太旧</td><td>升级到 macOS 26.x SDK</td></tr><tr><td><code>Undefined symbols for architecture arm64</code></td><td>新源文件没写进 <code>LIB_C</code></td><td>补登记后 <code>make clean &amp;&amp; make</code></td></tr><tr><td>运行时 &quot;FFmpeg is not installed&quot;</td><td>PATH 上没有 ffmpeg</td><td>用 <code>H3_FFMPEG</code> 显式指定</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=14&amp;e=26&amp;mode=part" data-f="AGENTS.md" data-s="14" data-e="26">AGENTS.md<span class="rng">L14-26</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=1&amp;e=4&amp;mode=part" data-f="Makefile" data-s="1" data-e="4">Makefile<span class="rng">L1-4</span></a></p></div></body></html>

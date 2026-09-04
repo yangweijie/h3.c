@@ -1,0 +1,62 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>性能分析与诊断开关</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>性能分析与诊断开关</h1>
+<p>引擎保留了大量<strong>用于精确 A/B 的环境变量</strong>。它们不是给用户调的，而是在同一进程内把某条融合路径关掉、回到&quot;近参考&quot;的两内核实现，从而定位数值或性能回归。</p>
+<h2>--profile 报告什么</h2>
+<p><code>--profile</code> 逐 Metal 阶段报告六个维度：</p>
+<table><thead><tr><th>维度</th><th>说明</th></tr></thead><tbody><tr><td>wall time</td><td>阶段墙钟时间</td></tr><tr><td>command encode</td><td>CPU 侧命令编码时间</td></tr><tr><td>wait</td><td><strong>完整的 commit-to-fence 周转</strong></td></tr><tr><td>root GPU timestamp</td><td>根命令缓冲的 GPU 时间戳</td></tr><tr><td>peak live / cumulative alloc</td><td>峰值活跃张量存储、累计分配量</td></tr><tr><td>dispatch counts</td><td>直接 / MPS linear / conv / sdpa / blit 各类 dispatch 数</td></tr></tbody></table>
+<p>关于时间口径有一条重要说明：</p>
+<blockquote>wait 测量的是完整的命令周转；<strong>根 GPU 时间戳单独看会漏掉 MPSGraph 内部调度的子缓冲</strong>，因此被相应标注。</blockquote>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=758&amp;e=765&amp;mode=part" data-f="README.md" data-s="758" data-e="765">README.md<span class="rng">L758-765</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=28&amp;e=32&amp;mode=part" data-f="h3_gpu.h" data-s="28" data-e="32">h3_gpu.h<span class="rng">L28-32</span></a></p>
+<h2>阶段名</h2>
+<p>进度回调里的 phase 字符串即剖析单元：</p>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>tokenizer, text encoder, Qwen vision, video VAE encoder, audio VAE encoder,
+text encoder (clipproj), preview VAE load, video VAE load, audio VAE, FFmpeg
++ DiT 透传的 phase</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=679&amp;e=710&amp;mode=part" data-f="h3.c" data-s="679" data-e="710">h3.c<span class="rng">L679-710</span></a></p>
+<h2>诊断开关总表</h2>
+<h3>DiT 融合</h3>
+<table><thead><tr><th>环境变量</th><th>关闭的对象</th></tr></thead><tbody><tr><td><code>H3_DISABLE_FUSED_MLP=1</code></td><td>融合的 <code>fc1→SwiGLU→fc2</code> 图，回到分离操作边界</td></tr><tr><td><code>H3_DISABLE_FUSED_GATE_ADALN=1</code></td><td>注意力残差门控 + 后续 MLP AdaLN 的融合</td></tr><tr><td><code>H3_DISABLE_FUSED_CROSS_BLOCK_ADALN=1</code></td><td>跨块的 MLP 门控 → 下一块注意力 AdaLN</td></tr><tr><td><code>H3_DISABLE_FUSED_FINAL_SLICE=1</code></td><td>最终 AdaLN 直接绑偏移，回到拷贝 + AdaLN</td></tr><tr><td><code>H3_DISABLE_FUSED_FINAL_HEAD=1</code></td><td>最终头加载瓦片时顺带施加 AdaLN</td></tr><tr><td><code>H3_DIT_F32_FINAL=1</code></td><td>恢复近参考的 F32 输出头</td></tr><tr><td><code>H3_DISABLE_FUSED_PATCH_CAST=1</code></td><td>patch 投影的融合舍入</td></tr><tr><td><code>H3_SCALAR_PATCH=1</code></td><td>标量诊断路径</td></tr><tr><td><code>H3_DISABLE_FUSED_PATCH_PACK=1</code></td><td>patch 输出直接绑进打包隐藏流</td></tr><tr><td><code>H3_DISABLE_DIT_ACTIVATION_ALIAS=1</code></td><td>激活缓冲的生命周期别名复用</td></tr><tr><td><code>H3_DIT_COMMAND_BLOCKS=0</code> / <code>1..50</code></td><td>命令缓冲拆分；0 恢复单个</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=502&amp;e=519&amp;mode=part" data-f="README.md" data-s="502" data-e="519">README.md<span class="rng">L502-519</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=683&amp;e=697&amp;mode=part" data-f="README.md" data-s="683" data-e="697">README.md<span class="rng">L683-697</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=767&amp;e=770&amp;mode=part" data-f="README.md" data-s="767" data-e="770">README.md<span class="rng">L767-770</span></a></p>
+<h3>int8 / Metal 4</h3>
+<table><thead><tr><th>环境变量</th><th>作用</th></tr></thead><tbody><tr><td><code>H3_NAX=0</code></td><td>完全禁用 TensorOps</td></tr><tr><td><code>H3_NAX=1</code></td><td>强制更宽的原生 BF16 线性（微基准更快，完整 forward 目前更慢）</td></tr><tr><td><code>H3_NAX=mlp</code></td><td>专门的 Metal 4 MLP 路径</td></tr><tr><td><code>H3_DISABLE_NAX_MLP=1</code></td><td>在此方式创建的上下文里保留 MPSGraph MLP，用于同进程 A/B</td></tr><tr><td><code>H3_DISABLE_GRAPH_DATA_CACHE=1</code></td><td>恢复所有张量的瞬态 MPSGraph 包装器</td></tr><tr><td><code>H3_REUSE_MPS_COMMAND=0</code> / <code>1</code></td><td>覆盖 MPSCommandBuffer 复用的自动选择</td></tr></tbody></table>
+<p>对应的 CLI 回退开关见 <a href="../pages/int8-tensorops.html">int8 与 TensorOps 路径</a>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=634&amp;e=652&amp;mode=part" data-f="README.md" data-s="634" data-e="652">README.md<span class="rng">L634-652</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=698&amp;e=709&amp;mode=part" data-f="README.md" data-s="698" data-e="709">README.md<span class="rng">L698-709</span></a></p>
+<h3>Token 缩减与首块缓存</h3>
+<table><thead><tr><th>环境变量</th><th>作用</th></tr></thead><tbody><tr><td><code>H3_TOKEN_REDUCTION_BLOCKS</code></td><td>覆盖后续的 <code>4:30</code> 区间</td></tr><tr><td><code>H3_TOKEN_REDUCTION_EARLY=STEPS:END</code></td><td>覆盖早期调度；<code>0</code> 禁用</td></tr><tr><td><code>H3_DISABLE_TOKEN_REDUCTION=1</code></td><td>上下文内的精确对照</td></tr><tr><td><code>H3_DISABLE_FUSED_TOKEN_POOL_ADALN=1</code></td><td>恢复双内核入口边界</td></tr><tr><td><code>H3_DISABLE_FUSED_TOKEN_ADALN=1</code></td><td>恢复双内核出口边界</td></tr><tr><td><code>H3_FB_CACHE=1</code></td><td>启用首块缓存（默认关）</td></tr><tr><td><code>H3_FB_CACHE_THRESHOLD</code></td><td>相对 L1 阈值，默认 0.12</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=548&amp;e=553&amp;mode=part" data-f="README.md" data-s="548" data-e="553">README.md<span class="rng">L548-553</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=563&amp;e=575&amp;mode=part" data-f="README.md" data-s="563" data-e="575">README.md<span class="rng">L563-575</span></a></p>
+<h3>权重与编码</h3>
+<table><thead><tr><th>环境变量</th><th>作用</th></tr></thead><tbody><tr><td><code>H3_ZERO_COPY_WEIGHTS=0</code></td><td>关闭 M5 的 zero-copy 权重映射</td></tr><tr><td><code>H3_QWEN_PREFETCH=0</code> / <code>1..8</code></td><td>文本编码器预取；0 恢复单层同步，1–8 指定线程数</td></tr><tr><td><code>H3_QWEN_PREFETCH_DEPTH=1..6</code></td><td>覆盖预取环深度（M3/老硬件默认 2，M5 默认 3）</td></tr><tr><td><code>H3_CLIPPROJ_DIR=0</code> / <code>off</code></td><td>回退到 50 层编码器</td></tr><tr><td><code>H3_VAE_TILE_PIXELS=256</code></td><td>恢复保守的视频 VAE 瓦片计划</td></tr><tr><td><code>H3_DEBUG_CONVROT</code></td><td>首块 <code>STREAM_OUT</code> 的 ConvRot 调试输出</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=600&amp;e=612&amp;mode=part" data-f="README.md" data-s="600" data-e="612">README.md<span class="rng">L600-612</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=1105&amp;e=1106&amp;mode=part" data-f="h3_dit.c" data-s="1105" data-e="1106">h3_dit.c<span class="rng">L1105-1106</span></a></p>
+<h3>采样器</h3>
+<table><thead><tr><th>环境变量</th><th>作用</th></tr></thead><tbody><tr><td><code>H3_CPU_SAMPLER=1</code></td><td>在 M5 上恢复 CPU 采样器</td></tr><tr><td><code>H3_GPU_SAMPLER=1</code></td><td>显式选择 GPU 状态路径</td></tr><tr><td><code>H3_GPU_SAMPLER_WINDOW=0</code></td><td>较慢的无界提前编码诊断模式</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=716&amp;e=719&amp;mode=part" data-f="README.md" data-s="716" data-e="719">README.md<span class="rng">L716-719</span></a></p>
+<h2>一个诊断流程示例</h2>
+<p>怀疑某个融合改变了数值：</p>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh"># 1) 基线（近参考）
+H3_DISABLE_FUSED_GATE_ADALN=1 H3_DISABLE_FUSED_MLP=1 \
+  ./h3 --profile -d ./MiniMax-H3 -p &quot;...&quot; --seed 42 \
+       --width 512 --height 512 --frames 22 --steps 20 --layers 50 --reuse 1 \
+       -o /tmp/base.mp4
+
+# 2) 默认（全部融合）
+./h3 --profile -d ./MiniMax-H3 -p &quot;...&quot; --seed 42 \
+       --width 512 --height 512 --frames 22 --steps 20 --layers 50 --reuse 1 \
+       -o /tmp/fused.mp4</code></pre></div>
+<p>同种子、同分辨率、同帧数、同步数是比较的前提。README 也提醒：</p>
+<blockquote>这类负载对热节流敏感，比较时应使用重复运行，并在机器预热期间交替变体。</blockquote>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=99&amp;e=102&amp;mode=part" data-f="README.md" data-s="99" data-e="102">README.md<span class="rng">L99-102</span></a></p>
+<h2>需要注意的默认行为</h2>
+<p><code>ssd-streaming</code> 不是默认档位，<code>token_reduction</code> 也不是；<code>memory_plan_auto</code> 默认<strong>开启</strong>，会在用户未显式指定流式/int8 时替用户做选择。做 A/B 时若想完全确定路径，应显式指定 <code>ssd_streaming</code> 与 <code>use_int8_row_fc2</code>（任一非零即禁用自动规划）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=886&amp;e=888&amp;mode=part" data-f="h3.c" data-s="886" data-e="888">h3.c<span class="rng">L886-888</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=156&amp;e=158&amp;mode=part" data-f="README.md" data-s="156" data-e="158">README.md<span class="rng">L156-158</span></a></p></div></body></html>

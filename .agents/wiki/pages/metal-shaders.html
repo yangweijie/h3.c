@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh" data-theme="dark"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Metal 着色器与后端: h3_metal / h3_gpu.m</title>
+<title>Metal 内核库</title>
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
 <link rel="stylesheet" href="../style/wiki.css">
 <link rel="stylesheet" href="../style/hljs.css">
@@ -11,15 +11,55 @@
 <script src="../script/source-viewer.js"></script>
 <script src="../script/mermaid.min.js"></script>
 <script src="../script/wiki.js" defer></script>
-</head><body><div class="wrap"><h1>Metal 着色器与后端: h3_metal / h3_gpu.m</h1>
-<p><code>h3_metal.h</code> 声明 Metal 内核接口，<code>h3_metal.m</code> 以 Objective-C 实现这些内核并把 Metal 着色器源码（<code>.metal</code>）作为字符串常量内联，<code>h3_gpu.m</code> 则封装设备/缓冲/命令队列并把算子分派到内核或 MPS。二者共同构成引擎的 GPU 后端。</p>
-<h2>着色器源</h2>
-<p><code>h3_metal.m</code> 持有若干 <code>.metal</code> 源字符串（如 RMSNorm、量化 matmul、AdaLN 调制、patch embed、VAE 上采样与 BigVGAN 反卷积）。这些源在 <code>h3_gpu_create()</code> 时通过 <code>shader_source_path</code> 指定的库加载，或当未指定时回退到内联编译。把源内联的好处是单一可执行文件即可运行，无需随包携带 <code>.metal</code> 文件。</p>
-<h2>内核类别</h2>
-<ul><li><strong>归一化</strong>：<code>rms_norm_*</code>——BF16/F32 的逐通道 RMS 归一化，DiT 与编码器共用。</li><li><strong>量化矩阵乘</strong>：<code>qmatmul_*</code>（group / row 两种 int8 布局）——对应 <code>权重存储</code> 的 <code>int8_group</code>/<code>int8_row</code> 路径；在共享缓冲上做分组/逐行反量化的乘加。</li><li><strong>激活与调制</strong>：<code>silu_*</code>、<code>adaln_modulate_*</code>——把 <code>AdaLN 调度</code> 投影出的调制参数应用到输入张量。</li><li><strong>嵌入与采样</strong>：<code>patch_embed_*</code>、<code>vae_upsample_*</code>、<code>bigvgan_conv_transpose_*</code>——VAE 解码与音频合成的核心算子。</li></ul>
-<h2>命令调度</h2>
-<p><code>h3_gpu.m</code> 维护一个 <code>MTLCommandQueue</code>，并暴露：</p>
-<ul><li><code>h3_gpu_dispatch_kernel(name, tensors[], params)</code>：提交单个内核。</li><li><code>h3_gpu_commit()</code> / <code>h3_gpu_wait()</code>：刷盘与同步；去噪主循环在每个 Euler 步结束时等待，以保证 <code>on_frame</code> 预览的数据已就绪。</li><li><code>h3_gpu_profiling</code>：可选计时，用于 <code>--preview-denoise</code> 之外的性能分析。</li></ul>
-<h2>与 MPS 的关系</h2>
-<p>稳定算子（softmax、卷积转置、某些归一化）走 MPS（<code>h3_mps_*</code>），手写内核用于 MPS 不支持或性能更优的路径（如 int8 量化 matmul）。<code>--use-slower-*</code> 在前端层把部分算子强制切回 MPS 以获得可复现性。</p>
-<p>相关：设备抽象接口见 <code>Metal / MPS 设备封装</code>；这些内核被 <code>DiT 主干</code>、<code>视频 VAE</code> 与 <code>音频 VAE</code> 调用。</p></div></body></html>
+</head><body><div class="wrap"><h1>Metal 内核库</h1>
+<p><code>h3_shaders.metal</code>（4471 行）是引擎自有的 Metal 内核集合。它<strong>作为源码字符串在运行时编译</strong>（<code>h3_gpu_create</code> 接收 <code>shader_source_path</code>），因此不依赖 Xcode 的可选离线 Metal 工具链。</p>
+<h2>组织方式</h2>
+<p>内核按所属模型分族，命名统一为 <code>h3_&lt;算子&gt;_&lt;dtype&gt;[_&lt;特化&gt;]</code>：</p>
+<table><thead><tr><th>族</th><th>代表内核</th><th>行</th></tr></thead><tbody><tr><td>F32 通用</td><td><code>h3_linear_f32</code>、<code>h3_silu_f32</code>、<code>h3_rms_norm_f32</code>、<code>h3_layer_norm_f32</code></td><td>150–390</td></tr><tr><td>F32 结构</td><td><code>h3_adaln_f32</code>、<code>h3_gate_f32</code>、<code>h3_qkv_rope_f32</code>、<code>h3_swiglu_f32</code></td><td>391–587</td></tr><tr><td>视觉 VAE</td><td><code>h3_vae_encoder_pad_f32</code>、<code>h3_vae_encoder_group_norm_silu_f32</code></td><td>588–701</td></tr><tr><td>音频</td><td><code>h3_weight_norm_f32</code>、<code>h3_alias_free_snake_f32</code>、<code>h3_snake1d_f32</code>、<code>h3_audio_qkv_split_f32</code>、<code>h3_audio_attention_pool_f32</code>、<code>h3_geglu_f32</code></td><td>702–878</td></tr><tr><td>BF16 基础</td><td><code>h3_linear_bf16</code></td><td>879</td></tr><tr><td>Metal 4 / TensorOps</td><td><code>h3_linear_bf16_nax_r128[_morton(4)]</code>、<code>h3_qkv_project_split_bf16_nax_r128_morton4</code>、<code>h3_qk_rope_bf16_nax_inplace</code></td><td>1014–1227</td></tr><tr><td>NAX MLP</td><td><code>h3_fc1_swiglu_bf16_nax_r128[_morton(4)]</code></td><td>1228–1410</td></tr><tr><td>int8 量化</td><td><code>h3_quantize_bf16_int8_rows</code>、<code>h3_quantize_bf16_int8_groups[_scalar(128)(_cached)]</code>、<code>h3_quantize_bf16_int8_head_major_to_rows_cached</code></td><td>1411–1778</td></tr><tr><td>int8 投影</td><td><code>h3_qkv_project_split_int8*_nax_r128_morton4</code>、<code>h3_fc1_swiglu_int8*_nax_r128</code>、<code>h3_linear_int8_nax_r128*</code></td><td>1779–2600+</td></tr><tr><td>权重处理</td><td><code>h3_weight_dequant_unrotate_int8</code>、<code>h3_convrot_remap_qkv_bf16</code></td><td>83–149</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_shaders.metal&amp;s=83&amp;e=2600&amp;mode=part" data-f="h3_shaders.metal" data-s="83" data-e="2600">h3_shaders.metal<span class="rng">L83-2600</span></a></p>
+<h2>模板特化</h2>
+<p>很多内核用 C++ 模板 + <code>[[host_name]]</code> 把形状常量<strong>编译进内核</strong>，避开运行时分支：</p>
+<div class="codeblock"><div class="cb-bar"><span>metal</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-metal">template&lt;uint K_TILE&gt;
+kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4_impl(...) { ... }
+
+template [[host_name(&quot;h3_qkv_project_split_int8_rope_nax_r128_morton4&quot;)]]
+kernel h3_qkv_project_split_int8_rope_nax_r128_morton4_t&lt;...&gt;;
+template [[host_name(&quot;h3_qkv_project_split_int8_rope_nax_r128_k5376_morton4&quot;)]]
+kernel h3_qkv_project_split_int8_rope_nax_r128_morton4_t&lt;...&gt;;</code></pre></div>
+<p>同一个实现以多个 host name 暴露，C 侧按形状挑名字。典型特化维度：</p>
+<ul><li><code>K_TILE</code>：K 方向瓦片大小</li><li><code>k5376</code> / <code>full_k14336</code>：把 H3 的真实维度（5376、14336）编译进去</li><li><code>local_scales</code>：scale 是否缓存在 threadgroup</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_shaders.metal&amp;s=1845&amp;e=1850&amp;mode=part" data-f="h3_shaders.metal" data-s="1845" data-e="1850">h3_shaders.metal<span class="rng">L1845-1850</span></a>, <a class="src-ref" href="../source.html?f=h3_shaders.metal&amp;s=2023&amp;e=2028&amp;mode=part" data-f="h3_shaders.metal" data-s="2023" data-e="2028">h3_shaders.metal<span class="rng">L2023-2028</span></a>, <a class="src-ref" href="../source.html?f=h3_shaders.metal&amp;s=2229&amp;e=2352&amp;mode=part" data-f="h3_shaders.metal" data-s="2229" data-e="2352">h3_shaders.metal<span class="rng">L2229-2352</span></a></p>
+<h2>Morton 调度</h2>
+<p>Metal 4 / TensorOps 路径用 <strong>Morton 序调度</strong>把 Q/K/V 直接写进 head-major 的注意力输入布局：</p>
+<ul><li>省掉 MPSGraph 的三次输入转置</li><li>与可移植路径<strong>逐字节一致</strong></li><li>2049–3072 行（含 864×480）用两次行偏移 Morton dispatch 保持高效瓦片几何</li></ul>
+<p>完整的 512×512 50 块 forward 提升约 2%。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=626&amp;e=633&amp;mode=part" data-f="README.md" data-s="626" data-e="633">README.md<span class="rng">L626-633</span></a>, <a class="src-ref" href="../source.html?f=h3_shaders.metal&amp;s=1037&amp;e=1149&amp;mode=part" data-f="h3_shaders.metal" data-s="1037" data-e="1149">h3_shaders.metal<span class="rng">L1037-1149</span></a></p>
+<h2>与 MPSGraph 的分工</h2>
+<pre class="mermaid">flowchart LR
+    A[&quot;算子请求&quot;] --&gt; B{&quot;有没有专用 Metal 内核?&quot;}
+    B --&gt;|有| C[&quot;直接 dispatch（direct_dispatches）&quot;]
+    B --&gt;|没有| D[&quot;MPSGraph 图（mps_*_dispatches）&quot;]
+    D --&gt; E[&quot;SDPA / Conv1d / Conv3d / 宽矩阵乘&quot;]</pre>
+<p>MPSGraph 承担<strong>稳定但形状多变</strong>的算子（SDPA、卷积、超宽矩阵乘），自研内核承担<strong>H3 特有、形状固定、值得特化</strong>的算子（AdaLN、门控、QKV+RoPE、patch 投影、量化）。</p>
+<p><code>h3_gpu_stats</code> 分别统计 <code>direct_dispatches</code> 与 <code>mps_linear/conv/sdpa_dispatches</code>，因此一次运行的算子构成是可观测的。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=17&amp;e=33&amp;mode=part" data-f="h3_gpu.h" data-s="17" data-e="33">h3_gpu.h<span class="rng">L17-33</span></a></p>
+<h2>稳定算子的图缓存</h2>
+<p>不可变的 DiT 权重与偏置的 <strong>MPSGraph tensor-data 包装器会被保留</strong>，连同其常驻缓冲一起。这避免为每个块、每次去噪求值重建相同的绑定元数据，且不拷贝张量存储。</p>
+<p><strong>激活包装器保持瞬态</strong>——保留它们在 M5 上是回退的。</p>
+<p>ABBA 实测收益：M3 Max 1.6%，M5 Max 0.4–1.1%。输出逐字节一致。</p>
+<p>回退：<code>H3_DISABLE_GRAPH_DATA_CACHE=1</code></p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=698&amp;e=704&amp;mode=part" data-f="README.md" data-s="698" data-e="704">README.md<span class="rng">L698-704</span></a></p>
+<h2>MPSCommandBuffer 复用</h2>
+<p>M3 / 更老硬件上，每个 DiT 块里的四个 MPSGraph 段<strong>复用一个 <code>MPSCommandBuffer</code> 包装器</strong>（共享底层 Metal 命令缓冲）。</p>
+<p>M5 实测中性，因此保留新建包装器。</p>
+<ul><li>热平衡重复实测 M3 Max 快 1.0–1.6%</li><li>结果逐字节一致</li><li><code>H3_REUSE_MPS_COMMAND=0</code> / <code>1</code> 覆盖自动选择</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=705&amp;e=709&amp;mode=part" data-f="README.md" data-s="705" data-e="709">README.md<span class="rng">L705-709</span></a></p>
+<h2>常量直写内核</h2>
+<p>H3 的真实维度被<strong>直接编译进内核</strong>：</p>
+<ul><li><code>h3_fc1_swiglu_int8_nax_r128_k5376</code> → K=5376</li><li><code>h3_linear_int8_nax_r128_full_k14336</code> → 完整 K=14336</li><li><code>h3_qkv_project_split_int8_rope_nax_r128_k5376_morton4</code></li></ul>
+<p>代价是编译时间，收益是循环边界在编译期已知、可完全展开。FC1 的 H3 特化 5376 宽 TensorOps 循环与通用循环逐字节一致，但快 0.1–0.4%。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_shaders.metal&amp;s=2341&amp;e=2352&amp;mode=part" data-f="h3_shaders.metal" data-s="2341" data-e="2352">h3_shaders.metal<span class="rng">L2341-2352</span></a>, <a class="src-ref" href="../source.html?f=h3_shaders.metal&amp;s=2490&amp;e=2543&amp;mode=part" data-f="h3_shaders.metal" data-s="2490" data-e="2543">h3_shaders.metal<span class="rng">L2490-2543</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=854&amp;e=856&amp;mode=part" data-f="README.md" data-s="854" data-e="856">README.md<span class="rng">L854-856</span></a></p>
+<h2>运行时编译的取舍</h2>
+<table><thead><tr><th>优点</th><th>代价</th></tr></thead><tbody><tr><td>不需要 Xcode 完整 Metal 工具链</td><td>首次运行有编译开销</td></tr><tr><td>内核形状可按实际参数特化</td><td>编译失败需静默回退到可移植库</td></tr><tr><td>跟随 Iris 的既有做法</td><td>—</td></tr></tbody></table>
+<p><code>H3_NAX=0</code> 可完全禁用 TensorOps 做精确 A/B 诊断。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=459&amp;e=467&amp;mode=part" data-f="README.md" data-s="459" data-e="467">README.md<span class="rng">L459-467</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=634&amp;e=636&amp;mode=part" data-f="README.md" data-s="634" data-e="636">README.md<span class="rng">L634-636</span></a></p></div></body></html>

@@ -1,0 +1,83 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SSD 流式权重</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>SSD 流式权重</h1>
+<p><code>--ssd-streaming</code> 是 DiT 的<strong>独立激进驻留模式</strong>：只用原始 BF16 checkpoint，不做转换或量化，把 DiT 的常驻存储从 ~36.5 GiB 压到 ~2 GiB。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=131&amp;e=158&amp;mode=part" data-f="README.md" data-s="131" data-e="158">README.md<span class="rng">L131-158</span></a></p>
+<h2>机制</h2>
+<pre class="mermaid">flowchart LR
+    subgraph 主 GPU 线程
+        A[&quot;当前块在 Metal 上执行&quot;]
+    end
+    subgraph 后台 I/O
+        B[&quot;读下一块的 4 个矩阵&lt;br/&gt;按 checkpoint 偏移顺序&quot;]
+    end
+    A -.-&gt;|&quot;两个 BF16 槽位交替&quot;| C[&quot;slot 0 / slot 1&quot;]
+    B -.-&gt; C
+    C -.-&gt; A</pre>
+<table><thead><tr><th>要素</th><th>说明</th></tr></thead><tbody><tr><td>常驻</td><td>只有每块的小归一化权重</td></tr><tr><td>槽位</td><td><strong>两个完整的 BF16 矩阵槽位交替</strong></td></tr><tr><td>读取</td><td>后台读线程按 checkpoint 偏移顺序填充下一个槽位</td></tr><tr><td>并发</td><td>当前 Metal 命令缓冲同时执行</td></tr><tr><td>缓存</td><td>Darwin 的非缓存读避免在文件缓存里保留第二份拷贝</td></tr><tr><td>预热</td><td>在最后一个块执行期间<strong>重新预取第一个活跃块</strong>，使缓存的交互式 DiT 为下一次去噪求值做好准备</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=614&amp;e=622&amp;mode=part" data-f="README.md" data-s="614" data-e="622">README.md<span class="rng">L614-622</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=957&amp;e=1030&amp;mode=part" data-f="h3_dit.c" data-s="957" data-e="1030">h3_dit.c<span class="rng">L957-1030</span></a></p>
+<h2>关键数据结构</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">enum { STREAM_QKV, STREAM_OUT, STREAM_FC1, STREAM_FC2, STREAM_MATRICES };
+
+typedef struct {
+    const char *path;
+    uint64_t file_offset;
+    size_t elements;
+    unsigned field;
+    const char *scale_path;      /* ConvRot int8 才有 */
+    uint64_t scale_offset;
+    size_t scale_elements;
+    char scale_name[64];
+    uint32_t rows, columns;
+} h3_dit_stream_source;
+
+typedef struct {
+    h3_dit_stream_source sources[STREAM_MATRICES];
+} h3_dit_stream_layer;</code></pre></div>
+<p>每层的四个矩阵由 <code>prepare_stream_layer</code> 登记，然后<strong>按文件偏移排序</strong>——这样读线程是顺序 I/O 而非随机 I/O。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=60&amp;e=83&amp;mode=part" data-f="h3_dit.c" data-s="60" data-e="83">h3_dit.c<span class="rng">L60-83</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=957&amp;e=975&amp;mode=part" data-f="h3_dit.c" data-s="957" data-e="975">h3_dit.c<span class="rng">L957-975</span></a></p>
+<h2>槽位分配</h2>
+<p><code>allocate_stream_slot</code> 分配四个 BF16 矩阵，外加（按需）int8 副本与 scale：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">slot-&gt;qkv = h3_gpu_tensor_new_bf16(gpu, INNER * 3 * HIDDEN);
+slot-&gt;out = h3_gpu_tensor_new_bf16(gpu, HIDDEN * INNER);
+slot-&gt;fc1 = h3_gpu_tensor_new_bf16(gpu, FFN * 2 * HIDDEN);
+slot-&gt;fc2 = h3_gpu_tensor_new_bf16(gpu, HIDDEN * FFN);
+/* int8_qkv / int8_attention_out / int8_mlp 各自再加 int8 + scales */</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=977&amp;e=1020&amp;mode=part" data-f="h3_dit.c" data-s="977" data-e="1020">h3_dit.c<span class="rng">L977-1020</span></a></p>
+<h2>读线程</h2>
+<p><code>read_stream_layer_thread</code>（1183）驱动 <code>read_stream_layer</code>（1041）。注释明确了线程归属：</p>
+<blockquote>ConvRot int8 权重在 CPU 上反量化与反旋转（此线程不发 GPU 命令）；这里的 GPU 工作只有下面 M5 流式块的 int8 重量化。</blockquote>
+<p>因此 <code>gpu_work</code> 标志决定是否调用 <code>h3_gpu_begin</code>。</p>
+<p><code>h3_dit_stream_job</code> 记录 <code>bytes</code> 与 <code>seconds</code>，供 <code>H3_PROFILE=1</code> 报告总字节数、读吞吐与未被 GPU 工作隐藏的读等待比例。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=1031&amp;e=1187&amp;mode=part" data-f="h3_dit.c" data-s="1031" data-e="1187">h3_dit.c<span class="rng">L1031-1187</span></a></p>
+<h2>实测</h2>
+<table><thead><tr><th>指标</th><th>512×512</th><th>864×480</th></tr></thead><tbody><tr><td>DiT 跟踪存储</td><td>36.5 GiB → <strong>2.0 GiB</strong></td><td>→ <strong>2.1 GiB</strong></td></tr><tr><td>温热 50 块 forward</td><td>1.35 s vs 2.49 s（<strong>慢 84%</strong>）</td><td>2.14 s vs 2.68 s（<strong>慢 26%</strong>）</td></tr></tbody></table>
+<p>这是与<strong>同一条全驻留 BF16 路径</strong>的对比，两次检查的结果<strong>逐字节相同</strong>。</p>
+<p>读吞吐实测约 <strong>13–14.6 GiB/s</strong>（内置 SSD）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=142&amp;e=148&amp;mode=part" data-f="README.md" data-s="142" data-e="148">README.md<span class="rng">L142-148</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=620&amp;e=622&amp;mode=part" data-f="README.md" data-s="620" data-e="622">README.md<span class="rng">L620-622</span></a></p>
+<h2>2 GiB 数字的含义</h2>
+<p>README 特意澄清：</p>
+<blockquote>2.0–2.1 GiB 是 DiT 的<strong>跟踪张量存储</strong>，不是系统总 RAM。提示词编码与两个 VAE 在<strong>独立的阶段</strong>运行，不会把各自的峰值叠加进去；操作系统、媒体缓冲与输出分辨率仍需余量。</blockquote>
+<p><code>--show</code> 会保持一个预览 VAE 常驻并增加约 10 GiB，因此最低内存运行要<strong>省略 <code>--show</code></strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=150&amp;e=154&amp;mode=part" data-f="README.md" data-s="150" data-e="154">README.md<span class="rng">L150-154</span></a></p>
+<h2>约束</h2>
+<table><thead><tr><th>约束</th><th>原因</th></tr></thead><tbody><tr><td>不能与 <code>--use-int8-row-fc2</code> 组合</td><td>流式用原始 BF16 权重</td></tr><tr><td>不能与 <code>--lora</code> 组合</td><td>只有 2 个块槽位轮转覆盖，无法原地更新完整 BF16 权重</td></tr><tr><td>首块缓存被禁用</td><td>预取环假设每个块都被按序消费</td></tr><tr><td>不是默认档位</td><td>显式的内存/速度权衡</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=577&amp;e=581&amp;mode=part" data-f="h3.c" data-s="577" data-e="581">h3.c<span class="rng">L577-581</span></a>, <a class="src-ref" href="../source.html?f=h3_lora.h&amp;s=26&amp;e=27&amp;mode=part" data-f="h3_lora.h" data-s="26" data-e="27">h3_lora.h<span class="rng">L26-27</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=156&amp;e=158&amp;mode=part" data-f="README.md" data-s="156" data-e="158">README.md<span class="rng">L156-158</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=577&amp;e=579&amp;mode=part" data-f="README.md" data-s="577" data-e="579">README.md<span class="rng">L577-579</span></a></p>
+<h2>交互会话</h2>
+<p>会话里用 <code>!ssd-streaming on</code> 切换，<code>!status</code> 会显示当前是 <code>SSD BF16</code> 还是 <code>resident</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_cli.c&amp;s=171&amp;e=171&amp;mode=part" data-f="h3_cli.c" data-s="171" data-e="171">h3_cli.c<span class="rng">L171</span></a>, <a class="src-ref" href="../source.html?f=h3_cli.c&amp;s=208&amp;e=210&amp;mode=part" data-f="h3_cli.c" data-s="208" data-e="210">h3_cli.c<span class="rng">L208-210</span></a></p>
+<h2>视频 VAE 的流式</h2>
+<p>DiT 之外，<strong>视频 VAE 解码器也有流式模式</strong>（<code>video_vae_streaming</code>），但机制不同：不是双槽轮转，而是<strong>每次载入一块、跑一块、释放一块</strong>，把 ~9 GiB 降到 ~0.25 GiB。</p>
+<p>它由 <a href="../pages/memory-plan.html">自动内存规划</a> 在预算紧张时自动打开，也可手动指定。实现细节见 <a href="../pages/video-vae.html">视频 VAE 解码</a>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_vae.c&amp;s=572&amp;e=622&amp;mode=part" data-f="h3_video_vae.c" data-s="572" data-e="622">h3_video_vae.c<span class="rng">L572-622</span></a>, <a class="src-ref" href="../source.html?f=h3.h&amp;s=103&amp;e=106&amp;mode=part" data-f="h3.h" data-s="103" data-e="106">h3.h<span class="rng">L103-106</span></a></p></div></body></html>

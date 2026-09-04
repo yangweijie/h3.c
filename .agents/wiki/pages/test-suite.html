@@ -1,0 +1,61 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>测试与数值对齐</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>测试与数值对齐</h1>
+<p>测试是 <code>tests/</code> 下的<strong>独立 <code>main()</code> 程序</strong>，按用途命名。它们链接 <code>libh3.a</code> 的全部目标文件，因此能直接调用内部函数。</p>
+<h2>命名约定</h2>
+<table><thead><tr><th>前缀</th><th>含义</th><th>是否需要权重</th></tr></thead><tbody><tr><td><code>test_*</code></td><td>确定性主机测试 / 需要 fixture 的 Metal 测试</td><td>否 / fixture</td></tr><tr><td><code>test_real_*</code></td><td>针对真实发布权重的测试</td><td><strong>是</strong></td></tr><tr><td><code>bench_*</code></td><td>基准测试</td><td>是</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=48&amp;e=50&amp;mode=part" data-f="AGENTS.md" data-s="48" data-e="50">AGENTS.md<span class="rng">L48-50</span></a></p>
+<h2>运行</h2>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">make test          # 全量，缺什么跳过什么
+make parity        # Metal vs MLX BF16 对齐（toy 块 fixture）
+make real-parity   # 同上，针对真实发布权重</code></pre></div>
+<p><strong>大多数二进制在权重或 fixture 不存在时自动跳过</strong>：没有装任何权重时，实际只跑 <code>h3_tests</code> 与 <code>h3_audio_gpu_tests</code>。</p>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">./h3_tests
+./h3_metal_tests misc/fixtures/h3_dit.safetensors
+./h3_bf16_tests misc/fixtures/h3_dit_bf16.safetensors
+./h3_tokenizer_tests MiniMax-H3/tokenizer/tokenizer.json
+./h3_text_tests misc/fixtures/h3_text_bf16.safetensors</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=115&amp;e=205&amp;mode=part" data-f="Makefile" data-s="115" data-e="205">Makefile<span class="rng">L115-205</span></a></p>
+<h2>测试全景</h2>
+<table><thead><tr><th>二进制</th><th>源文件</th><th>覆盖</th></tr></thead><tbody><tr><td><code>h3_tests</code></td><td><code>test_h3.c</code></td><td>参数校验、布局、调度、RNG 等确定性主机逻辑</td></tr><tr><td><code>h3_metal_tests</code></td><td><code>test_metal.c</code></td><td>Metal 与 MLX toy 块的 F32 诊断路径</td></tr><tr><td><code>h3_bf16_tests</code></td><td><code>test_bf16.c</code></td><td><strong>生产 BF16 存储路径</strong>的完整 toy H3 块</td></tr><tr><td><code>h3_text_tests</code></td><td><code>test_text_metal.c</code></td><td>Qwen 文本编码器对照 MLX fixture</td></tr><tr><td><code>h3_tokenizer_tests</code></td><td><code>test_tokenizer.c</code></td><td>发布 tokenizer 的往返</td></tr><tr><td><code>h3_audio_gpu_tests</code></td><td><code>test_audio_gpu.c</code></td><td>音频 GPU 算子（无需权重）</td></tr><tr><td><code>h3_convrot_test</code></td><td><code>test_convrot_unrotate.c</code></td><td>ConvRot int8 的反量化 + 反旋转</td></tr><tr><td><code>h3_av_mux_test</code></td><td><code>test_av_mux.c</code></td><td>ffmpeg 音视频封装</td></tr><tr><td><code>h3_lora_tests</code></td><td><code>test_lora.c</code></td><td>LoRA 合并数值（配合 <code>gen_lora_data.py</code>）</td></tr><tr><td><code>h3_real_audio_vae_test</code></td><td><code>test_real_audio_vae.c</code></td><td>真实 AudioVAE 解码</td></tr><tr><td><code>h3_real_audio_encoder_test</code></td><td><code>test_real_audio_encoder.c</code></td><td>真实音频编码器</td></tr><tr><td><code>h3_real_video_encoder_test</code></td><td><code>test_real_video_encoder.c</code></td><td>真实视觉 VAE 编码器（含参考视频 fixture）</td></tr><tr><td><code>h3_real_qwen_vision_test</code></td><td><code>test_real_qwen_vision.c</code></td><td>真实 Qwen 视觉塔（含视频对 fixture）</td></tr><tr><td><code>h3_real_multimodal_text_test</code></td><td><code>test_real_multimodal_text.c</code></td><td>真实多模态 Qwen</td></tr><tr><td><code>h3_real_ref_video_text_test</code></td><td><code>test_real_ref_video_text.c</code></td><td>Ref2VA 视频呈现</td></tr><tr><td><code>h3_real_prompt_test</code></td><td><code>test_real_prompt.c</code></td><td>发布 prompt 路径</td></tr><tr><td><code>h3_real_dit_block_test</code> / <code>_schedule_test</code> / <code>h3_real_dit_test</code></td><td>—</td><td>真实 DiT 的块 / 调度 / 整体</td></tr><tr><td><code>h3_semantic_dit_test</code> / <code>h3_semantic_vae_test</code></td><td>—</td><td>语义级检查</td></tr><tr><td><code>h3_clipproj_test</code></td><td><code>test_clipproj_encoder.c</code></td><td>ClipProj 编码器（配合 <code>clipproj_golden.sh</code>）</td></tr><tr><td><code>h3_dit_bench</code> / <code>h3_dit_bench_864</code></td><td><code>bench_dit.c</code></td><td>DiT 基准；864 版用 <code>-DH3_BENCH_LATENT_H/W</code> 编译</td></tr></tbody></table>
+<p>注意 <code>h3_lora_tests</code>、<code>h3_real_*</code>、<code>h3_semantic_*</code>、<code>h3_dit_bench*</code> <strong>不在 <code>make test</code> 的默认列表里</strong>，需要显式构建运行。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=36&amp;e=121&amp;mode=part" data-f="Makefile" data-s="36" data-e="121">Makefile<span class="rng">L36-121</span></a></p>
+<h2>数值对齐的三层</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;L1: 主机确定性测试&lt;br/&gt;h3_tests — 无需权重&quot;]
+    --&gt; B[&quot;L2: Metal vs MLX fixture&lt;br/&gt;make parity — toy 块 + Qwen&quot;]
+    --&gt; C[&quot;L3: 真实权重&lt;br/&gt;make real-parity — 发布 checkpoint&quot;]</pre>
+<h3>L2 的细节</h3>
+<p><code>make parity</code> 跑三个二进制，覆盖两条路径：</p>
+<ul><li><code>h3_metal_tests</code> —— <strong>F32 诊断路径</strong></li><li><code>h3_bf16_tests</code> —— <strong>生产 BF16 存储路径</strong></li></ul>
+<p>宽 BF16 矩阵乘与 SDPA 用缓存的 MPSGraph 图，并有直接的 Metal 正确性回退。</p>
+<p><strong>运行时编译是故意的</strong>：它跟随 Iris 的做法，不需要 Xcode 的可选离线 Metal 工具链。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=455&amp;e=467&amp;mode=part" data-f="README.md" data-s="455" data-e="467">README.md<span class="rng">L455-467</span></a></p>
+<h2>已记录的对齐结果</h2>
+<table><thead><tr><th>组件</th><th>指标</th><th>值</th></tr></thead><tbody><tr><td>原生音频编码器 vs 修正后 MLX oracle</td><td>相对 L2</td><td><code>3.59e-6</code></td></tr><tr><td>原生波形 vs 修正后 MLX oracle</td><td>相对 L2</td><td><code>6.94e-5</code></td></tr><tr><td>窄输出头（BF16 vs F32）</td><td>相对 L2</td><td><code>8.64e-4</code></td></tr><tr><td>F32 patch 投影（融合 vs 标量）</td><td>逐字节</td><td><strong>完全相同</strong></td></tr><tr><td>四步去噪 vs 29 步参考（512 方形狐狸）</td><td>全视频 SSIM</td><td>0.556</td></tr><tr><td>独立冲浪者测试</td><td>全视频 SSIM</td><td>0.547</td></tr><tr><td><code>--use-int8-row-fc2</code> 四步狐狸 / 冲浪者</td><td>全视频 SSIM</td><td>0.919 / 0.828</td></tr></tbody></table>
+<p><strong>与 MLX 的逐像素数值一致性不是目标</strong>——随机数与执行引擎不同。判据是<strong>描绘的内容与运动应当一致</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=126&amp;e=129&amp;mode=part" data-f="README.md" data-s="126" data-e="129">README.md<span class="rng">L126-129</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=196&amp;e=201&amp;mode=part" data-f="README.md" data-s="196" data-e="201">README.md<span class="rng">L196-201</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=730&amp;e=757&amp;mode=part" data-f="README.md" data-s="730" data-e="757">README.md<span class="rng">L730-757</span></a></p>
+<h2>刻意导出的测试接缝</h2>
+<p>若干内部函数被<strong>刻意导出到内部头文件</strong>，以便用便宜的主机测试钉住行序，而无需 62 GiB checkpoint：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_dit_patchify_video(...);
+int h3_dit_unpatchify_video(...);
+int h3_dit_pack_audio(...);
+int h3_dit_unpack_audio(...);
+int h3_dit_reuse_schedule(int steps, int reuse_interval,
+                          uint8_t *selected, size_t selected_count);</code></pre></div>
+<p><code>h3_dit.h</code> 的注释写明了理由：<code>reuse_schedule</code> 公开是&quot;为了让经过质量调优的激进度调度能被便宜的主机测试钉住&quot;。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=123&amp;e=142&amp;mode=part" data-f="h3_dit.h" data-s="123" data-e="142">h3_dit.h<span class="rng">L123-142</span></a></p>
+<h2>新增测试的约定</h2>
+<ul><li>放在 <code>tests/</code>，独立 <code>main()</code>，不要塞进库</li><li>需要权重或 fixture 的用例，在 <code>Makefile</code> 的 <code>test</code> 目标里用 <code>test -f ...</code> 包一层，缺件时打印 <code>skip: ...</code></li><li>新增源文件要记得登记进 <code>Makefile</code>（<code>LIB_C</code> 只管库，测试二进制有自己的链接规则）</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=48&amp;e=50&amp;mode=part" data-f="AGENTS.md" data-s="48" data-e="50">AGENTS.md<span class="rng">L48-50</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=123&amp;e=196&amp;mode=part" data-f="Makefile" data-s="123" data-e="196">Makefile<span class="rng">L123-196</span></a></p></div></body></html>

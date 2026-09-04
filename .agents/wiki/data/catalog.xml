@@ -1,47 +1,57 @@
 <section>
-h3-metal 引擎总览
-<topic level="1" slug="overview">项目总览 (Overview)</topic>
-<topic level="1" slug="architecture">系统架构 (Architecture)</topic>
-<topic level="1" slug="build-run">构建与运行 (Build & Run)</topic>
+概览
+<topic level="1" slug="overview">项目总览与架构</topic>
+<topic level="1" slug="build-and-run">构建与运行</topic>
+<topic level="1" slug="public-api">公共 API（h3.h）</topic>
+<topic level="1" slug="cli-and-session">命令行与交互会话</topic>
 </section>
 
 <section>
-核心 API 与编排
-<topic level="1" slug="api-public">公共 API: h3.h / h3.c</topic>
-<topic level="1" slug="host">宿主逻辑与张量布局: h3_host</topic>
-<topic level="1" slug="cli">命令行交互: h3_cli / main / terminal</topic>
+推理流水线
+<topic level="1" slug="pipeline-overview">六阶段流水线</topic>
+<topic level="1" slug="model-loading">模型加载与检查点布局</topic>
+<topic level="1" slug="conditioning">条件构建与多模态编码</topic>
+<topic level="1" slug="layout-and-rope">序列布局与位置编码</topic>
+<topic level="1" slug="dit-denoise">DiT 去噪与采样器</topic>
+<topic level="1" slug="video-vae">视频 VAE 解码</topic>
+<topic level="1" slug="audio-vae">音频 VAE 编解码</topic>
+<topic level="1" slug="mux-and-superres">封装输出与超分后处理</topic>
 </section>
 
 <section>
-权重与设备层
-<topic level="1" slug="safetensors">Safetensors 解析: h3_safetensors</topic>
-<topic level="1" slug="weights">权重存储: h3_weights</topic>
-<topic level="1" slug="gpu">Metal / MPS 设备封装: h3_gpu</topic>
-<topic level="1" slug="metal-shaders">Metal 着色器与后端: h3_metal / h3_gpu.m</topic>
+文本与视觉编码
+<topic level="1" slug="text-encoder">Qwen3-VL 文本编码器</topic>
+<topic level="1" slug="vision-encoder">Qwen 视觉塔与 Deepstack</topic>
+<topic level="1" slug="tokenizer">分词器</topic>
+<topic level="1" slug="clipproj">ClipProj 轻量文本路径</topic>
 </section>
 
 <section>
-文本与多模态编码
-<topic level="1" slug="tokenizer">Tokenizer: h3_tokenizer</topic>
-<topic level="1" slug="text-encoder">Qwen3-VL 文本编码器: h3_text_encoder</topic>
-<topic level="1" slug="vision-encoder">Qwen 视觉编码器: h3_vision_encoder</topic>
-<topic level="1" slug="multimodal">多模态嵌入编排: h3_multimodal</topic>
+DiT 内核
+<topic level="1" slug="dit-schedule">AdaLN 调度与门控排序</topic>
+<topic level="1" slug="dit-block">DiT 块执行流程</topic>
+<topic level="1" slug="token-reduction">Token 缩减</topic>
+<topic level="1" slug="lora">LoRA 合并</topic>
 </section>
 
 <section>
-扩散 Transformer (DiT)
-<topic level="1" slug="dit">DiT 主干与去噪: h3_dit</topic>
-<topic level="1" slug="dit-schedule">AdaLN 调度与门控剪枝: h3_dit_schedule</topic>
+Metal 后端
+<topic level="1" slug="gpu-abstraction">GPU 抽象层（h3_gpu）</topic>
+<topic level="1" slug="metal-shaders">Metal 内核库</topic>
+<topic level="1" slug="int8-tensorops">int8 与 TensorOps 路径</topic>
+<topic level="1" slug="weights-safetensors">权重与 safetensors</topic>
 </section>
 
 <section>
-VAE 与媒体编解码
-<topic level="1" slug="video-vae">视频 VAE 解码/编码: h3_video_vae / h3_video_encoder</topic>
-<topic level="1" slug="audio-vae">音频 VAE (BigVGAN): h3_audio_vae</topic>
-<topic level="1" slug="ffmpeg">FFmpeg 媒体读写: h3_ffmpeg</topic>
+内存与性能
+<topic level="1" slug="ssd-streaming">SSD 流式权重</topic>
+<topic level="1" slug="memory-plan">自动内存规划</topic>
+<topic level="1" slug="profiling">性能分析与诊断开关</topic>
+<topic level="1" slug="session-cache">会话缓存与复用</topic>
 </section>
 
 <section>
-测试
-<topic level="1" slug="tests">测试套件: tests/</topic>
+质量保障
+<topic level="1" slug="test-suite">测试与数值对齐</topic>
+<topic level="1" slug="conventions">代码约定与扩展指南</topic>
 </section>

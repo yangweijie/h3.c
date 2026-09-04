@@ -1,0 +1,76 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>条件构建与多模态编码</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>条件构建与多模态编码</h1>
+<p>条件构建把「一段文本 + 若干参考媒体」变成三样东西：一份 BF16 文本嵌入、一组视觉条件行、一组音频条件行。它是整条流水线里<strong>分支最多</strong>的一段。</p>
+<h2>三条互斥路径</h2>
+<pre class="mermaid">flowchart TD
+    A{&quot;reference_count &gt; 0 ?&quot;}
+    A --&gt;|是| B[&quot;Ref2VA：h3_multimodal_encode_ref2va_bf16&lt;br/&gt;有序 &lt;Picture N&gt;/&lt;Video N&gt; 呈现&quot;]
+    A --&gt;|否，有锚点| C[&quot;FL2VA 条件：h3_multimodal_encode_fl2va_bf16&lt;br/&gt;首帧/末帧共用一个呈现&quot;]
+    A --&gt;|否，纯文本| D{&quot;H3_CLIPPROJ_DIR 有效 ?&quot;}
+    D --&gt;|是| E[&quot;h3_text_encode_clipproj_bf16&lt;br/&gt;4B + ClipProj 投影&quot;]
+    D --&gt;|否| F[&quot;h3_text_encode_bf16&lt;br/&gt;完整 50 层 Qwen3-VL&quot;]
+    B &amp; C --&gt; G[&quot;h3_text_embedding + condition_*_rows&quot;]
+    E &amp; F --&gt; G</pre>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1467&amp;e=1519&amp;mode=part" data-f="h3.c" data-s="1467" data-e="1519">h3.c<span class="rng">L1467-1519</span></a></p>
+<h2>Ref2VA 参考处理</h2>
+<h3>视觉部分</h3>
+<p>对每个非纯音频引用，先 <code>h3_ffprobe_visual_size</code> 拿到源尺寸，再按类型解析画布：</p>
+<table><thead><tr><th>类型</th><th>画布规则</th><th>函数</th></tr></thead><tbody><tr><td>图像</td><td>只缩不放、保持比例；<code>H3_REFERENCE_IMAGE_MAX</code> 时用 2048 短边上限</td><td><code>h3_reference_image_canvas</code></td></tr><tr><td>视频</td><td>目标风格画布，但更小的源<strong>绝不放大小</strong></td><td><code>h3_reference_video_canvas</code></td></tr></tbody></table>
+<p>图像用 <code>h3_ffmpeg_read_image_f32</code>（<code>H3_IMAGE_FIT_STRETCH</code>）解一帧；视频用 <code>h3_ffmpeg_read_video_f32</code> 按 24 fps 解到 <code>temporal.frame_count</code>，并<strong>向下裁剪到发布的 <code>5+17k</code> 节拍</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1108&amp;e=1178&amp;mode=part" data-f="h3.c" data-s="1108" data-e="1178">h3.c<span class="rng">L1108-1178</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=101&amp;e=110&amp;mode=part" data-f="h3_host.h" data-s="101" data-e="110">h3_host.h<span class="rng">L101-110</span></a></p>
+<h3>视频的两帧分块与时间戳</h3>
+<p>Qwen 以<strong>时间优先的两帧块</strong>消费参考视频，而视觉 VAE 与媒体边界保持通道优先的 <code>[3,T,H,W]</code>。两者之间的转换由 <code>h3_extract_vision_pair</code> 完成。</p>
+<p>采样与时间戳规则：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">size_t samples = (condition_frames + 11) / 12;   /* 每 12 帧取一个样本 */
+size_t blocks  = (samples + 1) / 2;              /* 每 2 个样本一个块 */
+/* 第 block 块取样本 2b 与 2b+1（越界则重复 2b） */
+timestamp[block] = (first_sample + second_sample) / 4.0;</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1151&amp;e=1173&amp;mode=part" data-f="h3.c" data-s="1151" data-e="1173">h3.c<span class="rng">L1151-1173</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=850&amp;e=872&amp;mode=part" data-f="h3.c" data-s="850" data-e="872">h3.c<span class="rng">L850-872</span></a></p>
+<h3>音频部分</h3>
+<p>每个音频来源（<code>--ref-audio</code> / 视频内嵌音轨 / <code>--ref-video-audio</code> 的替换音轨）走同一段逻辑：</p>
+<ol><li><code>h3_ffmpeg_read_audio_f32</code> 解成 <strong>32 kHz 立体声 F32</strong>，<code>max_samples</code> 上限 15 秒。视频音轨（<code>truncate=1</code>）允许静默截断，独立音频片段则报错而非静默裁剪。</li><li><code>h3_audio_vae_encode</code> 走原生 AudioVAE 后验均值路径。</li><li>混成 <strong>0.999 干净潜变量 + 0.001 带种子的噪声</strong>，钉在音频条件时间步 1.0。</li><li>打包成宽度 32 的行，放在与视觉引用相同的旋转时间轴上。</li></ol>
+<p>约束：单个输入 2–15 秒；最多 3 个音频输入；总解码时长上限 15 秒；<strong>纯音频引用必须伴随图像或视频引用</strong>。</p>
+<p>行打包顺序是 <code>[stereo, time, channel]</code>，而编码器输出是 <code>[channel, stereo, time]</code>，需要一次三重循环转置。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1190&amp;e=1294&amp;mode=part" data-f="h3.c" data-s="1190" data-e="1294">h3.c<span class="rng">L1190-1294</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1266&amp;e=1290&amp;mode=part" data-f="h3.c" data-s="1266" data-e="1290">h3.c<span class="rng">L1266-1290</span></a></p>
+<h2>FL2VA 锚点</h2>
+<p>首帧与末帧<strong>共用 Ref2VA 图像那套呈现</strong>，但拟合方式不同，与参考实现一致：</p>
+<table><thead><tr><th>锚点</th><th>拟合方式</th><th>键帧索引</th></tr></thead><tbody><tr><td><code>--first-frame</code></td><td><code>H3_IMAGE_FIT_STRETCH</code>（拉伸到目标画布）</td><td><code>0</code></td></tr><tr><td><code>--last-frame</code></td><td><code>H3_IMAGE_FIT_COVER</code>（比例覆盖后居中裁剪）</td><td><code>frame_count - 1</code></td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1296&amp;e=1323&amp;mode=part" data-f="h3.c" data-s="1296" data-e="1323">h3.c<span class="rng">L1296-1323</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1054&amp;e=1058&amp;mode=part" data-f="h3.c" data-s="1054" data-e="1058">h3.c<span class="rng">L1054-1058</span></a></p>
+<h2>视觉条件行：VAE 编码 + patchify</h2>
+<p>不论哪条路径，只要存在视觉条件，都会先用<strong>视觉 VAE 编码器</strong>把像素压成潜变量，再切成 DiT 的行：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int image_latent_t = h3_video_encoder_latent_t(condition_frames[image]);
+size_t row_elements = image_latent_t * image_latent_h * image_latent_w / 4 * 96;
+h3_video_vae_encode(vae_path, &quot;h3_shaders.metal&quot;, pixels, frames, h, w, ..., &amp;latent);
+h3_dit_patchify_video(latent.values, 24, image_latent_t, latent_h, latent_w, rows, row_elements);</code></pre></div>
+<p>行宽 96 = 24 通道 × 2×2 patch。音频行宽 32 同理由 <code>h3_dit_pack_audio</code> 产出。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1362&amp;e=1401&amp;mode=part" data-f="h3.c" data-s="1362" data-e="1401">h3.c<span class="rng">L1362-1401</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=48&amp;e=50&amp;mode=part" data-f="h3_dit.h" data-s="48" data-e="50">h3_dit.h<span class="rng">L48-50</span></a></p>
+<h2>Qwen 视觉编码</h2>
+<p>视觉条件随后喂给 Qwen3-VL 的视觉塔（<code>h3_vision_encode_bf16</code>），产出：</p>
+<ul><li><code>merged</code>：BF16 呈现行</li><li><code>deepstack[3]</code>：三个同形状的 deepstack 增量，分别加在语言层 0、1、2 之后</li></ul>
+<p>图像只有一个输出；视频每个两帧块一个输出。详情见 <a href="../pages/vision-encoder.html">Qwen 视觉塔与 Deepstack</a>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1408&amp;e=1462&amp;mode=part" data-f="h3.c" data-s="1408" data-e="1462">h3.c<span class="rng">L1408-1462</span></a>, <a class="src-ref" href="../source.html?f=h3_vision_encoder.h&amp;s=9&amp;e=33&amp;mode=part" data-f="h3_vision_encoder.h" data-s="9" data-e="33">h3_vision_encoder.h<span class="rng">L9-33</span></a></p>
+<h2>种子化条件增强</h2>
+<p>条件行装配完成后，<code>h3_augment_conditions</code> 会施加<strong>0.999 的条件增强</strong>（乘以 0.999 再加 0.001 量级的带种子噪声）。这是发布实现的一部分，不是可选的噪声注入。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=312&amp;e=320&amp;mode=part" data-f="h3.c" data-s="312" data-e="320">h3.c<span class="rng">L312-320</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1533&amp;e=1539&amp;mode=part" data-f="h3.c" data-s="1533" data-e="1539">h3.c<span class="rng">L1533-1539</span></a></p>
+<h2>输出：h3_text_embedding</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    size_t tokens;
+    size_t width;          /* 5120 */
+    uint16_t *values;      /* BF16 */
+    h3_gpu_stats gpu_stats;
+    uint8_t *tags;         /* 每行一个 DiT 模态 tag：语言=1，Qwen 视觉跨度=0 */
+} h3_text_embedding;</code></pre></div>
+<p><code>tags</code> 会一路传到 <a href="../pages/dit-schedule.html">AdaLN 调度与门控排序</a> 的 <code>h3_dit_schedule_row_map</code>，决定每行吃到哪个模态的时间步。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=11&amp;e=19&amp;mode=part" data-f="h3_text_encoder.h" data-s="11" data-e="19">h3_text_encoder.h<span class="rng">L11-19</span></a>, <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=49&amp;e=55&amp;mode=part" data-f="h3_dit_schedule.h" data-s="49" data-e="55">h3_dit_schedule.h<span class="rng">L49-55</span></a></p></div></body></html>

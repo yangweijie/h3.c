@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh" data-theme="dark"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Qwen3-VL 文本编码器: h3_text_encoder</title>
+<title>Qwen3-VL 文本编码器</title>
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
 <link rel="stylesheet" href="../style/wiki.css">
 <link rel="stylesheet" href="../style/hljs.css">
@@ -11,12 +11,70 @@
 <script src="../script/source-viewer.js"></script>
 <script src="../script/mermaid.min.js"></script>
 <script src="../script/wiki.js" defer></script>
-</head><body><div class="wrap"><h1>Qwen3-VL 文本编码器: h3_text_encoder</h1>
-<p><code>h3_text_encoder.c</code> / <code>h3_text_encoder.h</code> 实现了 H3 文本侧的条件生成：把 token 序列（及可选的视觉嵌入）喂入 Qwen3-VL 语言模型的前 50 层，产出 BF16 条件嵌入。</p>
-<h2>核心函数</h2>
-<ul><li><code>h3_text_encode_bf16(params, tokenizer, model_name, text, cond)</code>：纯文本路径。输入提示 → 分词 → 前 50 层 Qwen3-VL → BF16 嵌入，写入 <code>h3_host_cond.text_embed</code>。这是 FL2VA（文本到视频/音频）的主路径。</li><li><code>h3_text_encode_multimodal_bf16(params, tokenizer, model_name, text, image_embed, audio_embed, n_audio, pr_cond, cond)</code>：多模态路径。把 <code>Qwen 视觉编码器</code> 产生的图像嵌入与音频条件，按 <code>&lt;Picture n&gt;</code> 呈现格式插入文本序列对应位置，再走同样的 50 层语言层，输出联合 BF16 嵌入。用于 Ref2VA（参考到视频）。</li></ul>
-<h2>关键设计</h2>
-<ul><li><strong>只取前 50 层</strong>：H3 复用 Qwen3-VL 的语言主干而非完整模型，输出 5376 维（<code>HIDDEN</code>）嵌入，与 <code>DiT 主干</code> 的隐藏维度对齐。</li><li><strong>BF16 输出</strong>：所有中间与最终嵌入均为 BF16，直接驻留共享 Metal 缓冲，避免 F32 往返开销。</li><li><strong>条件分离</strong>：<code>pr_cond</code>（提示参考条件，如角色设定文本）与 <code>image_embed</code>/<code>audio_embed</code> 分别传入，由本模块负责在序列中正确放置。</li></ul>
-<h2>与宿主的关系</h2>
-<p>本模块产出 <code>h3_host_cond</code> 的嵌入字段，由 <code>宿主逻辑</code> 持有并在去噪步之间复用（除非 <code>core_reuse</code> 强制重算）。嵌入维度与布局必须匹配 <code>h3_layout_build()</code> 计算的段结构。</p>
-<p>相关：文本序列来自 <code>Tokenizer</code>；多模态装配见 <code>多模态嵌入编排</code>。</p></div></body></html>
+</head><body><div class="wrap"><h1>Qwen3-VL 文本编码器</h1>
+<p><code>h3_text_encoder.c</code>（1348 行）跑 <strong>Qwen3-VL 的前 50 个语言层</strong>，把 token 序列变成 DiT 消费的 BF16 条件嵌入。宽度 5120（<code>H3_TEXT_HIDDEN_SIZE</code>）。</p>
+<h2>三个入口</h2>
+<table><thead><tr><th>函数</th><th>场景</th></tr></thead><tbody><tr><td><code>h3_text_encode_bf16</code></td><td>纯文本，跑完整 50 层</td></tr><tr><td><code>h3_text_encode_multimodal_bf16</code></td><td>带 Qwen3-VL 呈现跨度（视觉注入 + deepstack）</td></tr><tr><td><code>h3_text_encode_multimodal_layers_bf16</code></td><td>前缀形式，只跑前 N 层——<strong>用于对齐工具定位多模态失配</strong></td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=31&amp;e=65&amp;mode=part" data-f="h3_text_encoder.h" data-s="31" data-e="65">h3_text_encoder.h<span class="rng">L31-65</span></a></p>
+<h2>多模态呈现跨度</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    size_t start;                    /* 跨度起始 token */
+    size_t tokens;                   /* 跨度长度 */
+    const uint16_t *embeddings;      /* 替换基础 token 嵌入的视觉嵌入 */
+    const uint16_t *deepstack[3];    /* 三层 deepstack 增量 */
+} h3_text_vision_span;</code></pre></div>
+<p>规则：</p>
+<ul><li>跨度内<strong>每个</strong> token 的基础嵌入被替换为视觉嵌入</li><li>三个 deepstack 行分别<strong>加在语言层 0、1、2 之后</strong></li><li><code>position_ids</code> 是轴优先的 <code>[3, tokens]</code></li><li><code>tags</code> 携带每一行的 DiT 模态 tag（语言=1，Qwen 视觉跨度含边界 token=0）</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=24&amp;e=52&amp;mode=part" data-f="h3_text_encoder.h" data-s="24" data-e="52">h3_text_encoder.h<span class="rng">L24-52</span></a></p>
+<h2>层执行</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;token ids&quot;] --&gt; B[&quot;embedding_bf16&quot;]
+    B --&gt; C{&quot;有呈现跨度?&quot;}
+    C --&gt;|是| D[&quot;替换基础嵌入&quot;]
+    C --&gt;|否| E
+    D --&gt; E[&quot;encode_layer × 50&quot;]
+    E --&gt; F{&quot;层号 0/1/2 ?&quot;}
+    F --&gt;|是| G[&quot;叠加 deepstack 行&quot;]
+    F --&gt;|否| H
+    G --&gt; H[&quot;下层&quot;]
+    H --&gt; I[&quot;h3_text_embedding（BF16 + tags）&quot;]</pre>
+<p>单层由 <code>encode_layer</code>（409）实现，内部依次调用 <code>h3_gpu_*</code>：RMSNorm → Q/K 的 head RMS norm + RoPE → GQA 因果注意力 → 输出投影 → 残差 → MLP（SwiGLU）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.c&amp;s=409&amp;e=473&amp;mode=part" data-f="h3_text_encoder.c" data-s="409" data-e="473">h3_text_encoder.c<span class="rng">L409-473</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=523&amp;e=554&amp;mode=part" data-f="h3_gpu.h" data-s="523" data-e="554">h3_gpu.h<span class="rng">L523-554</span></a></p>
+<h2>流式权重与预取环</h2>
+<p>这是本文件最复杂的一段。50 层的权重<strong>不会全部驻留</strong>，而是用一个预取环与 GPU 执行重叠：</p>
+<pre class="mermaid">flowchart LR
+    subgraph I/O 线程
+        A[&quot;layer_prefetch_main&quot;] --&gt; B[&quot;prefetch_slot_start&lt;br/&gt;提交 read_weight_bf16&quot;]
+        A --&gt; C[&quot;prefetch_slot_take&lt;br/&gt;取出已完成槽位&quot;]
+    end
+    subgraph 主线程
+        D[&quot;encode_layer(当前层)&quot;] --&gt; E[&quot;prefetch_slot_retire&quot;]
+    end
+    B -.-&gt;|共享 Metal 缓冲| D
+    C -.-&gt; D</pre>
+<table><thead><tr><th>元素</th><th>说明</th></tr></thead><tbody><tr><td><code>text_prefetch_slot</code>（71）</td><td>一个未来层的缓冲槽</td></tr><tr><td><code>layer_weights_load</code> / <code>_allocate</code> / <code>_read_lane</code></td><td>加载三阶段：定位 → 分配 → 读入（lane 可并行）</td></tr><tr><td><code>text_prefetch_threads</code>（124）</td><td>工作线程数，默认 8</td></tr><tr><td><code>text_prefetch_depth</code>（135）</td><td>环深度，<strong>M3/老硬件 2，M5 3</strong></td></tr></tbody></table>
+<p>环境变量：</p>
+<table><thead><tr><th>变量</th><th>作用</th></tr></thead><tbody><tr><td><code>H3_QWEN_PREFETCH=0</code></td><td>恢复单层同步参考路径</td></tr><tr><td><code>H3_QWEN_PREFETCH=1..8</code></td><td>指定工作线程数</td></tr><tr><td><code>H3_QWEN_PREFETCH_DEPTH=1..6</code></td><td>覆盖环深度</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.c&amp;s=61&amp;e=81&amp;mode=part" data-f="h3_text_encoder.c" data-s="61" data-e="81">h3_text_encoder.c<span class="rng">L61-81</span></a>, <a class="src-ref" href="../source.html?f=h3_text_encoder.c&amp;s=124&amp;e=144&amp;mode=part" data-f="h3_text_encoder.c" data-s="124" data-e="144">h3_text_encoder.c<span class="rng">L124-144</span></a>, <a class="src-ref" href="../source.html?f=h3_text_encoder.c&amp;s=303&amp;e=395&amp;mode=part" data-f="h3_text_encoder.c" data-s="303" data-e="395">h3_text_encoder.c<span class="rng">L303-395</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=607&amp;e=612&amp;mode=part" data-f="README.md" data-s="607" data-e="612">README.md<span class="rng">L607-612</span></a></p>
+<h2>延迟释放</h2>
+<p><code>defer</code>（91）与 <code>retire_deferred</code>（102）是一对延迟释放机制：把大张量推入待释放列表，在下一次层边界统一回收，避免在 GPU 仍在读取时释放。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.c&amp;s=91&amp;e=106&amp;mode=part" data-f="h3_text_encoder.c" data-s="91" data-e="106">h3_text_encoder.c<span class="rng">L91-106</span></a></p>
+<h2>ClipProj 轻量路径</h2>
+<p><code>h3_text_encode_clipproj_bf16</code>（985）是<strong>等价替代</strong>：用截断到抽取层的 Qwen3-VL-4B 作文本编码器，再用 ClipProj MLP 把 2560 维的抽取隐藏提升到 5120 维的 H3 条件空间。</p>
+<pre class="mermaid">flowchart LR
+    A[&quot;Qwen3-VL-4B（截断）&quot;] --&gt; B[&quot;2560 维抽取隐藏&quot;]
+    B --&gt; C[&quot;mean/std 归一化&quot;]
+    C --&gt; D[&quot;2 层投影&quot;]
+    D --&gt; E[&quot;attention sink 替换&quot;]
+    E --&gt; F[&quot;h3_text_embedding（width=5120）&quot;]</pre>
+<p>由于输出宽度正是 DiT 期望的 5120，<strong>DiT 完全不需要改动</strong>。</p>
+<p>代价对比：</p>
+<table><thead><tr><th>路径</th><th>读取量</th></tr></thead><tbody><tr><td>50 层编码器</td><td>~62 GiB</td></tr><tr><td>4B + ClipProj</td><td>~5.5 GiB</td></tr></tbody></table>
+<p>由环境变量控制，默认开启：</p>
+<table><thead><tr><th>变量</th><th>默认</th><th>语义</th></tr></thead><tbody><tr><td><code>H3_CLIPPROJ_DIR</code></td><td><code>/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct</code></td><td>BF16 Qwen3-VL-4B-Instruct 目录；<code>0</code> / <code>off</code> 回退到 50 层编码器</td></tr><tr><td><code>H3_CLIPPROJ_PROJ</code></td><td><code>/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3</code></td><td>投影目录</td></tr></tbody></table>
+<p>当 ClipProj 激活时，<code>FL2VA/text_encoder</code> 在 <a href="../pages/model-loading.html">模型加载</a> 阶段变成<strong>可选</strong>目录。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=67&amp;e=84&amp;mode=part" data-f="h3_text_encoder.h" data-s="67" data-e="84">h3_text_encoder.h<span class="rng">L67-84</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=434&amp;e=457&amp;mode=part" data-f="h3.c" data-s="434" data-e="457">h3.c<span class="rng">L434-457</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1490&amp;e=1518&amp;mode=part" data-f="h3.c" data-s="1490" data-e="1518">h3.c<span class="rng">L1490-1518</span></a></p>
+<h2>输出与释放</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">void h3_text_embedding_free(h3_text_embedding *embedding);</code></pre></div>
+<p>调用方拥有 <code>values</code> 与 <code>tags</code>。<code>h3.c</code> 在 DiT 加载完成后立刻释放它（<code>h3.c:1628</code>），因为 DiT 已把条件烘焙进自己的常驻张量。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=65&amp;e=65&amp;mode=part" data-f="h3_text_encoder.h" data-s="65" data-e="65">h3_text_encoder.h<span class="rng">L65</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1628&amp;e=1632&amp;mode=part" data-f="h3.c" data-s="1628" data-e="1632">h3.c<span class="rng">L1628-1632</span></a></p></div></body></html>

@@ -1,0 +1,64 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClipProj 轻量文本路径</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>ClipProj 轻量文本路径</h1>
+<p>ClipProj 用一个 <strong>4B 模型 + 一个小型投影 MLP</strong> 替代 <strong>62 GiB 的 50 层 Qwen3-VL 编码器</strong>，把文本编码的读取量降到 ~5.5 GiB。</p>
+<h2>动机</h2>
+<p>H3 的文本编码器（Qwen3-VL 前 50 层）是整个 checkpoint 里第二大的组件。但对<strong>纯文本</strong>路径而言，它的 50 层深度是冗余的——真正需要的只是最后那 5120 维条件嵌入。</p>
+<p>ClipProj 观察到：截断到某个抽取层的 Qwen3-VL-<strong>4B</strong> 已经能给出足够好的中间表示，只需一个投影把它升到 H3 的条件空间。</p>
+<table><thead><tr><th>路径</th><th>读取量</th><th>适用</th></tr></thead><tbody><tr><td>50 层编码器</td><td>~62 GiB</td><td>多模态（有视觉跨度）、对齐检查</td></tr><tr><td>4B + ClipProj</td><td>~5.5 GiB</td><td>纯文本（默认）</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=67&amp;e=76&amp;mode=part" data-f="h3_text_encoder.h" data-s="67" data-e="76">h3_text_encoder.h<span class="rng">L67-76</span></a></p>
+<h2>结构</h2>
+<pre class="mermaid">flowchart LR
+    A[&quot;token ids&quot;] --&gt; B[&quot;Qwen3-VL-4B&lt;br/&gt;截断到抽取层&quot;]
+    B --&gt; C[&quot;2560 维抽取隐藏&quot;]
+    C --&gt; D[&quot;mean/std 归一化&quot;]
+    D --&gt; E[&quot;2 层投影 MLP&quot;]
+    E --&gt; F[&quot;attention sink 替换&quot;]
+    F --&gt; G[&quot;h3_text_embedding&lt;br/&gt;width = 5120&quot;]
+    G --&gt; H[&quot;DiT（完全无改动）&quot;]</pre>
+<p>三步后处理（归一化 → 投影 → attention sink 替换）与 <code>clipproj_harness.py</code> 中的离线参考实现严格对应。</p>
+<p><strong>关键性质</strong>：输出宽度正是 <code>H3_TEXT_HIDDEN_SIZE == 5120</code>，与 50 层路径逐位兼容，因此 DiT 侧不需要任何改动。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=67&amp;e=84&amp;mode=part" data-f="h3_text_encoder.h" data-s="67" data-e="84">h3_text_encoder.h<span class="rng">L67-84</span></a></p>
+<h2>实现位置</h2>
+<p><code>h3_text_encode_clipproj_bf16</code>（<code>h3_text_encoder.c:985</code>）是本路径的入口，配套一组 <code>cp_*</code> 辅助函数：</p>
+<table><thead><tr><th>辅助</th><th>行</th><th>职责</th></tr></thead><tbody><tr><td><code>cp_bf16_to_f32</code> / <code>cp_f32_to_bf16</code></td><td>798 / 805</td><td>dtype 转换</td></tr><tr><td><code>cp_f16_to_f32</code></td><td>813</td><td>投影权重可能是 F16</td></tr><tr><td><code>cp_load_2d</code> / <code>cp_load_1d</code> / <code>cp_load_f32</code></td><td>834 / 841 / 850</td><td>权重加载</td></tr><tr><td><code>cp_gelu</code></td><td>888</td><td>投影的激活函数</td></tr><tr><td><code>cp_encode_layer</code></td><td>892</td><td>4B 模型的单层</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_text_encoder.c&amp;s=798&amp;e=985&amp;mode=part" data-f="h3_text_encoder.c" data-s="798" data-e="985">h3_text_encoder.c<span class="rng">L798-985</span></a></p>
+<h2>开关</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">const char *cp_dir = getenv(&quot;H3_CLIPPROJ_DIR&quot;);
+if (!cp_dir || !*cp_dir)
+    /* 默认开启 */
+    cp_dir = &quot;/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct&quot;;
+int use_clipproj = strcmp(cp_dir, &quot;0&quot;) != 0 &amp;&amp; strcmp(cp_dir, &quot;off&quot;) != 0;</code></pre></div>
+<table><thead><tr><th>环境变量</th><th>默认</th><th>语义</th></tr></thead><tbody><tr><td><code>H3_CLIPPROJ_DIR</code></td><td><code>/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct</code></td><td>BF16 Qwen3-VL-4B-Instruct 目录；设为 <code>0</code> 或 <code>off</code> 回退到 50 层编码器</td></tr><tr><td><code>H3_CLIPPROJ_PROJ</code></td><td><code>/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3</code></td><td>投影权重目录</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1490&amp;e=1500&amp;mode=part" data-f="h3.c" data-s="1490" data-e="1500">h3.c<span class="rng">L1490-1500</span></a></p>
+<h2>对模型加载的影响</h2>
+<p><strong>这是唯一一处会放宽目录校验的地方。</strong> 当 ClipProj 激活时，<code>FL2VA/text_encoder</code> 缺失不再致命：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">if (!h3_inventory(ctx, &quot;FL2VA/text_encoder&quot;, &amp;ctx-&gt;model.text_encoder)) {
+    if (!clipproj_active) { /* 报错返回 */ }
+    memset(&amp;ctx-&gt;model.text_encoder, 0, sizeof(ctx-&gt;model.text_encoder));
+    h3_global_error[0] = &#x27;\0&#x27;;
+    ctx-&gt;error[0] = &#x27;\0&#x27;;
+}</code></pre></div>
+<p>换句话说，只做纯文本生成的用户<strong>不需要下载 text_encoder 那 62 GiB</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=434&amp;e=457&amp;mode=part" data-f="h3.c" data-s="434" data-e="457">h3.c<span class="rng">L434-457</span></a></p>
+<h2>适用范围</h2>
+<p>ClipProj <strong>只在纯文本路径上生效</strong>（<code>h3.c:1484</code> 的 <code>else</code> 分支，即 <code>visual_count == 0</code>）。一旦存在视觉条件——FL2VA 锚点或 Ref2VA 参考——就必须走 <code>h3_multimodal_encode_*</code>，因为视觉跨度注入与 deepstack 需要完整的 50 层。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1484&amp;e=1519&amp;mode=part" data-f="h3.c" data-s="1484" data-e="1519">h3.c<span class="rng">L1484-1519</span></a></p>
+<h2>保真度验证</h2>
+<p>仓库提供了一套 golden 对照脚本：</p>
+<table><thead><tr><th>文件</th><th>作用</th></tr></thead><tbody><tr><td><code>clipproj_harness.py</code></td><td>离线参考实现（A_local）</td></tr><tr><td><code>clipproj_golden.sh</code></td><td>编排：跑引擎侧 B，与 A_local 比对</td></tr><tr><td><code>clipproj_golden_compare.py</code></td><td>数值比对</td></tr></tbody></table>
+<p>Makefile 目标：</p>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">make clipproj-golden</code></pre></div>
+<p>相关路径由 Makefile 顶部的变量给出（<code>QWEN4B</code>、<code>PROJ</code>、<code>CLIPPROJ_MODEL</code>、<code>CLIPPROJ_PROMPT</code>）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=18&amp;e=22&amp;mode=part" data-f="Makefile" data-s="18" data-e="22">Makefile<span class="rng">L18-22</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=207&amp;e=208&amp;mode=part" data-f="Makefile" data-s="207" data-e="208">Makefile<span class="rng">L207-208</span></a></p></div></body></html>

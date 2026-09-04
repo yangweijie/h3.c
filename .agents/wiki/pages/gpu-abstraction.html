@@ -1,0 +1,69 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU 抽象层（h3_gpu）</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>GPU 抽象层（h3_gpu）</h1>
+<p><code>h3_gpu.h</code> 是 C 侧的<strong>设备抽象</strong>，<code>h3_gpu.m</code>（4830 行，工程里最大的文件）是它的 Objective-C 实现。所有算子都是<strong>扁平的 C 函数</strong>，签名统一为 <code>int h3_gpu_xxx(h3_gpu *, 输出, 输入..., 形状参数)</code>，返回 0 表示失败。</p>
+<h2>分层</h2>
+<pre class="mermaid">flowchart TB
+    A[&quot;C 层：h3_dit.c / h3_*_vae.c / h3_text_encoder.c&quot;]
+    --&gt; B[&quot;h3_gpu.h：扁平 C 算子 API&quot;]
+    B --&gt; C[&quot;h3_gpu.m：Metal 命令编码 / MPSGraph 图缓存&quot;]
+    C --&gt; D[&quot;h3_shaders.metal：内联 Metal 内核（运行时编译）&quot;]
+    C --&gt; E[&quot;MPSGraph：SDPA / 卷积 / 宽矩阵乘&quot;]</pre>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=1&amp;e=9&amp;mode=part" data-f="h3_gpu.h" data-s="1" data-e="9">h3_gpu.h<span class="rng">L1-9</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=16&amp;e=16&amp;mode=part" data-f="Makefile" data-s="16" data-e="16">Makefile<span class="rng">L16</span></a></p>
+<h2>张量</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef enum { H3_GPU_F32, H3_GPU_BF16, H3_GPU_I8, H3_GPU_U32 } h3_gpu_dtype;</code></pre></div>
+<p>张量是<strong>共享 Metal 缓冲</strong>的句柄，主机与 GPU 都能直接读写（统一内存）。两类创建方式：</p>
+<table><thead><tr><th>方式</th><th>用途</th></tr></thead><tbody><tr><td><code>h3_gpu_tensor_new_f32</code> / <code>_bf16</code> / <code>_i8</code></td><td>分配空张量</td></tr><tr><td><code>h3_gpu_tensor_from_f32</code> / <code>_bf16</code> / <code>_u32</code></td><td>从主机数组拷贝</td></tr><tr><td><code>h3_gpu_tensor_load_bf16</code> / <code>_f32</code> / <code>_i8</code></td><td><strong>分配共享缓冲并 pread 文件字节进去</strong></td></tr></tbody></table>
+<p><strong>文件直读是核心优化</strong>：加载权重时中间不产生任何 host 分配。31 GB 级的 DiT 权重靠这条路径才能在合理内存内落地。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=42&amp;e=57&amp;mode=part" data-f="h3_gpu.h" data-s="42" data-e="57">h3_gpu.h<span class="rng">L42-57</span></a></p>
+<h2>两个读文件变体</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_gpu_tensor_read_file_bf16(...);    /* 普通 pread */
+int h3_gpu_tensor_stream_file_bf16(...);  /* 请求 Darwin 不保留文件缓存副本 */</code></pre></div>
+<p><code>stream</code> 变体请 Darwin <strong>避免在文件缓存里保留第二份拷贝</strong>，专供大顺序权重流使用——目标缓冲才是唯一有用的驻留副本。这是 <a href="../pages/ssd-streaming.html">SSD 流式权重</a> 能维持 13–14.6 GiB/s 读吞吐的前提之一。</p>
+<p>两者都<strong>不改变张量及其记账</strong>，因此可以在一个 I/O 线程上运行，同时另一个张量在 GPU 上飞行。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=58&amp;e=69&amp;mode=part" data-f="h3_gpu.h" data-s="58" data-e="69">h3_gpu.h<span class="rng">L58-69</span></a></p>
+<h2>命令缓冲三段式</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int  h3_gpu_begin(h3_gpu *gpu);     /* 开始一个新命令缓冲 */
+int  h3_gpu_continue(h3_gpu *gpu);  /* 提交当前缓冲但不等待，继续在同一有序队列上编码 */
+int  h3_gpu_submit(h3_gpu *gpu);    /* 等待并校验整条链 */</code></pre></div>
+<p><code>h3_gpu_continue</code> 是 <a href="../pages/dit-denoise.html">DiT 去噪与采样器</a> 里「两段命令缓冲重叠」的实现基础：提交第一段、继续编码第二段，最后统一 <code>submit</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=94&amp;e=99&amp;mode=part" data-f="h3_gpu.h" data-s="94" data-e="99">h3_gpu.h<span class="rng">L94-99</span></a></p>
+<h2>算子目录</h2>
+<p><code>h3_gpu.h</code> 导出约 90 个算子，按所属模型分：</p>
+<table><thead><tr><th>分组</th><th>代表算子</th></tr></thead><tbody><tr><td>通用</td><td><code>linear</code>、<code>cast</code>、<code>copy</code>、<code>silu</code>、<code>swiglu</code>、<code>scale_add</code>、<code>clip</code></td></tr><tr><td>DiT</td><td><code>adaln</code>、<code>gate</code>、<code>qkv_rope</code>、<code>sdpa</code>、<code>mlp_bf16</code>、<code>token_pool</code> / <code>token_expand</code>、<code>euler_bf16</code></td></tr><tr><td>文本</td><td><code>head_rms_norm</code>、<code>rope_text</code>、<code>gqa_causal</code>、<code>embedding</code></td></tr><tr><td>视觉 VAE</td><td><code>vae_encoder_pad</code>、<code>conv3d</code>、<code>vae_encoder_group_norm_silu</code></td></tr><tr><td>音频 VAE</td><td><code>conv1d</code> / <code>conv1d_stride</code> / <code>conv_transpose1d</code>、<code>weight_norm</code>、<code>alias_free_snake</code>、<code>snake1d</code>、<code>audio_attention_pool</code>、<code>geglu</code></td></tr><tr><td>int8</td><td><code>quantize_weight_int8</code>、<code>linear_int8_bf16</code>、<code>mlp_int8_bf16</code>、<code>weight_dequant_unrotate_int8</code>、<code>convrot_remap_qkv_bf16</code></td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=106&amp;e=634&amp;mode=part" data-f="h3_gpu.h" data-s="106" data-e="634">h3_gpu.h<span class="rng">L106-634</span></a></p>
+<h2>两套精度路径</h2>
+<table><thead><tr><th>路径</th><th>说明</th></tr></thead><tbody><tr><td><strong>F32</strong></td><td>早期实现，主要保留给音频 VAE、视觉 VAE 与诊断</td></tr><tr><td><strong>BF16</strong></td><td>生产路径。<strong>算术在 F32 累加，在操作边界舍入</strong>，与发布 checkpoint 的计算 dtype 一致</td></tr></tbody></table>
+<p><code>h3_gpu.h</code> 的注释明确了 BF16 的语义：</p>
+<blockquote>可移植 BF16 存储路径。算术在 F32 中累加并在操作边界舍入，匹配发布 checkpoint 的计算 dtype。</blockquote>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=294&amp;e=300&amp;mode=part" data-f="h3_gpu.h" data-s="294" data-e="300">h3_gpu.h<span class="rng">L294-300</span></a></p>
+<h2>统计与性能剖析</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    uint64_t allocated_bytes, live_bytes, peak_live_bytes;
+    uint64_t tensor_allocations;
+    uint64_t direct_dispatches, mps_linear_dispatches,
+             mps_conv_dispatches, mps_sdpa_dispatches, blit_copies;
+    uint64_t submissions;
+    double command_encode_seconds, command_wait_seconds, gpu_seconds;
+} h3_gpu_stats;</code></pre></div>
+<p>关于 <code>gpu_seconds</code> 有一条重要注释：</p>
+<blockquote>根 MTLCommandBuffer 时间戳；MPSGraph 可能在内部调度子缓冲，因此 <code>command_wait_seconds</code> 才是完整的周转测量。</blockquote>
+<p><code>--profile</code> 报告的正是这三个时间维度。详见 <a href="../pages/profiling.html">性能分析与诊断开关</a>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=17&amp;e=33&amp;mode=part" data-f="h3_gpu.h" data-s="17" data-e="33">h3_gpu.h<span class="rng">L17-33</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=100&amp;e=104&amp;mode=part" data-f="h3_gpu.h" data-s="100" data-e="104">h3_gpu.h<span class="rng">L100-104</span></a></p>
+<h2>能力探测</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_gpu_is_m5(const h3_gpu *gpu);
+int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
+int h3_gpu_has_int8_mlp(const h3_gpu *gpu);</code></pre></div>
+<p>这三个谓词决定走哪条算子路径。选择是<strong>运行时守卫</strong>的：若 Metal 4 内核编译不可用，会静默回退到未改动的可移植库。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=38&amp;e=40&amp;mode=part" data-f="h3_gpu.h" data-s="38" data-e="40">h3_gpu.h<span class="rng">L38-40</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=634&amp;e=636&amp;mode=part" data-f="README.md" data-s="634" data-e="636">README.md<span class="rng">L634-636</span></a></p></div></body></html>

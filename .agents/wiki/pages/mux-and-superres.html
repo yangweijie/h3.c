@@ -1,0 +1,77 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>封装输出与超分后处理</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>封装输出与超分后处理</h1>
+<p><code>h3_ffmpeg.c</code>（919 行）是引擎与外界的媒体边界。它<strong>不链接 libav</strong>，而是把 ffmpeg 当作子进程，通过管道喂数据。</p>
+<h2>职责一览</h2>
+<table><thead><tr><th>类别</th><th>函数</th></tr></thead><tbody><tr><td>探测</td><td><code>h3_ffprobe_visual_size</code></td></tr><tr><td>解码输入</td><td><code>h3_ffmpeg_read_image_f32</code>、<code>h3_ffmpeg_read_video_f32</code>、<code>h3_ffmpeg_read_audio_f32</code></td></tr><tr><td>编码输出</td><td><code>h3_ffmpeg_write_rgb24</code>、<code>h3_ffmpeg_write_av_rgb24_f32</code></td></tr><tr><td>后处理</td><td><code>h3_superres</code></td></tr></tbody></table>
+<p>可执行文件可被环境变量覆盖：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">static const char *ffmpeg_program(void);   /* H3_FFMPEG  */
+static const char *ffprobe_program(void);  /* H3_FFPROBE */</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.c&amp;s=16&amp;e=26&amp;mode=part" data-f="h3_ffmpeg.c" data-s="16" data-e="26">h3_ffmpeg.c<span class="rng">L16-26</span></a>, <a class="src-ref" href="../source.html?f=h3_ffmpeg.h&amp;s=12&amp;e=58&amp;mode=part" data-f="h3_ffmpeg.h" data-s="12" data-e="58">h3_ffmpeg.h<span class="rng">L12-58</span></a></p>
+<h2>输入侧</h2>
+<h3>图像</h3>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_ffmpeg_read_image_f32(const char *path, int width, int height,
+                             h3_image_fit fit, float **pixels,
+                             char *error, size_t error_size);</code></pre></div>
+<p>产出通道优先 F32 <code>[3,height,width]</code>，值域 <code>[0,1]</code>。两种拟合：</p>
+<table><thead><tr><th>拟合</th><th>语义</th><th>使用者</th></tr></thead><tbody><tr><td><code>H3_IMAGE_FIT_STRETCH</code></td><td>拉伸到目标画布</td><td>首帧锚点、Ref2VA 参考图像</td></tr><tr><td><code>H3_IMAGE_FIT_COVER</code></td><td>比例覆盖后居中裁剪</td><td>末帧锚点</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.h&amp;s=7&amp;e=21&amp;mode=part" data-f="h3_ffmpeg.h" data-s="7" data-e="21">h3_ffmpeg.h<span class="rng">L7-21</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1298&amp;e=1315&amp;mode=part" data-f="h3.c" data-s="1298" data-e="1315">h3.c<span class="rng">L1298-1315</span></a></p>
+<h3>视频</h3>
+<p>按 24 fps 解码成 <code>[3,T,H,W]</code>，<strong>帧数向下裁剪到发布的 <code>5+17k</code> 节拍</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.h&amp;s=23&amp;e=27&amp;mode=part" data-f="h3_ffmpeg.h" data-s="23" data-e="27">h3_ffmpeg.h<span class="rng">L23-27</span></a></p>
+<h3>音频</h3>
+<p>解码首个音频流为 <strong>32 kHz 立体声 F32</strong>，通道优先。<code>max_samples</code> 限制分配上限。</p>
+<p><code>truncate_at_limit</code> 是一个语义开关：</p>
+<ul><li><code>= 1</code>（视频音轨）：到上限就静默截断</li><li><code>= 0</code>（独立音频片段）：到上限<strong>报错</strong>而不是悄悄裁剪</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.h&amp;s=29&amp;e=35&amp;mode=part" data-f="h3_ffmpeg.h" data-s="29" data-e="35">h3_ffmpeg.h<span class="rng">L29-35</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1225&amp;e=1231&amp;mode=part" data-f="h3.c" data-s="1225" data-e="1231">h3.c<span class="rng">L1225-1231</span></a></p>
+<h2>输出侧：双并发管道</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
+                                 int frame_count, int width, int height,
+                                 int fps, const float *pcm, int samples,
+                                 int channels, int sample_rate,
+                                 char *error, size_t error_size);</code></pre></div>
+<pre class="mermaid">flowchart LR
+    A[&quot;RGB24 帧&quot;] --&gt;|pipe 1| F[&quot;ffmpeg&quot;]
+    B[&quot;F32 PCM&quot;] --&gt;|pipe 2| F
+    F --&gt; C[&quot;H.264 + AAC 的 MP4&quot;]
+    W[&quot;stream_writer / stream_thread&quot;] --&gt; A
+    W --&gt; B</pre>
+<p>两个 <code>stream_writer</code> 各由一个 <code>stream_thread</code>（<code>h3_ffmpeg.c:587</code>）驱动并发写入，<strong>不产生任何中间未压缩媒体文件</strong>。这是 <code>make_parents</code>（36）会先建目录、<code>write_all</code>（57）处理短写的原因。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.c&amp;s=580&amp;e=614&amp;mode=part" data-f="h3_ffmpeg.c" data-s="580" data-e="614">h3_ffmpeg.c<span class="rng">L580-614</span></a>, <a class="src-ref" href="../source.html?f=h3_ffmpeg.c&amp;s=36&amp;e=75&amp;mode=part" data-f="h3_ffmpeg.c" data-s="36" data-e="75">h3_ffmpeg.c<span class="rng">L36-75</span></a></p>
+<h2>超分后处理</h2>
+<p><code>h3_superres</code>（<code>h3_ffmpeg.c:785</code>）调用外部 <code>realesrgan-ncnn-vulkan</code>：</p>
+<pre class="mermaid">flowchart LR
+    A[&quot;生成的 MP4&quot;] --&gt; B[&quot;抽帧&quot;]
+    B --&gt; C[&quot;realesrgan 放大&quot;]
+    C --&gt; D[&quot;重封装，保留原音轨&quot;]</pre>
+<h3>参数</h3>
+<table><thead><tr><th>CLI</th><th>语义</th></tr></thead><tbody><tr><td><code>--sr</code></td><td>启用</td></tr><tr><td><code>--sr-bin DIR</code></td><td>含 <code>realesrgan-ncnn-vulkan</code> 的目录</td></tr><tr><td><code>--sr-model-dir DIR</code></td><td>含 <code>.bin</code> / <code>.param</code> 的目录</td></tr><tr><td><code>--sr-model NAME</code></td><td>默认 <code>realesrgan-x4plus</code></td></tr><tr><td><code>--sr-target WxH</code></td><td>明确目标分辨率；缺省为内部尺寸 × scale</td></tr><tr><td><code>--sr-scale N</code></td><td>2 / 3 / 4，默认 4；无 <code>--sr-target</code> 时生效</td></tr></tbody></table>
+<h3>分辨率策略</h3>
+<p>内部（超分前）分辨率从输出文件<strong>自动探测</strong>，即视频实际生成的 <code>--width × --height</code>。</p>
+<ul><li><code>--sr-target</code> 是内部尺寸的 2–4 整数倍 → 模型按该精确倍率跑</li><li>否则 → 按 ×4 跑，最后用 ffmpeg 缩到请求的目标</li></ul>
+<h3>失败语义</h3>
+<p><strong>这是对已编码视频的后处理，不是扩散流水线的一部分</strong>。失败时回退到低分辨率片段，而不是中断整次运行。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_ffmpeg.h&amp;s=49&amp;e=58&amp;mode=part" data-f="h3_ffmpeg.h" data-s="49" data-e="58">h3_ffmpeg.h<span class="rng">L49-58</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=357&amp;e=402&amp;mode=part" data-f="README.md" data-s="357" data-e="402">README.md<span class="rng">L357-402</span></a></p>
+<h2>推荐的低分辨率 + 超分组合</h2>
+<p>内部画布必须是 32 的倍数（见 <a href="../pages/layout-and-rope.html">序列布局与位置编码</a>）并与目标成比例。16:9 输出下，<code>512x288</code>（×4 → <code>2048x1152</code>，再缩到 <code>1280x720</code>）是安全且快的选择：</p>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">./h3 -d ./MiniMax-H3 -p &quot;...&quot; --seconds 15 \
+     --width 512 --height 288 \
+     --steps 4 --layers 45 --reuse 1 --ssd-streaming \
+     --sr --sr-bin /tmp/h3_realesrgan --sr-model-dir /tmp/h3_realesrgan/models \
+     --sr-target 1280x720 -o outputs/drama-720p.mp4</code></pre></div>
+<p>最快的生成预设（<code>--steps 4 --layers 45 --reuse 1 --ssd-streaming</code>）把扩散成本压到最低，视觉重活交给 ×4 放大。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=389&amp;e=402&amp;mode=part" data-f="README.md" data-s="389" data-e="402">README.md<span class="rng">L389-402</span></a></p>
+<h2>无 MP4 的运行</h2>
+<p><code>-o &#x27;&#x27;</code> 关闭 MP4 编码。配合 <code>--frames-dir DIR</code> 把最终帧写成 PPM，可在 ffmpeg 不可用时仍能产出画面。注意 <code>--show</code> 的中间预览<strong>不会</strong>写进 <code>--frames-dir</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=341&amp;e=344&amp;mode=part" data-f="README.md" data-s="341" data-e="344">README.md<span class="rng">L341-344</span></a></p></div></body></html>

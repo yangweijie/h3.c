@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh" data-theme="dark"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AdaLN 调度与门控剪枝: h3_dit_schedule</title>
+<title>AdaLN 调度与门控排序</title>
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
 <link rel="stylesheet" href="../style/wiki.css">
 <link rel="stylesheet" href="../style/hljs.css">
@@ -11,14 +11,66 @@
 <script src="../script/source-viewer.js"></script>
 <script src="../script/mermaid.min.js"></script>
 <script src="../script/wiki.js" defer></script>
-</head><body><div class="wrap"><h1>AdaLN 调度与门控剪枝: h3_dit_schedule</h1>
-<p><code>h3_dit_schedule.c</code> / <code>h3_dit_schedule.h</code> 负责两件事：在每个去噪步预计算 DiT 所需的 AdaLN 调制参数，以及为块剪枝提供门控分数。它把&quot;调度&quot;从去噪主循环（<code>h3_dit_denoise_euler</code>）中解耦出来，使主循环可以简单地查表使用。</p>
-<h2>结构常量（<code>h3_dit_schedule.h</code>）</h2>
-<ul><li><code>H3_DIT_BLOCKS = 50</code>、<code>HIDDEN = 5376</code>、<code>HEADS = 56</code>、<code>HEAD_DIM = 96</code>、<code>MLP = 21504</code>、<code>DIT_IN = 24</code>、<code>DIT_IN_AUDIO = 32</code>：与 <code>DiT 主干</code> 共享同一组维度宏，确保调制参数形状匹配。</li><li><code>SIGMA_STEPS = 1000</code>：连续噪声水平（sigma）的离散化粒度，用于构造去噪调度。</li></ul>
-<h2>调度构造</h2>
-<ul><li><code>h3_schedule_build(params, steps, &amp;sched)</code>：依据去噪步数（默认 20）与 <code>SIGMA_STEPS</code> 生成 <code>h3_sigma_schedule</code>——一组从大到小的 sigma 值，决定每个 Euler 步的噪声水平。</li><li><code>h3_dit_schedule_precompute(ctx, params, cond, layout, sigmas, &amp;schedule)</code>：对每个去噪步，把当前 sigma 与条件投影为 50 块各自的 AdaLN 调制参数（shift/scale/gate），结果存入 <code>h3_dit_schedule</code> 供主循环逐块取用。预计算避免在每个块前向内重复投影时间嵌入。</li></ul>
-<h2>门控剪枝</h2>
-<ul><li><code>h3_dit_schedule_gate_score(schedule, block_index)</code>：返回某块在&quot;当前去噪阶段&quot;的门控分数。分数低表示该块对当前噪声水平的贡献小，可在部分步跳过以加速（配合 <code>H3_MIN_DIT_LAYERS</code> 下限保证质量底线）。</li><li>该机制与 <code>core_reuse</code> / <code>denoise_reuse</code> 正交：后者是时间维度的复用，门控剪枝是空间（块）维度的稀疏化。</li></ul>
-<h2>设计取舍</h2>
-<p>把 AdaLN 调制与时间调度集中在此模块，让 <code>DiT 主干</code> 的主循环保持&quot;读调制→跑块→采样&quot;的线性结构，易于在 Metal 内核间流水化。代价是需要额外的预计算缓冲，但因其可在 <code>core_reuse</code> 周期内复用，实际开销很低。</p>
-<p>相关：预计算输出由 <code>DiT 主干</code> 的块前向内联使用；sigma 调度驱动 <code>h3_dit_denoise_euler</code>。</p></div></body></html>
+</head><body><div class="wrap"><h1>AdaLN 调度与门控排序</h1>
+<p><code>h3_dit_schedule.c</code>（716 行）在 DiT 主体加载<strong>之前</strong>先把每个去噪步的 AdaLN 调制值与门控分数<strong>一次性算好</strong>。这一步的设计目标是：让 498 MiB 量级的块投影在计算完就被释放，从而不占常驻内存。</p>
+<h2>常量</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">#define H3_DIT_BLOCKS 50u
+#define H3_DIT_HIDDEN 5376u
+#define H3_DIT_TIME_DIM 2688u
+#define H3_DIT_MODALITIES 3u
+#define H3_DIT_ADALN_SLOTS 6u</code></pre></div>
+<p>这些常量在 <code>h3_dit_schedule.h</code> 与 <code>h3_dit.c</code> 里<strong>有意重复</strong>，改动必须两处同步。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=11&amp;e=15&amp;mode=part" data-f="h3_dit_schedule.h" data-s="11" data-e="15">h3_dit_schedule.h<span class="rng">L11-15</span></a></p>
+<h2>预计算流程</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;h3_sigma_schedule&quot;] --&gt; B[&quot;time_embeddings&lt;br/&gt;时间步嵌入&quot;]
+    B --&gt; C[&quot;time_table_embeddings&lt;br/&gt;时间步查表嵌入&quot;]
+    C --&gt; D[&quot;逐块投影&lt;br/&gt;一次一块，随即释放&quot;]
+    D --&gt; E[&quot;h3_dit_schedule&lt;br/&gt;每步的视频/音频/条件行索引 + 每块门控分数&quot;]</pre>
+<p><code>h3_dit_schedule_precompute</code> 的注释点明了核心设计：</p>
+<blockquote>刻意一次只提交一个投影，因此 498 MiB 的块投影会在加载下一个之前被释放。</blockquote>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=22&amp;e=30&amp;mode=part" data-f="h3_dit_schedule.h" data-s="22" data-e="30">h3_dit_schedule.h<span class="rng">L22-30</span></a>, <a class="src-ref" href="../source.html?f=h3_dit_schedule.c&amp;s=305&amp;e=407&amp;mode=part" data-f="h3_dit_schedule.c" data-s="305" data-e="407">h3_dit_schedule.c<span class="rng">L305-407</span></a></p>
+<h2>步骤查询</h2>
+<p>每步需要知道「这一行的调制值在哪一行」：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">uint32_t h3_dit_schedule_video_row(schedule, step);
+uint32_t h3_dit_schedule_audio_row(schedule, step);
+uint32_t h3_dit_schedule_visual_condition_row(schedule, step);
+uint32_t h3_dit_schedule_audio_condition_row(schedule, step);
+uint32_t h3_dit_schedule_time_rows(schedule);</code></pre></div>
+<p>视频与音频是<strong>两条独立的位移 sigma 网格</strong>（video shift 12.0、audio shift 3.0），因此各有自己的行索引。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=33&amp;e=40&amp;mode=part" data-f="h3_dit_schedule.h" data-s="33" data-e="40">h3_dit_schedule.h<span class="rng">L33-40</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=12&amp;e=13&amp;mode=part" data-f="h3_host.h" data-s="12" data-e="13">h3_host.h<span class="rng">L12-13</span></a></p>
+<h2>门控排序（层精简的基础）</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule, unsigned block);
+void   h3_dit_schedule_prune(h3_dit_schedule *schedule,
+                             const uint8_t *active_blocks, size_t count);</code></pre></div>
+<p><code>--layers N</code>（N &lt; 50）不是简单地砍掉后 N 块，而是：</p>
+<ol><li>对 checkpoint 中<strong>实际的 AdaLN 门控值</strong>排序</li><li>按分数保留前 N 块</li><li><strong>保护结构上重要的首个与最终块</strong></li></ol>
+<p>被剪掉的块的权重与调度张量<strong>不会被保留</strong>，所以 <code>--layers 45</code> 与 <code>--layers 40</code> 同时减少变换器时间与统一内存占用——不只是省算力。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=43&amp;e=46&amp;mode=part" data-f="h3_dit_schedule.h" data-s="43" data-e="46">h3_dit_schedule.h<span class="rng">L43-46</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=495&amp;e=500&amp;mode=part" data-f="README.md" data-s="495" data-e="500">README.md<span class="rng">L495-500</span></a></p>
+<h2>行映射</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
+                            const h3_layout *layout,
+                            const uint8_t *text_tags, size_t text_tag_count,
+                            uint32_t *rows, size_t row_count);</code></pre></div>
+<p>这是把 <a href="../pages/layout-and-rope.html">序列布局与位置编码</a> 和 AdaLN 内核连起来的桥梁。规则：</p>
+<ul><li><code>text_tags</code> 可为 NULL（所有 tag 取 1），或每行一个 tag</li><li><strong>Qwen 视觉呈现跨度用 tag 0</strong>（含其边界 token）</li><li>段类型（见 <code>h3_segment_kind</code>）决定该行吃<strong>目标时间步还是条件时间步</strong>，以及打到哪个模态</li></ul>
+<p>产物 <code>rows</code> 直接被融合的 AdaLN / 门控内核消费，无需在 GPU 上再做分支判断。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=49&amp;e=55&amp;mode=part" data-f="h3_dit_schedule.h" data-s="49" data-e="55">h3_dit_schedule.h<span class="rng">L49-55</span></a>, <a class="src-ref" href="../source.html?f=h3_dit_schedule.c&amp;s=665&amp;e=716&amp;mode=part" data-f="h3_dit_schedule.c" data-s="665" data-e="716">h3_dit_schedule.c<span class="rng">L665-716</span></a></p>
+<h2>权重读取的 dtype 处理</h2>
+<p>调度器要吃几种不同 dtype 的权重，因此有一组转换辅助：</p>
+<table><thead><tr><th>函数</th><th>行</th><th>用途</th></tr></thead><tbody><tr><td><code>schedule_f16_to_f32</code></td><td>58</td><td>F16 → F32</td></tr><tr><td><code>schedule_f32_to_bf16</code></td><td>82</td><td>F32 → BF16</td></tr><tr><td><code>weight_f32_1d</code> / <code>weight_f32_2d</code></td><td>43 / 50</td><td>F32 权重</td></tr><tr><td><code>weight_bf16_any</code> / <code>_1d</code> / <code>_2d</code></td><td>92 / 160 / 168</td><td>接受任意源 dtype 的 BF16 权重</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit_schedule.c&amp;s=43&amp;e=175&amp;mode=part" data-f="h3_dit_schedule.c" data-s="43" data-e="175">h3_dit_schedule.c<span class="rng">L43-175</span></a></p>
+<h2>在 DiT 加载中的位置</h2>
+<pre class="mermaid">sequenceDiagram
+    participant H3 as h3.c
+    participant DIT as h3_dit.c
+    participant SCH as h3_dit_schedule.c
+    H3-&gt;&gt;DIT: h3_dit_load_conditioned / _t2va
+    DIT-&gt;&gt;DIT: refine_text（文本精化）
+    DIT-&gt;&gt;SCH: h3_dit_schedule_precompute
+    Note over SCH: 逐块投影，用完即释放
+    SCH--&gt;&gt;DIT: h3_dit_schedule
+    DIT-&gt;&gt;DIT: load_core（持久核心，此时才吃大内存）
+    DIT--&gt;&gt;H3: h3_dit</pre>
+<p><strong>顺序很重要</strong>：如果先加载核心再算调度，峰值内存会高出 498 MiB 量级。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=20&amp;e=22&amp;mode=part" data-f="h3_dit.h" data-s="20" data-e="22">h3_dit.h<span class="rng">L20-22</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=1300&amp;e=1378&amp;mode=part" data-f="h3_dit.c" data-s="1300" data-e="1378">h3_dit.c<span class="rng">L1300-1378</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=1737&amp;e=1851&amp;mode=part" data-f="h3_dit.c" data-s="1737" data-e="1851">h3_dit.c<span class="rng">L1737-1851</span></a></p></div></body></html>

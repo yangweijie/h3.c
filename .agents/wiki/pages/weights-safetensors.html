@@ -1,0 +1,85 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>权重与 safetensors</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>权重与 safetensors</h1>
+<p>权重加载是三层结构：<strong>原始 safetensors → 组件级权重存储 → 设备映射</strong>。三层各司其职，共同保证「33B 权重不产生中间 host 分配」。</p>
+<h2>第一层：h3_safetensors.c</h2>
+<p>纯 C 的 safetensors 解析器，不依赖任何第三方。</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    char *name;
+    h3_dtype dtype;
+    int ndim;
+    uint64_t shape[8];
+    uint64_t data_begin, data_end, file_offset;
+} h3_st_tensor;
+
+typedef struct {
+    char *path;
+    uint64_t file_size, header_size;
+    h3_st_tensor *tensors;
+    size_t tensor_count;
+} h3_st_header;</code></pre></div>
+<table><thead><tr><th>函数</th><th>职责</th></tr></thead><tbody><tr><td><code>h3_st_read_header</code></td><td>解析单个文件的 JSON 头（含 8 字节长度前缀）</td></tr><tr><td><code>h3_st_free_header</code></td><td>释放</td></tr><tr><td><code>h3_st_find</code></td><td>按名查找张量</td></tr><tr><td><code>h3_st_tensor_elements</code></td><td>元素个数</td></tr><tr><td><code>h3_st_read_data</code></td><td>按已解析的偏移读数据</td></tr><tr><td><code>h3_st_inventory_dir</code></td><td><strong>目录级统计</strong>：总字节、张量字节、文件数、张量数</td></tr></tbody></table>
+<p><code>h3_st_inventory_dir</code> 是关键：它让 <a href="../pages/memory-plan.html">自动内存规划</a> 能在<strong>不读任何载荷</strong>的情况下知道每个组件有多大。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_safetensors.h&amp;s=9&amp;e=56&amp;mode=part" data-f="h3_safetensors.h" data-s="9" data-e="56">h3_safetensors.h<span class="rng">L9-56</span></a></p>
+<h2>第二层：h3_weights.c</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">h3_weight_store *h3_weight_store_open(const char *directory,
+                                      char *error, size_t error_size);
+const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
+                                   const char *name, const h3_st_header **header);
+h3_gpu_tensor *h3_weight_load_bf16(const h3_weight_store *store, h3_gpu *gpu,
+                                   const char *name, int ndim,
+                                   const uint64_t *shape,
+                                   char *error, size_t error_size);</code></pre></div>
+<p><code>h3_weight_store_open</code> 打开一个组件目录下的<strong>所有</strong>分片头（<code>safetensors_name</code> + <code>compare_paths</code> 保证分片按自然序），但不读任何张量载荷。</p>
+<p><code>h3_weight_load_bf16</code> 的三步是原子的：</p>
+<ol><li><code>h3_weight_find</code> 定位张量与所在分片</li><li>校验 dtype 与形状<strong>精确匹配</strong></li><li>分配共享 Metal 缓冲并把 payload <code>pread</code> 进去</li></ol>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_weights.h&amp;s=12&amp;e=35&amp;mode=part" data-f="h3_weights.h" data-s="12" data-e="35">h3_weights.h<span class="rng">L12-35</span></a>, <a class="src-ref" href="../source.html?f=h3_weights.c&amp;s=44&amp;e=132&amp;mode=part" data-f="h3_weights.c" data-s="44" data-e="132">h3_weights.c<span class="rng">L44-132</span></a>, <a class="src-ref" href="../source.html?f=h3_weights.c&amp;s=436&amp;e=457&amp;mode=part" data-f="h3_weights.c" data-s="436" data-e="457">h3_weights.c<span class="rng">L436-457</span></a></p>
+<h2>第三层：h3_gpu.m</h2>
+<p><code>h3_gpu_tensor_load_bf16</code> / <code>_f32</code> / <code>_i8</code> 分配共享 Metal 存储并直接 pread。两个变体：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_gpu_tensor_read_file_bf16(...);    /* 普通 */
+int h3_gpu_tensor_stream_file_bf16(...);  /* 请 Darwin 不保留文件缓存副本 */</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=51&amp;e=69&amp;mode=part" data-f="h3_gpu.h" data-s="51" data-e="69">h3_gpu.h<span class="rng">L51-69</span></a></p>
+<h2>三种权重形态</h2>
+<pre class="mermaid">flowchart LR
+    A[&quot;safetensors 分片&quot;] --&gt; B{&quot;形态?&quot;}
+    B --&gt;|纯 BF16| C[&quot;pread 直达共享缓冲&quot;]
+    B --&gt;|M5 zero-copy| D[&quot;直接 mmap 分片&lt;br/&gt;保持文件背衬/可回收&quot;]
+    B --&gt;|ConvRot int8| E[&quot;读 int8 + scale&lt;br/&gt;Walsh-Hadamard 反旋转 → BF16&quot;]</pre>
+<table><thead><tr><th>形态</th><th>条件</th><th>关键性质</th></tr></thead><tbody><tr><td>纯 BF16</td><td>默认</td><td>最直白，无中间分配</td></tr><tr><td>M5 zero-copy</td><td>M5 级 GPU</td><td>持久变换器权重从分片映射而非拷进匿名共享缓冲，让 37 GiB 保持文件背衬/可回收，且略微改善总变换器时间</td></tr><tr><td>ConvRot int8</td><td><code>H3_CONVROT_*</code></td><td>存储减半，加载时 CPU 侧反旋转还原真权重</td></tr></tbody></table>
+<p>M3 使用<strong>更快的拷贝缓冲路径</strong>，不走 zero-copy。</p>
+<p><code>H3_ZERO_COPY_WEIGHTS=0</code> 可关闭 M5 的选择用于诊断。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_weights.c&amp;s=160&amp;e=206&amp;mode=part" data-f="h3_weights.c" data-s="160" data-e="206">h3_weights.c<span class="rng">L160-206</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=600&amp;e=612&amp;mode=part" data-f="README.md" data-s="600" data-e="612">README.md<span class="rng">L600-612</span></a></p>
+<h2>dtype 支持</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef enum {
+    H3_DTYPE_UNKNOWN, H3_DTYPE_BOOL, H3_DTYPE_I8, H3_DTYPE_U8,
+    H3_DTYPE_I16, H3_DTYPE_U16, H3_DTYPE_F16, H3_DTYPE_BF16,
+    H3_DTYPE_I32, H3_DTYPE_U32, H3_DTYPE_F32, H3_DTYPE_I64,
+    H3_DTYPE_U64, H3_DTYPE_F64
+} h3_dtype;</code></pre></div>
+<p>解析器支持全 dtype 集，但<strong>加载路径</strong>只暴露 BF16 / F32 / I8 三个入口（<code>h3_weight_load_bf16</code> / <code>_f32</code> / <code>_i8</code>）。需要其它 dtype 时，<code>h3_weights.c</code> 内部用 <code>f16_to_f32</code>（302）与 <code>f32_to_bf16_u16</code>（184）做转换。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_safetensors.h&amp;s=9&amp;e=24&amp;mode=part" data-f="h3_safetensors.h" data-s="9" data-e="24">h3_safetensors.h<span class="rng">L9-24</span></a>, <a class="src-ref" href="../source.html?f=h3_weights.h&amp;s=25&amp;e=34&amp;mode=part" data-f="h3_weights.h" data-s="25" data-e="34">h3_weights.h<span class="rng">L25-34</span></a></p>
+<h2>卸载时机</h2>
+<p><code>h3_weight_store_free</code>（119）只释放分片头与张量元数据，<strong>不管已映射的 GPU 张量</strong>——后者由各子系统的 <code>free_*</code> 负责。</p>
+<p>这个分工很重要：权重存储的生命周期可以比它映射出的张量短，因为一旦 payload 进了共享缓冲，safetensors 头就只是索引。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_weights.c&amp;s=119&amp;e=131&amp;mode=part" data-f="h3_weights.c" data-s="119" data-e="131">h3_weights.c<span class="rng">L119-131</span></a></p>
+<h2>与加载顺序的关系</h2>
+<p>各子系统按<strong>阶段</strong>加载权重，用完即弃：</p>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>text_encoder        → 条件构建期加载，完成后释放
+video_vae (encoder) → 条件构建期加载，完成后释放
+audio_vae (encoder) → 条件构建期加载，完成后释放
+transformer (DiT)   → 去噪期常驻（或 2 块轮转）
+video_vae (decoder) → 解码期常驻（或 1 块轮转）
+audio_vae (decoder) → 解码期加载，完成后释放</code></pre></div>
+<p>这让 33B 变换器、Qwen 编码器与两个解码器<strong>永远不必同时驻留统一内存</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1628&amp;e=1633&amp;mode=part" data-f="h3.c" data-s="1628" data-e="1633">h3.c<span class="rng">L1628-1633</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1690&amp;e=1699&amp;mode=part" data-f="h3.c" data-s="1690" data-e="1699">h3.c<span class="rng">L1690-1699</span></a></p></div></body></html>

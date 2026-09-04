@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh" data-theme="dark"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>音频 VAE (BigVGAN): h3_audio_vae</title>
+<title>音频 VAE 编解码</title>
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
 <link rel="stylesheet" href="../style/wiki.css">
 <link rel="stylesheet" href="../style/hljs.css">
@@ -11,14 +11,70 @@
 <script src="../script/source-viewer.js"></script>
 <script src="../script/mermaid.min.js"></script>
 <script src="../script/wiki.js" defer></script>
-</head><body><div class="wrap"><h1>音频 VAE (BigVGAN): h3_audio_vae</h1>
-<p><code>h3_audio_vae.c</code> / <code>h3_audio_vae.h</code> 实现音频潜变量的 BigVGAN 解码（以及参考音频的编码），把 <code>DiT 主干</code> 输出的音频潜变量还原为 32 kHz 立体声 PCM。</p>
-<h2>解码器</h2>
-<ul><li><code>h3_audio_vae_decoder_open(ctx, weights, params)</code> / <code>h3_audio_vae_decoder_close()</code>：加载 BigVGAN 反卷积权重（来自 <code>权重存储</code>）。</li><li><code>h3_audio_vae_decode(latent, params, &amp;pcm)</code>：输入音频潜变量 <code>[32, 2, T]</code>（32 通道、2 声道、T 帧），经多组反卷积（对应 <code>Metal 着色器</code> 的 <code>bigvgan_conv_transpose_*</code>）上采样为 F32 PCM，采样率固定 32000。</li><li><code>h3_audio_vae_decode_preview(...)</code>：与 <code>视频 VAE</code> 类似，支持逐块预览音频（在逐 Euler 步时仅合成最新一段）。</li></ul>
-<h2>编码器（参考路径）</h2>
-<ul><li><code>h3_audio_vae_encode(path, params, &amp;latent)</code>：把参考音频（经 <code>FFmpeg</code> 读入的 PCM）编码为 <code>[32,2,T]</code> 潜变量，作为 Ref2VA 的音频条件，进入 <code>多模态嵌入编排</code>。</li></ul>
-<h2>与 DiT 的耦合</h2>
-<p>音频潜变量的通道数（32）决定 DiT 音频分支的输入维度（<code>DIT_IN_AUDIO=32</code>）。与视频 VAE 一样，维度必须在 <code>h3_load_dir()</code> 阶段与权重校验一致。</p>
-<h2>实现要点</h2>
-<p>BigVGAN 的反卷积内核在 <code>h3_metal.m</code> 中以 Metal 着色器实现，运行于 BF16 共享缓冲；输出 PCM 直接交给 <code>FFmpeg</code> 的音频管道封装，不落中间文件。</p>
-<p>相关：视频侧对称实现见 <code>视频 VAE</code>；媒体写出见 <code>FFmpeg 媒体读写</code>。</p></div></body></html>
+</head><body><div class="wrap"><h1>音频 VAE 编解码</h1>
+<p><code>h3_audio_vae.c</code>（1343 行）实现 H3 的音频分支：一个<strong>解码器（BigVGAN 风格）</strong>把音频潜变量还原成 32 kHz 立体声波形，以及一个<strong>编码器</strong>把参考音频压成后验均值潜变量。</p>
+<h2>数据契约</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    int channels;      /* 2 */
+    int samples;
+    int sample_rate;   /* 32000 */
+    float *pcm;        /* 通道优先 F32，裁剪到 [-1,1] */
+    h3_gpu_stats gpu_stats;
+} h3_audio_waveform;
+
+typedef struct {
+    int channels;      /* 32 */
+    int stereo;        /* 2 */
+    int length;
+    float *values;     /* 通道优先 F32 [32,2,length]，归一化后验均值 */
+    h3_gpu_stats gpu_stats;
+} h3_audio_latent;</code></pre></div>
+<table><thead><tr><th>函数</th><th>输入</th><th>输出</th></tr></thead><tbody><tr><td><code>h3_audio_vae_decode</code></td><td><code>[32,2,T]</code> 归一化潜变量</td><td>32 kHz 立体声波形</td></tr><tr><td><code>h3_audio_vae_encode</code></td><td>通道优先 32 kHz 立体声 PCM <code>[2,samples]</code></td><td><code>[32,2,length]</code> 后验均值</td></tr></tbody></table>
+<p>编码器把输入<strong>右侧补零到下一个 800 样本潜变量边界</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_audio_vae.h&amp;s=8&amp;e=46&amp;mode=part" data-f="h3_audio_vae.h" data-s="8" data-e="46">h3_audio_vae.h<span class="rng">L8-46</span></a></p>
+<h2>解码器结构</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;prepare_input：潜变量归一化&quot;] --&gt; B[&quot;stage 0..N&quot;]
+    B --&gt; C[&quot;run_stage：上采样 + 残差块&quot;]
+    C --&gt; D[&quot;decode_output：输出卷积 + clip&quot;]
+    D --&gt; E[&quot;波形 [-1,1]&quot;]</pre>
+<p>每个 stage 由 <code>audio_stage</code> 描述，含若干 <code>audio_resblock</code>（残差块），每个残差块含若干 <code>audio_activation</code> 与 <code>audio_conv</code>。三个静态表驱动拓扑：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">static const int upsample_rates[];
+static const int upsample_kernels[];
+static const int residual_kernels[];
+static const int residual_dilations[];</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_audio_vae.c&amp;s=26&amp;e=68&amp;mode=part" data-f="h3_audio_vae.c" data-s="26" data-e="68">h3_audio_vae.c<span class="rng">L26-68</span></a>, <a class="src-ref" href="../source.html?f=h3_audio_vae.c&amp;s=519&amp;e=659&amp;mode=part" data-f="h3_audio_vae.c" data-s="519" data-e="659">h3_audio_vae.c<span class="rng">L519-659</span></a></p>
+<h2>权重归一化</h2>
+<p>BigVGAN 的卷积用 <strong>weight norm</strong>。加载路径是：</p>
+<ol><li><code>load_plain_conv</code> / <code>load_normalized_conv</code> 读出 <code>weight_g</code>（magnitude）与 <code>weight_v</code>（vector）</li><li><code>normalize_conv</code>（218）在 GPU 上用 <code>h3_gpu_weight_norm_f32</code> 合成真正的卷积核</li><li><code>retire_normalization_inputs</code>（234）<strong>立刻释放 <code>weight_g</code> / <code>weight_v</code></strong>——这一步直接决定峰值内存</li></ol>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_audio_vae.c&amp;s=155&amp;e=238&amp;mode=part" data-f="h3_audio_vae.c" data-s="155" data-e="238">h3_audio_vae.c<span class="rng">L155-238</span></a></p>
+<h2>关键 GPU 算子</h2>
+<p><code>h3_gpu.h</code> 里为音频单列了一组算子，且注释明确了两条约定：</p>
+<blockquote>- <strong>激活是时间优先的 <code>[batch, length, channels]</code></strong> - <strong>Conv1d 权重按 PyTorch OIK 序存，ConvTranspose1d 按 IOK 序存</strong></blockquote>
+<table><thead><tr><th>算子</th><th>用途</th></tr></thead><tbody><tr><td><code>h3_gpu_conv1d_f32</code> / <code>h3_gpu_conv1d_stride_f32</code> / <code>h3_gpu_conv_transpose1d_f32</code></td><td>三种一维卷积</td></tr><tr><td><code>h3_gpu_weight_norm_f32</code></td><td>weight norm 合成</td></tr><tr><td><code>h3_gpu_alias_free_snake_f32</code> / <code>h3_gpu_snake1d_f32</code></td><td>BigVGAN 的周期性激活</td></tr><tr><td><code>h3_gpu_audio_qkv_split_f32</code> / <code>h3_gpu_sdpa_causal_f32</code> / <code>h3_gpu_audio_attention_pool_f32</code></td><td>编码器里的注意力分支</td></tr><tr><td><code>h3_gpu_geglu_f32</code> / <code>h3_gpu_clip_f32</code></td><td>编码器 MLP 与输出裁剪</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=196&amp;e=266&amp;mode=part" data-f="h3_gpu.h" data-s="196" data-e="266">h3_gpu.h<span class="rng">L196-266</span></a></p>
+<h2>编码器结构</h2>
+<pre class="mermaid">flowchart LR
+    A[&quot;PCM [2,samples]&quot;] --&gt; B[&quot;encoder_initial&quot;]
+    B --&gt; C[&quot;encoder_residual × N&quot;]
+    C --&gt; D[&quot;encoder_downsample&quot;]
+    D --&gt; E[&quot;encoder_final_conv&quot;]
+    E --&gt; F[&quot;两个分支&quot;]
+    F --&gt; G[&quot;encoder_projection_branch&quot;]
+    F --&gt; H[&quot;encoder_attention_branch&quot;]
+    G &amp; H --&gt; I[&quot;encoder_mlp&quot;]
+    I --&gt; J[&quot;encoder_output → [32,2,length]&quot;]</pre>
+<p><code>encoder_strides</code> / <code>encoder_dilations</code> 是静态表；<code>encoder_trace</code>（723）与 <code>encoder_conv_length</code>（746）用来预先算好每一层的输出长度，避免过度分配。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_audio_vae.c&amp;s=713&amp;e=985&amp;mode=part" data-f="h3_audio_vae.c" data-s="713" data-e="985">h3_audio_vae.c<span class="rng">L713-985</span></a>, <a class="src-ref" href="../source.html?f=h3_audio_vae.c&amp;s=1011&amp;e=1274&amp;mode=part" data-f="h3_audio_vae.c" data-s="1011" data-e="1274">h3_audio_vae.c<span class="rng">L1011-1274</span></a></p>
+<h2>一个重要的正确性修正</h2>
+<p>原生实现与<strong>修正后的</strong> MLX oracle 在真实两秒立体声 fixture 上相对 L2 达到 <code>3.59e-6</code>。这个修正很关键：</p>
+<blockquote>原始 MLX 的 reshape <strong>交错了左右声道样本</strong>，而官方 PyTorch / SGLang 路径把<strong>完整立体声声道折叠进 batch 维度</strong>。</blockquote>
+<p><code>h3_audio_vae_encode</code> 走的是后一条（正确）路径。早期的交错解释是噪声诊断输出的根源之一，与 <a href="../pages/model-loading.html">模型加载与检查点布局</a> 里 QKV 布局那处修正同源。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=750&amp;e=757&amp;mode=part" data-f="README.md" data-s="750" data-e="757">README.md<span class="rng">L750-757</span></a></p>
+<h2>解码保真度</h2>
+<p>公开生成路径用流式原生 BigVGAN / AudioVAE 解码联合音频潜变量，输出与修正后 MLX oracle 的相对 L2 为 <code>6.94e-5</code>。</p>
+<p>参考音频在编码后会混成 <strong>0.999 干净潜变量 + 0.001 带种子噪声</strong>，并钉在音频条件时间步 1.0，再打包成宽度 32 的行放到与视觉引用相同的旋转时间轴。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=728&amp;e=748&amp;mode=part" data-f="README.md" data-s="728" data-e="748">README.md<span class="rng">L728-748</span></a></p>
+<h2>数值档位</h2>
+<p>与视频侧不同，音频解码<strong>没有</strong> int8 或流式开关：它相对 DiT 与视频 VAE 小得多，整段常驻即可。这也是 <a href="../pages/memory-plan.html">自动内存规划</a> 把 <code>audio_vae</code> 的流式贡献算作 0 的原因（编码器/解码器逐调用释放）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=912&amp;e=915&amp;mode=part" data-f="h3.c" data-s="912" data-e="915">h3.c<span class="rng">L912-915</span></a></p></div></body></html>

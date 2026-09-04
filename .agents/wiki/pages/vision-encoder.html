@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh" data-theme="dark"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Qwen 视觉编码器: h3_vision_encoder</title>
+<title>Qwen 视觉塔与 Deepstack</title>
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
 <link rel="stylesheet" href="../style/wiki.css">
 <link rel="stylesheet" href="../style/hljs.css">
@@ -11,12 +11,65 @@
 <script src="../script/source-viewer.js"></script>
 <script src="../script/mermaid.min.js"></script>
 <script src="../script/wiki.js" defer></script>
-</head><body><div class="wrap"><h1>Qwen 视觉编码器: h3_vision_encoder</h1>
-<p><code>h3_vision_encoder.c</code> / <code>h3_vision_encoder.h</code> 处理图像与视频参考输入，把它们编码为与文本嵌入同源的视觉 token，供 <code>多模态嵌入编排</code> 拼接。</p>
-<h2>核心函数</h2>
-<ul><li><code>h3_vision_encode_image_bf16(params, path, image_embed)</code>：把单张参考图（经 <code>FFmpeg</code> 读入、vImage 高质量缩放）编码为 BF16 视觉嵌入。用于 Ref2VA 中的 <code>Image</code> 段与 <code>ReferenceImage</code> 段。</li><li><code>h3_vision_encode_video_bf16(params, path, video_embed, frame_indices[], n)</code>：把参考视频按关键帧索引采样、编码为时序视觉嵌入序列，供视频参考的逐帧条件使用。</li></ul>
-<h2>关键设计</h2>
-<ul><li><strong>与 Qwen3-VL 对齐</strong>：视觉编码器输出维度与文本编码器的隐藏维度一致（5376），使得二者可在同一序列中共存。</li><li><strong>图像条件行数</strong>：嵌入高度/宽度（patch 化后）决定 <code>宿主逻辑</code> 中 <code>image_cond_rows</code> 的数量，进而影响 DiT 序列总长度的布局。</li><li><strong>高质量缩放</strong>：采样帧在送入编码器前用 Accelerate 的 vImage 做高质量缩放，保持与训练分布一致的预处理。</li></ul>
-<h2>与多模态层的关系</h2>
-<p>本模块只负责&quot;图/视频 → 视觉嵌入&quot;，不负责把嵌入拼回文本序列；拼接与 <code>&lt;Picture n&gt;</code> 占位符的填充由 <code>多模态嵌入编排</code> 完成，最后交由 <code>Qwen3-VL 文本编码器</code> 的前 50 层统一处理。</p>
-<p>相关：参考输入由 <code>命令行交互</code> 或公共 API 的 <code>h3_ref</code> 提供；输出写入 <code>h3_host_cond.image_embed</code>。</p></div></body></html>
+</head><body><div class="wrap"><h1>Qwen 视觉塔与 Deepstack</h1>
+<p><code>h3_vision_encoder.c</code>（633 行）把一张图或<strong>一个两帧视频块</strong>编码成 Qwen3-VL 的视觉呈现行。它是 FL2VA 锚点与 Ref2VA 参考共用的视觉前端。</p>
+<h2>契约</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">#define H3_VISION_OUTPUT_WIDTH 5120u
+#define H3_VISION_DEEPSTACKS 3u
+
+typedef struct {
+    int grid_h, grid_w;
+    size_t tokens;
+    uint16_t *merged;                        /* BF16 呈现行 */
+    uint16_t *deepstack[H3_VISION_DEEPSTACKS];
+    h3_gpu_stats gpu_stats;
+} h3_vision_output;
+
+int h3_vision_encode_bf16(const char *weight_directory,
+                          const char *shader_source_path,
+                          const float *pixels, int frames,
+                          int height, int width,
+                          h3_vision_progress progress, void *progress_opaque,
+                          h3_vision_output *output,
+                          char *error, size_t error_size);</code></pre></div>
+<p>输入像素是 F32 <code>[T,3,H,W]</code>，值域 <code>[0,1]</code>；<code>T</code> 必须是 <strong>1 或 2</strong>；<code>H</code>/<code>W</code> 必须是 <strong>32 的倍数</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_vision_encoder.h&amp;s=9&amp;e=33&amp;mode=part" data-f="h3_vision_encoder.h" data-s="9" data-e="33">h3_vision_encoder.h<span class="rng">L9-33</span></a></p>
+<h2>流水线</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;pixels [T,3,H,W] F32&quot;] --&gt; B[&quot;prepare_patch_rows&lt;br/&gt;patch 切分 + 转 BF16&quot;]
+    A --&gt; C[&quot;prepare_position_rows&lt;br/&gt;位置行&quot;]
+    B &amp; C --&gt; D[&quot;prepare_rope&lt;br/&gt;RoPE cos/sin&quot;]
+    D --&gt; E[&quot;run_block × N&lt;br/&gt;Qwen 视觉块&quot;]
+    E --&gt; F[&quot;run_merger&lt;br/&gt;空间合并到 token 网格&quot;]
+    F --&gt; G[&quot;merged (BF16) + deepstack×3&quot;]</pre>
+<table><thead><tr><th>函数</th><th>行</th><th>职责</th></tr></thead><tbody><tr><td><code>prepare_patch_rows</code></td><td>135</td><td>像素 → patch 行 + BF16 转换</td></tr><tr><td><code>prepare_position_rows</code></td><td>163</td><td>生成位置索引</td></tr><tr><td><code>prepare_rope</code></td><td>215</td><td>计算 RoPE 的 cos/sin 表</td></tr><tr><td><code>load_block_weights</code></td><td>250</td><td>加载单个视觉块权重</td></tr><tr><td><code>run_block</code></td><td>288</td><td>执行一个视觉块</td></tr><tr><td><code>run_merger</code></td><td>350</td><td>合并到最终 token 网格并产出 deepstack</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_vision_encoder.c&amp;s=135&amp;e=427&amp;mode=part" data-f="h3_vision_encoder.c" data-s="135" data-e="427">h3_vision_encoder.c<span class="rng">L135-427</span></a></p>
+<h2>逐块加载</h2>
+<p>视觉塔权重<strong>逐块加载、逐块释放</strong>（<code>load_block_weights</code> / <code>free_block_weights</code>），与文本编码器的预取环不同——这里没有异步预取，因为视觉塔相对小得多。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_vision_encoder.c&amp;s=242&amp;e=287&amp;mode=part" data-f="h3_vision_encoder.c" data-s="242" data-e="287">h3_vision_encoder.c<span class="rng">L242-287</span></a></p>
+<h2>三个 Deepstack 层</h2>
+<p><code>deepstack[0..2]</code> 是<strong>三个同形状的增量张量</strong>，分别叠加在语言层的 <strong>0、1、2 之后</strong>。这是 Qwen3-VL 的三层 deepstack 视觉注入，由 <a href="../pages/text-encoder.html">Qwen3-VL 文本编码器</a> 的 <code>h3_text_encode_multimodal_bf16</code> 消费。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_vision_encoder.h&amp;s=16&amp;e=19&amp;mode=part" data-f="h3_vision_encoder.h" data-s="16" data-e="19">h3_vision_encoder.h<span class="rng">L16-19</span></a>, <a class="src-ref" href="../source.html?f=h3_text_encoder.h&amp;s=40&amp;e=52&amp;mode=part" data-f="h3_text_encoder.h" data-s="40" data-e="52">h3_text_encoder.h<span class="rng">L40-52</span></a></p>
+<h2>视频的两帧分块</h2>
+<p>Qwen 以<strong>时间优先的两帧块</strong>消费视频，而媒体边界是通道优先的 <code>[3,T,H,W]</code>。转换由 <code>h3.c</code> 的 <code>h3_extract_vision_pair</code> 完成：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">/* 源：[channel][time][h][w]；目标：[time][channel][h][w]，T=2 */
+for (int time = 0; time &lt; 2; time++)
+    for (int channel = 0; channel &lt; 3; channel++) {
+        size_t source      = ((size_t)channel * frames + times[time]) * area;
+        size_t destination = ((size_t)time * 3 + channel) * area;
+        memcpy(pair + destination, pixels + source, area * sizeof(float));
+    }</code></pre></div>
+<p>采样规则：每 12 帧取一个样本，每 2 个样本组成一个块；奇数样本越界时重复前一个。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=850&amp;e=872&amp;mode=part" data-f="h3.c" data-s="850" data-e="872">h3.c<span class="rng">L850-872</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1429&amp;e=1457&amp;mode=part" data-f="h3.c" data-s="1429" data-e="1457">h3.c<span class="rng">L1429-1457</span></a></p>
+<h2>调用方</h2>
+<pre class="mermaid">flowchart LR
+    A[&quot;h3_vision_encode_bf16&quot;] --&gt; B[&quot;h3_vision_output&quot;]
+    B --&gt; C[&quot;h3_multimodal_encode_fl2va_bf16&lt;br/&gt;（FL2VA 锚点）&quot;]
+    B --&gt; D[&quot;h3_multimodal_encode_ref2va_bf16&lt;br/&gt;（Ref2VA 参考）&quot;]
+    C &amp; D --&gt; E[&quot;h3_text_encode_multimodal_bf16&quot;]
+    E --&gt; F[&quot;h3_text_embedding&quot;]</pre>
+<p>视觉输出在文本编码完成后<strong>立即释放</strong>（<code>h3.c:1482-1483</code>），因为语言层已经把它们烘焙进嵌入。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=1467&amp;e=1483&amp;mode=part" data-f="h3.c" data-s="1467" data-e="1483">h3.c<span class="rng">L1467-1483</span></a>, <a class="src-ref" href="../source.html?f=h3_multimodal.h&amp;s=15&amp;e=52&amp;mode=part" data-f="h3_multimodal.h" data-s="15" data-e="52">h3_multimodal.h<span class="rng">L15-52</span></a></p>
+<h2>调试支持</h2>
+<p><code>debug_tensor</code>（70）与 <code>debug_sync</code>（124）提供了张量内容转储与同步点，用于把原生视觉塔的输出与 MLX oracle 逐层对照。这是 <a href="../pages/test-suite.html">测试与数值对齐</a> 里 <code>test_real_qwen_vision.c</code> 的基础。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_vision_encoder.c&amp;s=70&amp;e=133&amp;mode=part" data-f="h3_vision_encoder.c" data-s="70" data-e="133">h3_vision_encoder.c<span class="rng">L70-133</span></a></p></div></body></html>

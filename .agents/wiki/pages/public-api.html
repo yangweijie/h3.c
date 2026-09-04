@@ -1,0 +1,73 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>公共 API（h3.h）</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>公共 API（h3.h）</h1>
+<p><code>h3.h</code> 是整个引擎的对外契约：一个不透明上下文、一组扁平的 C 函数、一个参数结构体。所有内部实现（DiT、VAE、编码器）都通过它间接触达。</p>
+<h2>生命周期</h2>
+<pre class="mermaid">sequenceDiagram
+    participant App
+    participant H3
+    App-&gt;&gt;H3: h3_load_dir(model_dir)
+    Note over H3: 校验目录布局 + 打开 safetensors 头&lt;br/&gt;探测 Metal 设备；权重未映射
+    App-&gt;&gt;H3: h3_device() / h3_model()
+    App-&gt;&gt;H3: h3_generate(ctx, prompt, params)
+    Note over H3: on_progress / on_frame 回调
+    App-&gt;&gt;H3: h3_result_free(result)
+    App-&gt;&gt;H3: h3_free(ctx)</pre>
+<table><thead><tr><th>函数</th><th>语义</th></tr></thead><tbody><tr><td><code>h3_load_dir</code></td><td>校验模型目录布局，解析 <code>h3_model_info</code>，并通过 <code>h3_metal_probe</code> 探测设备。<strong>权重保持未映射</strong>。</td></tr><tr><td><code>h3_free</code></td><td>清空缓存并释放上下文</td></tr><tr><td><code>h3_last_error</code></td><td>返回最后一次错误字符串（ctx 为 NULL 时读全局）</td></tr><tr><td><code>h3_device</code> / <code>h3_model</code></td><td>读取设备信息与组件清单</td></tr><tr><td><code>h3_generate</code></td><td>执行一次完整生成，帧通过 <code>on_frame</code> 增量交付</td></tr><tr><td><code>h3_cache_set_enabled</code> / <code>h3_cache_clear</code> / <code>h3_cache_get_info</code></td><td>交互会话的跨调用复用开关，默认关闭</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.h&amp;s=192&amp;e=213&amp;mode=part" data-f="h3.h" data-s="192" data-e="213">h3.h<span class="rng">L192-213</span></a></p>
+<h2>h3_params：生成参数</h2>
+<p>参数结构体是<strong>扁平的、全 int / 指针</strong>，没有嵌套配置对象。默认值由 <code>H3_PARAMS_DEFAULT</code> 宏给出。</p>
+<table><thead><tr><th>字段</th><th>默认</th><th>含义</th></tr></thead><tbody><tr><td><code>width</code> / <code>height</code></td><td>864 / 480</td><td>输出画布，均为 32 的倍数，乘积 ≤ <code>768*1344</code></td></tr><tr><td><code>frames</code> / <code>steps</code></td><td>56 / 20</td><td>请求帧数（对齐到 <code>5+17n</code>）、去噪步数</td></tr><tr><td><code>seed</code></td><td>42</td><td>本机随机流种子</td></tr><tr><td><code>denoise_reuse</code></td><td>1</td><td>每 N 步评估一次完整 DiT：1 精确、2 快速、3 激进</td></tr><tr><td><code>dit_layers</code></td><td>50</td><td>按 AdaLN 门控排序后保留的块数，取值 <code>[35,50]</code></td></tr><tr><td><code>core_reuse</code></td><td>1</td><td>每 N 步重算变换器核心，同时每步刷新时间步头；与 <code>denoise_reuse</code> <strong>互斥</strong></td></tr><tr><td><code>token_reduction</code></td><td>0</td><td>在中段块内成对合并水平视频 token（激进加速，可选）</td></tr><tr><td><code>ssd_streaming</code></td><td>0</td><td>只保留 2 个 BF16 DiT 块，与 GPU 执行重叠从 SSD 读下一块</td></tr><tr><td><code>use_int8_row_fc2</code></td><td>0</td><td>每个 FC2 行一个激活 scale 的 int8；需要 Metal 4</td></tr><tr><td><code>use_reference_rope</code></td><td>0</td><td>在 256x256 恢复发布版空间 RoPE（默认用半尺度自适应网格）</td></tr><tr><td><code>lora_path</code></td><td>NULL</td><td>加载时合并进 DiT 权重的 Turbo/distillation LoRA</td></tr><tr><td><code>render_width</code> / <code>render_height</code></td><td>0</td><td>更低的内部模型画布，同比例、不超过输出尺寸</td></tr><tr><td><code>memory_plan_auto</code></td><td>1</td><td>依据设备工作集自动选 ssd_streaming / int8 / dit_layers</td></tr><tr><td><code>preview_denoise</code></td><td>0</td><td>每个 Euler 步后解码一帧预览（<strong>需要 <code>on_frame</code></strong>）</td></tr><tr><td><code>use_slower_*</code></td><td>0</td><td>一组<strong>回退开关</strong>，强制走可对照的慢路径</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.h&amp;s=65&amp;e=155&amp;mode=part" data-f="h3.h" data-s="65" data-e="155">h3.h<span class="rng">L65-155</span></a></p>
+<h3>参数互斥关系（在 <code>h3_valid_params</code> 中强制）</h3>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>ssd_streaming        ⊕ use_int8_row_fc2        （流式用原始 BF16）
+use_int8_row_fc2     ⊕ use_slower_bf16_mlp
+use_int8_row_fc2     → 需要 device.metal4
+core_reuse &gt; 1       ⊕ denoise_reuse &gt; 1
+references           ⊕ first_frame / last_frame
+preview_denoise      → 需要 on_frame</code></pre></div>
+<p>参考数量上限：<strong>12 个总引用</strong>，其中 <strong>9 图 / 3 视频 / 3 音频</strong>；纯音频引用必须搭配图像或视频引用。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=577&amp;e=601&amp;mode=part" data-f="h3.c" data-s="577" data-e="601">h3.c<span class="rng">L577-601</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=651&amp;e=658&amp;mode=part" data-f="h3.c" data-s="651" data-e="658">h3.c<span class="rng">L651-658</span></a></p>
+<h2>回调</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef int (*h3_frame_callback)(const h3_frame *frame, void *opaque);
+typedef int (*h3_progress_callback)(const char *phase, int completed,
+                                    int total, void *opaque);</code></pre></div>
+<p>两者<strong>返回非零即表示取消</strong>，引擎会回滚到 <code>cleanup</code> 并设置 &quot;generation cancelled ...&quot; 错误。</p>
+<p><code>h3_frame</code> 的 <code>denoise_step</code> 为非负值时表示这是一帧<strong>中间去噪预览</strong>；最终帧该字段为 <code>-1</code>。</p>
+<p>进度 phase 字符串包括：<code>tokenizer</code>、<code>text encoder</code>、<code>Qwen vision</code>、<code>video VAE load</code>、<code>preview VAE load</code>、<code>video VAE encoder</code>、<code>audio VAE encoder</code>、<code>audio VAE</code>、<code>FFmpeg</code>，以及 DiT 透传的 phase。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.h&amp;s=49&amp;e=63&amp;mode=part" data-f="h3.h" data-s="49" data-e="63">h3.h<span class="rng">L49-63</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=669&amp;e=710&amp;mode=part" data-f="h3.c" data-s="669" data-e="710">h3.c<span class="rng">L669-710</span></a></p>
+<h2>参考输入</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef enum {
+    H3_REFERENCE_IMAGE = 1,        /* 一张图 */
+    H3_REFERENCE_VIDEO = 2,        /* 视频，可选带内嵌音轨 */
+    H3_REFERENCE_AUDIO = 3,        /* 独立音频片段 */
+    H3_REFERENCE_VIDEO_AUDIO = 4   /* 视频 + 显式替换音轨 */
+} h3_reference_kind;</code></pre></div>
+<p><code>references</code> 数组的<strong>顺序即呈现顺序</strong>，对应 prompt 里的 <code>&lt;Picture 1&gt;</code>、<code>&lt;Picture 2&gt;</code>… 文件名对模型没有语义。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.h&amp;s=30&amp;e=47&amp;mode=part" data-f="h3.h" data-s="30" data-e="47">h3.h<span class="rng">L30-47</span></a></p>
+<h2>设备与模型信息</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    char name[128]; char architecture[128];
+    uint64_t physical_memory;
+    uint64_t recommended_working_set;   /* 自动内存规划的输入 */
+    uint64_t max_buffer_length;
+    int apple_gpu_family; int metal4; int unified_memory;
+} h3_device_info;
+
+typedef struct {
+    h3_component_info text_encoder, fl2va_transformer,
+                      ref2va_transformer, video_vae, audio_vae;
+} h3_model_info;</code></pre></div>
+<p><code>recommended_working_set</code> 直接来自 <code>MTLDevice.recommendedMaxWorkingSetSize</code>，是 <a href="../pages/memory-plan.html">自动内存规划</a> 的决策依据；<code>metal4</code> 由 <code>supportsFamily:MTLGPUFamilyMetal4</code> 决定，是 <a href="../pages/int8-tensorops.html">int8 与 TensorOps 路径</a> 的准入条件。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.h&amp;s=157&amp;e=181&amp;mode=part" data-f="h3.h" data-s="157" data-e="181">h3.h<span class="rng">L157-181</span></a>, <a class="src-ref" href="../source.html?f=h3_metal.m&amp;s=31&amp;e=44&amp;mode=part" data-f="h3_metal.m" data-s="31" data-e="44">h3_metal.m<span class="rng">L31-44</span></a></p></div></body></html>

@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh" data-theme="dark"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>视频 VAE 解码/编码: h3_video_vae / h3_video_encoder</title>
+<title>视频 VAE 解码</title>
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
 <link rel="stylesheet" href="../style/wiki.css">
 <link rel="stylesheet" href="../style/hljs.css">
@@ -11,14 +11,50 @@
 <script src="../script/source-viewer.js"></script>
 <script src="../script/mermaid.min.js"></script>
 <script src="../script/wiki.js" defer></script>
-</head><body><div class="wrap"><h1>视频 VAE 解码/编码: h3_video_vae / h3_video_encoder</h1>
-<p><code>h3_video_vae.h</code> / <code>h3_video_vae.c</code> 实现视频潜变量的平铺（tiled）解码与编码；<code>h3_video_encoder.c</code> 把输入参考视频编码为潜变量（用于 Ref2VA 的视频参考条件）。二者共用一套 VAE 权重（来自 <code>权重存储</code>）。</p>
-<h2>视频 VAE 解码器</h2>
-<ul><li><code>h3_video_vae_decoder_open(ctx, weights, params)</code> / <code>h3_video_vae_decoder_close()</code>：加载并释放解码器权重。支持常驻模式，便于逐步预览。</li><li><code>h3_video_vae_decoder_load(ctx, latents, n, params, decoder)</code>：把 <code>DiT 主干</code> 输出的视频潜变量（<code>[24, F/2, H/16, W/16]</code>，patch=96）解码为 RGB 帧序列（channel-major F32，值范围 0..1）。</li><li><code>h3_video_vae_decoder_preview(decoder, latent_i)</code>：在常驻解码器上只解码第 <code>i</code> 个潜变量帧，用于 <code>--preview-denoise</code> 的逐 Euler 步预览，避免每步重解全部帧。</li><li><code>h3_video_vae_decode_tiled(...)</code>：平铺解码——把大帧切分为空间块分别解码再拼接，控制峰值内存；块边界用重叠-加窗（overlap-add）消除接缝。</li></ul>
-<h2>视频编码器（参考路径）</h2>
-<ul><li><code>h3_video_encoder_encode(path, params, &amp;latent)</code>：把参考视频（经 <code>FFmpeg</code> 读入）编码为潜变量，作为 Ref2VA 的视频条件输入，进入 <code>多模态嵌入编排</code> 的序列装配。</li></ul>
-<h2>与 DiT 的耦合</h2>
-<p>视频 VAE 的通道数（24）与 patch 尺寸（96）直接决定 DiT 输入/输出维度（<code>DIT_IN=24</code>），二者必须版本匹配；若权重与代码维度不一致，<code>h3_load_dir()</code> 阶段会通过 <code>h3_model_info</code> 校验报错。</p>
-<h2>实现要点</h2>
-<p>解码器大量使用 <code>Metal 着色器</code> 中的 <code>vae_upsample_*</code>（转置卷积/上采样）与卷积算子，并在 <code>.m</code> 后端上以 BF16 运行。平铺策略使 864×480×56 帧的解码峰值内存显著低于整帧一次性解码。</p>
-<p>相关：音频侧对称实现见 <code>音频 VAE</code>；解码结果经 <code>FFmpeg</code> 封装输出。</p></div></body></html>
+</head><body><div class="wrap"><h1>视频 VAE 解码</h1>
+<p><code>h3_video_vae.c</code>（1385 行）实现视觉 VAE：一个 <strong>36 块</strong>的解码器，把 <code>[24,T,H,W]</code> 的归一化潜变量还原成 RGB。它同时提供编码器（供 FL2VA/Ref2VA 条件用，见 <code>h3_video_encoder.c</code> 的入口）。</p>
+<h2>两条解码路径</h2>
+<table><thead><tr><th>路径</th><th>入口</th><th>驻留</th><th>适用</th></tr></thead><tbody><tr><td><strong>常驻解码器</strong></td><td><code>h3_video_vae_decoder_load</code> → <code>h3_video_vae_decoder_decode</code></td><td>~9 GiB（36 块全驻留）</td><td><code>--show</code> 实时预览、会话缓存复用</td></tr><tr><td><strong>一次性</strong></td><td><code>h3_video_vae_decode</code></td><td>用完即弃</td><td>单次生成、内存紧张</td></tr></tbody></table>
+<p>常驻解码器还能用 <code>h3_video_vae_decoder_preview</code> <strong>每次只解一帧代表性中间帧</strong>，用于去噪预览；预览结束后可以接着产出完整视频，无需重新加载那 9.7 GiB 权重。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_vae.h&amp;s=26&amp;e=59&amp;mode=part" data-f="h3_video_vae.h" data-s="26" data-e="59">h3_video_vae.h<span class="rng">L26-59</span></a></p>
+<h2>块数常量</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">#define H3_VIDEO_VAE_LAYERS 36</code></pre></div>
+<p>这个常量<strong>专门导出</strong>，供 <a href="../pages/memory-plan.html">自动内存规划</a> 估算流式解码时的每块驻留开销——绝不要硬编码这个数。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_vae.h&amp;s=20&amp;e=24&amp;mode=part" data-f="h3_video_vae.h" data-s="20" data-e="24">h3_video_vae.h<span class="rng">L20-24</span></a></p>
+<h2>流式 vs 常驻（重要）</h2>
+<p>解码器内部按 <code>vae-&gt;streaming</code>（来自 <code>h3_params.video_vae_streaming</code>）分叉：</p>
+<ul><li><code>run_resident_tile</code>（<code>h3_video_vae.c:572</code>）—— 36 块全部驻留，快，~9 GiB</li><li><code>run_stream_tile</code>（<code>h3_video_vae.c:622</code>）—— 每次载一块、跑一块、释放一块，~0.25 GiB</li></ul>
+<p><strong>两个解码入口都必须对这个标志分叉</strong>：<code>decoder_decode_chunk</code>（常驻解码器）与 <code>decode_chunked</code>（一次性路径）。<strong>改动时必须保持两者同步</strong>——这是 AGENTS.md 明确点出的易错点。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_vae.c&amp;s=572&amp;e=622&amp;mode=part" data-f="h3_video_vae.c" data-s="572" data-e="622">h3_video_vae.c<span class="rng">L572-622</span></a>, <a class="src-ref" href="../source.html?f=h3_video_vae.c&amp;s=956&amp;e=1017&amp;mode=part" data-f="h3_video_vae.c" data-s="956" data-e="1017">h3_video_vae.c<span class="rng">L956-1017</span></a>, <a class="src-ref" href="../source.html?f=h3_video_vae.c&amp;s=1176&amp;e=1310&amp;mode=part" data-f="h3_video_vae.c" data-s="1176" data-e="1310">h3_video_vae.c<span class="rng">L1176-1310</span></a></p>
+<h2>分块解码</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;潜变量 [24,T,H,W]&quot;] --&gt; B[&quot;沿时间切成对齐的 H3 时间块&quot;]
+    B --&gt; C[&quot;每块沿空间切成 256–320 px 重叠瓦片&quot;]
+    C --&gt; D[&quot;extract_latent_tile：带重叠halo提取&quot;]
+    D --&gt; E[&quot;run_decoder：输入/输出权重 + 36 块&quot;]
+    E --&gt; F[&quot;stitch_tiles：按发布规则加权混合重叠区&quot;]
+    F --&gt; G[&quot;unpack_frame_range：解出 RGB 帧&quot;]
+    G --&gt; H[&quot;时间块之间按发布 overlap/blend 规则混合&quot;]</pre>
+<p>关键实现点：</p>
+<table><thead><tr><th>函数</th><th>行</th><th>职责</th></tr></thead><tbody><tr><td><code>configured_tile_pixels</code></td><td>791</td><td>由画布几何自动选 256–320 px 瓦片；<code>H3_VAE_TILE_PIXELS=256</code> 可恢复保守计划</td></tr><tr><td><code>tile_axis_build</code></td><td>817</td><td>为每个轴计算瓦片边界与重叠</td></tr><tr><td><code>extract_latent_tile</code></td><td>858</td><td>带 halo 提取子块</td></tr><tr><td><code>stitch_tiles</code></td><td>886</td><td>重叠区加权缝合</td></tr><tr><td><code>decoder_decode_chunk</code></td><td>956</td><td>常驻解码器的一次性块解码</td></tr><tr><td><code>unpack_frame_range</code></td><td>704</td><td>潜变量 → RGB F32</td></tr></tbody></table>
+<p>瓦片尺寸是<strong>自动选择</strong>的：在最小化重复重叠计算与限制峰值存储之间权衡。<code>H3_VAE_TILE_PIXELS</code> 环境变量可强制回退到原始的保守瓦片计划，用于近参考诊断。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_vae.c&amp;s=704&amp;e=955&amp;mode=part" data-f="h3_video_vae.c" data-s="704" data-e="955">h3_video_vae.c<span class="rng">L704-955</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=595&amp;e=598&amp;mode=part" data-f="README.md" data-s="595" data-e="598">README.md<span class="rng">L595-598</span></a></p>
+<h2>权重加载与预取</h2>
+<p>解码器权重大致分三批：</p>
+<table><thead><tr><th>批</th><th>函数</th><th>内容</th></tr></thead><tbody><tr><td>输入</td><td><code>load_input_weights</code> (233)</td><td>输入卷积</td></tr><tr><td>块</td><td><code>load_block</code> (174)</td><td>36 块的主体权重</td></tr><tr><td>输出</td><td><code>load_output_weights</code> (251)</td><td>输出卷积</td></tr></tbody></table>
+<p>常驻路径由 <code>load_resident_weights</code>（550）一次性载入。权重归一化参数（<code>load_latent_normalization</code>，302）从 JSON 解析（<code>parse_float_array</code>，264）。</p>
+<p><code>vae_prefetch_thread</code>（221）是一个后台预取线程，由 <code>vae_prefetch_enabled</code>（227）控制开关。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_vae.c&amp;s=174&amp;e=302&amp;mode=part" data-f="h3_video_vae.c" data-s="174" data-e="302">h3_video_vae.c<span class="rng">L174-302</span></a>, <a class="src-ref" href="../source.html?f=h3_video_vae.c&amp;s=550&amp;e=571&amp;mode=part" data-f="h3_video_vae.c" data-s="550" data-e="571">h3_video_vae.c<span class="rng">L550-571</span></a></p>
+<h2>编码器侧</h2>
+<p>视觉 VAE <strong>编码器</strong>用于把条件图像/视频压成潜变量，入口是 <code>h3_video_vae_encode</code>（声明在 <code>h3_video_encoder.h</code>）：</p>
+<ul><li>输入：通道优先 RGB <code>[3,T,H,W]</code>，值域 <code>[0,1]</code>，空间轴必须是 16 的倍数</li><li>保持发布的 <strong>256px / 64px 重叠分块</strong></li><li>输出：<code>[24,time,height,width]</code> 归一化 F32</li></ul>
+<p>编码器张量用<strong>通道最后的 <code>[B,T,H,W,C]</code> 存储</strong>；空间 padding 反射像素，时间前向 padding 补零。这两点体现在 <code>h3_gpu_vae_encoder_pad_f32</code> 与 <code>h3_gpu_conv3d_f32</code> 的签名注释里。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_encoder.h&amp;s=8&amp;e=29&amp;mode=part" data-f="h3_video_encoder.h" data-s="8" data-e="29">h3_video_encoder.h<span class="rng">L8-29</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=268&amp;e=292&amp;mode=part" data-f="h3_gpu.h" data-s="268" data-e="292">h3_gpu.h<span class="rng">L268-292</span></a></p>
+<h2>输出</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    int frames, height, width;
+    float *rgb;              /* 帧优先、行优先交错的 RGB F32，值域 [0,1] */
+    h3_gpu_stats gpu_stats;
+} h3_video_frames;</code></pre></div>
+<p><code>h3.c</code> 随后把它转成 RGB24（<code>h3_rgb_f32_to_u8</code>），按需用 vImage 放大到请求的输出尺寸，再交付给 <code>on_frame</code> 与 ffmpeg。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_video_vae.h&amp;s=8&amp;e=15&amp;mode=part" data-f="h3_video_vae.h" data-s="8" data-e="15">h3_video_vae.h<span class="rng">L8-15</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1730&amp;e=1751&amp;mode=part" data-f="h3.c" data-s="1730" data-e="1751">h3.c<span class="rng">L1730-1751</span></a></p></div></body></html>

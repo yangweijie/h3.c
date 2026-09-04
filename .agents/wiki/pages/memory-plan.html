@@ -1,0 +1,87 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>自动内存规划</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>自动内存规划</h1>
+<p><code>h3_memory_plan.c</code>（112 行）是一个<strong>小而关键的决策器</strong>：给定设备的 <code>recommended_working_set</code> 与模型驻留开销，自动决定 SSD 流式、int8、VAE 流式、编码器流式与 DiT 层数。目标是让 16/24 GB 的小内存 Mac <strong>无需手工调参</strong>就能跑起来。</p>
+<p>它的设计精神移植自 ds4/DwarfStar 的 SSD 流式缓存规划器（<code>ds4_ssd_auto_cache_plan</code> / <code>ds4_streaming_manual_cache_safe_bytes</code>）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_memory_plan.h&amp;s=8&amp;e=19&amp;mode=part" data-f="h3_memory_plan.h" data-s="8" data-e="19">h3_memory_plan.h<span class="rng">L8-19</span></a></p>
+<h2>输入与输出</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_memory_plan_auto(const h3_device_info *device,
+                        uint64_t total_weight_bytes,
+                        uint64_t streamed_resident_bytes,
+                        uint64_t activation_bytes,
+                        h3_memory_plan *out);</code></pre></div>
+<table><thead><tr><th>输入</th><th>含义</th></tr></thead><tbody><tr><td><code>total_weight_bytes</code></td><td>五个组件<strong>全驻留</strong>的字节总和</td></tr><tr><td><code>streamed_resident_bytes</code></td><td><strong>施加流式之后</strong>的驻留量：DiT 只留 ~2 块、VAE 解码器只留 ~1 块、编码器逐调用释放（贡献 ~0）</td></tr><tr><td><code>activation_bytes</code></td><td>粗略的峰值激活缓冲（潜变量、VAE 瓦片、PCM）</td></tr><tr><td><code>device</code></td><td>探测到的设备信息</td></tr></tbody></table>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    int ssd_streaming;
+    int use_int8_row_fc2;
+    int dit_layers;              /* 0 表示保持 h3_params 默认 */
+    int video_vae_streaming;
+    int encoder_streaming;
+    uint64_t cache_budget_bytes;
+    char reason[256];
+} h3_memory_plan;</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_memory_plan.h&amp;s=21&amp;e=62&amp;mode=part" data-f="h3_memory_plan.h" data-s="21" data-e="62">h3_memory_plan.h<span class="rng">L21-62</span></a></p>
+<h2>决策逻辑</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;steady = total + activation&lt;br/&gt;target = recommended × 80%&quot;] --&gt; B{&quot;steady ≤ target ?&quot;}
+    B --&gt;|是| C[&quot;全驻留：不流式、不 int8、保持默认层数&quot;]
+    B --&gt;|否| D[&quot;开启 SSD 流式 + VAE 流式 + 编码器流式&lt;br/&gt;建议 int8&quot;]
+    D --&gt; E[&quot;用 streamed_resident + activation 重算&quot;]
+    E --&gt; F{&quot;剩余 &lt; 4 GiB ?&quot;}
+    F --&gt;|是| G[&quot;dit_layers → H3_MIN_DIT_LAYERS (35)&quot;]
+    F --&gt;|否| H[&quot;保持默认层数，计算缓存预算&quot;]</pre>
+<p><strong>关键设计点</strong>：第二个分支用的是 <code>streamed_resident_bytes</code> 而<strong>不是</strong> <code>total_weight_bytes</code>。注释解释得很直接：</p>
+<blockquote>因此规划器不会长期高估内存：流式下 DiT 只驻留 2 个块、VAE 解码器只驻留 1 个块、编码器逐调用释放。</blockquote>
+<p>早期版本用全量估算，会导致几乎所有机器都被判为&quot;必须流式&quot;。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_memory_plan.c&amp;s=39&amp;e=93&amp;mode=part" data-f="h3_memory_plan.c" data-s="39" data-e="93">h3_memory_plan.c<span class="rng">L39-93</span></a></p>
+<h2>int8 与流式解耦</h2>
+<p>注释里明确说明这是一个<strong>有意的改变</strong>：</p>
+<blockquote>int8 与 ssd_streaming 不再互斥：两者是正交的（流式 = 权重住哪，int8 = 权重怎么压），镜像 ds4 的解耦路由 / expert 缓存设计。</blockquote>
+<p>因此在流式分支里 <code>use_int8_row_fc2</code> 也被置 1（由调用方检查 <code>metal4</code>）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_memory_plan.h&amp;s=21&amp;e=29&amp;mode=part" data-f="h3_memory_plan.h" data-s="21" data-e="29">h3_memory_plan.h<span class="rng">L21-29</span></a>, <a class="src-ref" href="../source.html?f=h3_memory_plan.c&amp;s=63&amp;e=66&amp;mode=part" data-f="h3_memory_plan.c" data-s="63" data-e="66">h3_memory_plan.c<span class="rng">L63-66</span></a></p>
+<h2>缓存预算</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">uint64_t h3_memory_cache_budget_bytes(const h3_device_info *device,
+                                      uint64_t steady_state_bytes);</code></pre></div>
+<p>规则（镜像 ds4 的 <code>ds4_streaming_manual_cache_safe_bytes</code>）：</p>
+<ul><li>目标 = <code>recommended_working_set × 7/8</code></li><li>减去稳态（模型 + 激活）开销</li><li>向下对齐到 GiB</li><li>若结果非零但不足 1 GiB，取 1 GiB</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_memory_plan.c&amp;s=97&amp;e=112&amp;mode=part" data-f="h3_memory_plan.c" data-s="97" data-e="112">h3_memory_plan.c<span class="rng">L97-112</span></a></p>
+<h2>调用方如何估算输入</h2>
+<p><code>h3_generate</code> 里的估算是<strong>近似的但方向保守</strong>：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">uint64_t activation = (uint64_t)eff.width * eff.height * eff.frames / 16 / 16 * 56 * 4
+                    + 1024ull * 1024 * 1024;    /* 1 GiB 余量 */
+
+const uint64_t dit_resident  = 2 * (dit_blocks / H3_DEFAULT_DIT_LAYERS);
+const uint64_t vae_resident  = ctx-&gt;model.video_vae.bytes / H3_VIDEO_VAE_LAYERS;
+const uint64_t streamed_resident = dit_resident + vae_resident;
+/* text_encoder 与 audio_vae 逐调用释放，贡献 0 */</code></pre></div>
+<p>注意 <code>H3_VIDEO_VAE_LAYERS</code> <strong>必须</strong>从 <code>h3_video_vae.h</code> 引入而不是硬编码——这是 AGENTS.md 特别强调的点，硬编码会随真实块数静默漂移。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=896&amp;e=915&amp;mode=part" data-f="h3.c" data-s="896" data-e="915">h3.c<span class="rng">L896-915</span></a>, <a class="src-ref" href="../source.html?f=h3_video_vae.h&amp;s=20&amp;e=24&amp;mode=part" data-f="h3_video_vae.h" data-s="20" data-e="24">h3_video_vae.h<span class="rng">L20-24</span></a></p>
+<h2>触发条件</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">if (eff.memory_plan_auto &amp;&amp;
+    eff.ssd_streaming == 0 &amp;&amp; eff.use_int8_row_fc2 == 0) { ... }</code></pre></div>
+<p><strong>任何显式的 <code>ssd_streaming</code> 或 <code>use_int8_row_fc2</code> 设置都会禁用自动规划。</strong> 规划结果被写进 <code>eff</code>（<code>h3_params</code> 的一份副本），原始 <code>params</code> 不被修改。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=886&amp;e=927&amp;mode=part" data-f="h3.c" data-s="886" data-e="927">h3.c<span class="rng">L886-927</span></a></p>
+<h2>可观测性</h2>
+<p>规划器会输出一行人类可读的理由，打印到 stderr：</p>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>h3: auto memory plan: model 62.3 GiB + activations 3.1 GiB fit in 78.4 GiB working set; full resident</code></pre></div>
+<p>或：</p>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>h3: auto memory plan: model 62.3 GiB exceeds 51.2 GiB working set; after streaming
+    4.2 GiB remain, SSD+VAE+encoder streaming on, int8 on, cache 12.0 GiB</code></pre></div>
+<p>交互会话里用 <code>!memory-plan</code> 查看，用 <code>!memory-plan off</code> 关闭。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=924&amp;e=924&amp;mode=part" data-f="h3.c" data-s="924" data-e="924">h3.c<span class="rng">L924</span></a>, <a class="src-ref" href="../source.html?f=h3_cli.c&amp;s=189&amp;e=190&amp;mode=part" data-f="h3_cli.c" data-s="189" data-e="190">h3_cli.c<span class="rng">L189-190</span></a></p>
+<h2>规划是建议性的</h2>
+<p>头部注释明确：</p>
+<blockquote>该规划是建议性的：调用方可以通过在 <code>generate()</code> 之前显式设置相应的 <code>h3_params</code> 条目来覆盖任何字段。</blockquote>
+<p>这也是为什么它只写进那份 <code>eff</code> 副本——既不污染调用方的结构，也不越过用户的显式意图。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_memory_plan.h&amp;s=16&amp;e=19&amp;mode=part" data-f="h3_memory_plan.h" data-s="16" data-e="19">h3_memory_plan.h<span class="rng">L16-19</span></a></p></div></body></html>

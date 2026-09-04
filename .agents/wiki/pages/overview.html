@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh" data-theme="dark"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>项目总览 (Overview)</title>
+<title>项目总览与架构</title>
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
 <link rel="stylesheet" href="../style/wiki.css">
 <link rel="stylesheet" href="../style/hljs.css">
@@ -11,10 +11,62 @@
 <script src="../script/source-viewer.js"></script>
 <script src="../script/mermaid.min.js"></script>
 <script src="../script/wiki.js" defer></script>
-</head><body><div class="wrap"><h1>项目总览 (Overview)</h1>
-<p><code>h3-metal</code> 是一个面向 Apple Silicon 的原生视频/音频生成推理引擎，用于运行 MiniMax-H3（H3）系列扩散模型。它以纯 C（核心）与 Objective-C（Metal 后端）实现，无 Python 依赖，通过 Metal Performance Shaders（MPS）在 GPU 上执行所有权重计算，并通过 FFmpeg 处理媒体读写。</p>
-<p>仓库根目录为 C 源码所在位置（<code>h3.c</code> 文件夹），主要源文件包括：</p>
-<ul><li>公共 API 与编排：<code>h3.c</code>、<code>h3.h</code>、<code>h3_internal.h</code>、<code>h3_cli.c</code>、<code>main.c</code>、<code>h3_terminal.c</code></li><li>设备/权重层：<code>h3_gpu.h</code>（C 声明）、<code>h3_gpu.m</code> / <code>h3_metal.h</code> / <code>h3_metal.m</code>（Metal 实现）、<code>h3_safetensors.c</code>、<code>h3_weights.c</code></li><li>文本/多模态：<code>h3_tokenizer.m</code>、<code>h3_text_encoder.c</code>、<code>h3_vision_encoder.c</code>、<code>h3_multimodal.c</code></li><li>扩散主干：<code>h3_dit.c</code>、<code>h3_dit_schedule.c</code></li><li>VAE 与媒体：<code>h3_video_vae.c</code>、<code>h3_video_encoder.c</code>、<code>h3_audio_vae.c</code>、<code>h3_ffmpeg.c</code></li><li>终端交互：<code>linenoise.c</code>（第三方行编辑库）</li></ul>
-<p>引擎支持两种 Transformer 装配：<code>FL2VA</code>（文本到视频/音频）与 <code>Ref2VA</code>（带图像/视频/音频参考的参考到视频）。模型权重以 safetensors 分片形式提供，引擎在加载时仅映射元数据、按需流式读取张量到共享 Metal 缓冲区。</p>
-<p>版本宏位于 <code>h3.h</code>：<code>H3_VERSION &quot;0.1.0-dev&quot;</code>；默认画布 864×480、56 帧、20 步去噪、50 个 DiT 层（<code>H3_DEFAULT_*</code>、<code>H3_MIN_DIT_LAYERS=35</code>）。</p>
-<p>详细架构见 <code>系统架构</code>，构建与运行见 <code>构建与运行</code>。</p></div></body></html>
+</head><body><div class="wrap"><h1>h3-metal 项目总览</h1>
+<p><code>h3.c</code> 是一个 <strong>纯 C / Objective-C 实现的 MiniMax-H3 本地推理引擎</strong>，仅面向 macOS / Apple Silicon。它在 Metal 上重新实现了 H3 的 FL2VA（文生视频+音频）与 Ref2VA（参考生视频+音频）扩散流水线，<strong>不依赖 Python、torch 或任何外部 ML 运行时</strong>。CLI 可执行文件是 <code>h3</code>，可嵌入的静态库是 <code>libh3.a</code>。</p>
+<h2>一句话架构</h2>
+<p>C 负责编排，Objective-C 负责 Metal 后端。跨模块数据类型集中在 <code>h3_internal.h</code>，对外只暴露 <code>h3.h</code>。</p>
+<pre class="mermaid">flowchart TB
+    subgraph C[&quot;C 层（纯 C11 编排）&quot;]
+        A[&quot;h3.c&lt;br/&gt;公共 API / 生成编排&quot;]
+        B[&quot;h3_host.c&lt;br/&gt;布局 / 调度 / RNG&quot;]
+        C1[&quot;h3_dit.c&lt;br/&gt;50 块 DiT&quot;]
+        D[&quot;h3_dit_schedule.c&lt;br/&gt;AdaLN 预计算&quot;]
+        E[&quot;h3_text_encoder.c&lt;br/&gt;Qwen3-VL&quot;]
+        F[&quot;h3_video_vae.c&lt;br/&gt;视频 VAE&quot;]
+        G[&quot;h3_audio_vae.c&lt;br/&gt;BigVGAN&quot;]
+        H[&quot;h3_ffmpeg.c&lt;br/&gt;封装 / 超分&quot;]
+    end
+    subgraph M[&quot;Objective-C 层（Metal 后端）&quot;]
+        I[&quot;h3_gpu.m&lt;br/&gt;设备 / 张量 / 命令队列&quot;]
+        J[&quot;h3_metal.m&lt;br/&gt;设备探测&quot;]
+        K[&quot;h3_tokenizer.m&lt;br/&gt;BPE 分词&quot;]
+    end
+    S[&quot;h3_shaders.metal&lt;br/&gt;内联 Metal 内核&quot;]
+    A --&gt; B &amp; C1 &amp; E &amp; F &amp; G &amp; H
+    C1 --&gt; D
+    A --&gt; I
+    I --&gt; S
+    J --&gt; A</pre>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_internal.h&amp;s=12&amp;e=34&amp;mode=part" data-f="h3_internal.h" data-s="12" data-e="34">h3_internal.h<span class="rng">L12-34</span></a>, <a class="src-ref" href="../source.html?f=h3.h&amp;s=1&amp;e=30&amp;mode=part" data-f="h3.h" data-s="1" data-e="30">h3.h<span class="rng">L1-30</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=11&amp;e=16&amp;mode=part" data-f="Makefile" data-s="11" data-e="16">Makefile<span class="rng">L11-16</span></a></p>
+<h2>关键事实</h2>
+<table><thead><tr><th>维度</th><th>值</th><th>来源</th></tr></thead><tbody><tr><td>版本</td><td><code>0.1.0-dev</code></td><td><code>H3_VERSION</code></td></tr><tr><td>默认画布</td><td>864x480，56 帧，24 fps</td><td><code>H3_DEFAULT_*</code></td></tr><tr><td>画布约束</td><td>宽高均为 32 的倍数，乘积 ≤ <code>768*1344</code></td><td><code>H3_CANVAS_MULTIPLE</code> / <code>H3_MAX_PIXELS</code></td></tr><tr><td>帧对齐</td><td>向上对齐到 <code>5 + 17*n</code>（22..362）</td><td><code>h3_align_frame_count</code></td></tr><tr><td>DiT 规模</td><td>50 块，HIDDEN=5376，HEADS=56，MLP=14336</td><td><code>h3_dit.c</code> 枚举 / <code>h3_dit_schedule.h</code></td></tr><tr><td>潜变量</td><td>视频 24 通道（空间比 16），音频 32 通道 x 2 立体声</td><td><code>H3_VAE_SPATIAL_RATIO</code> / <code>h3_audio_vae.h</code></td></tr><tr><td>音频</td><td>32 kHz 立体声，音频潜变量 40 fps</td><td><code>H3_AUDIO_LATENT_FPS</code></td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.h&amp;s=12&amp;e=18&amp;mode=part" data-f="h3.h" data-s="12" data-e="18">h3.h<span class="rng">L12-18</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=7&amp;e=14&amp;mode=part" data-f="h3_host.h" data-s="7" data-e="14">h3_host.h<span class="rng">L7-14</span></a>, <a class="src-ref" href="../source.html?f=h3_dit_schedule.h&amp;s=11&amp;e=15&amp;mode=part" data-f="h3_dit_schedule.h" data-s="11" data-e="15">h3_dit_schedule.h<span class="rng">L11-15</span></a></p>
+<h2>两条并行的权重大流</h2>
+<p>引擎同时消费两组权重，它们在时间上<strong>从不需要共存</strong>：</p>
+<ol><li><strong>文本 / 视觉编码器流</strong>：Qwen3-VL 前 50 层 + 视觉塔，负责把 prompt 与参考图像/视频/音频编码为 BF16 条件嵌入。Ref2VA 复用同一套。</li><li><strong>DiT + VAE 流</strong>：33B DiT 变换器、视频 VAE（36 块解码器）、音频 VAE（BigVGAN）。</li></ol>
+<p><code>h3.c</code> 按阶段分别加载与释放，因此 33B 变换器、Qwen 编码器和两个解码器<strong>永远不必同时驻留统一内存</strong>——这是本机可运行的根本原因。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=408&amp;e=484&amp;mode=part" data-f="h3.c" data-s="408" data-e="484">h3.c<span class="rng">L408-484</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1628&amp;e=1633&amp;mode=part" data-f="h3.c" data-s="1628" data-e="1633">h3.c<span class="rng">L1628-1633</span></a></p>
+<h2>两条生成路径</h2>
+<table><thead><tr><th>路径</th><th>触发条件</th><th>检查点</th><th>说明</th></tr></thead><tbody><tr><td><strong>FL2VA</strong></td><td>纯文本，或 <code>--first-frame</code> / <code>--last-frame</code> 锚点</td><td><code>FL2VA/transformer</code></td><td>首帧拉伸到目标画布，末帧按 aspect-cover 居中裁剪</td></tr><tr><td><strong>Ref2VA</strong></td><td>存在有序参考（<code>--ref-image</code> / <code>--ref-video</code> / <code>--ref-audio</code>）</td><td><code>Ref2VA/transformer</code></td><td>保留 <code>&lt;Picture N&gt;</code> / <code>&lt;Video N&gt;</code> 有序呈现，参考画布只缩不放</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=938&amp;e=942&amp;mode=part" data-f="h3.c" data-s="938" data-e="942">h3.c<span class="rng">L938-942</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=993&amp;e=1002&amp;mode=part" data-f="h3.c" data-s="993" data-e="1002">h3.c<span class="rng">L993-1002</span></a></p>
+<h2>上下文对象</h2>
+<p><code>h3_ctx</code> 是整个引擎的唯一句柄，持有模型目录、设备信息、模型清单，以及交互会话的三层缓存（条件、准备好的 DiT、视频解码器）：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">struct h3_ctx {
+    char *model_dir;
+    char error[512];
+    h3_device_info device;
+    h3_model_info model;
+    int cache_enabled;
+    /* 条件缓存：BF16 值 + 标签 + 视觉/音频条件行 */
+    char *conditioning_key;
+    uint16_t *conditioning_values;
+    /* 准备好的 DiT 与视频解码器缓存 */
+    char *dit_key;              struct h3_dit *dit;
+    char *video_decoder_key;    struct h3_video_vae_decoder *video_decoder;
+};</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_internal.h&amp;s=12&amp;e=34&amp;mode=part" data-f="h3_internal.h" data-s="12" data-e="34">h3_internal.h<span class="rng">L12-34</span></a></p>
+<h2>推荐阅读顺序</h2>
+<ol><li><a href="../pages/build-and-run.html">构建与运行</a> —— 先把二进制跑起来</li><li><a href="../pages/pipeline-overview.html">六阶段流水线</a> —— 理解一次生成的全貌</li><li><a href="../pages/public-api.html">公共 API（h3.h）</a> —— 参数与回调契约</li><li><a href="../pages/model-loading.html">模型加载与检查点布局</a> —— 权重从哪来</li><li><a href="../pages/dit-denoise.html">DiT 去噪与采样器</a> —— 最耗时的核心</li><li><a href="../pages/gpu-abstraction.html">GPU 抽象层（h3_gpu）</a> / <a href="../pages/metal-shaders.html">Metal 内核库</a> —— 底层是怎么算的</li><li><a href="../pages/memory-plan.html">自动内存规划</a> / <a href="../pages/ssd-streaming.html">SSD 流式权重</a> —— 为什么小内存机器也能跑</li><li><a href="../pages/profiling.html">性能分析与诊断开关</a> —— 如何做 A/B 与回归定位</li></ol>
+<h2>文档之外的权威来源</h2>
+<p>仓库根目录的 <code>README.md</code>（878 行）是<strong>教程与实测数据</strong>的一手来源：预设档位、分辨率/时长表、每项融合优化的实测收益与对应的 <code>--use-slower-*</code> 回退开关都在那里。<code>AGENTS.md</code> 则是构建注意事项与架构速览。本 Wiki 是对源码结构的补充，不是它们的替代品。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=1&amp;e=11&amp;mode=part" data-f="README.md" data-s="1" data-e="11">README.md<span class="rng">L1-11</span></a>, <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=1&amp;e=12&amp;mode=part" data-f="AGENTS.md" data-s="1" data-e="12">AGENTS.md<span class="rng">L1-12</span></a></p></div></body></html>

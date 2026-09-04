@@ -1,0 +1,81 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>代码约定与扩展指南</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>代码约定与扩展指南</h1>
+<h2>语言与编译</h2>
+<ul><li><strong>严格 C11</strong>：<code>-std=c11 -O3 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE</code></li><li><code>.m</code> 文件用 <code>-fobjc-arc</code></li><li><code>linenoise.c</code> 是 vendored 的，<strong>豁免</strong> <code>-Wconversion</code>（Makefile 里单独加 <code>-Wno-conversion -Wno-variadic-macro-arguments-omitted</code>）</li></ul>
+<p>只有三个文件是 Objective-C：<code>h3_metal.m</code>、<code>h3_gpu.m</code>、<code>h3_tokenizer.m</code>。其余全是 C。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=1&amp;e=9&amp;mode=part" data-f="Makefile" data-s="1" data-e="9">Makefile<span class="rng">L1-9</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=219&amp;e=221&amp;mode=part" data-f="Makefile" data-s="219" data-e="221">Makefile<span class="rng">L219-221</span></a></p>
+<h2>源文件登记</h2>
+<p><strong>所有库源文件必须列进 <code>LIB_C</code> 或 <code>LIB_M</code>。</strong> 只被 <code>#include</code> 而不登记的源文件会在链接期报 <code>Undefined symbols</code>——<code>h3_memory_plan.c</code> 就是这样被漏掉的。</p>
+<p>新增一个 <code>.c</code> 文件到库里：</p>
+<ol><li>写 <code>h3_&lt;模块&gt;.c</code> / <code>h3_&lt;模块&gt;.h</code></li><li>加进 <code>LIB_C</code></li><li><code>make clean &amp;&amp; make</code>（<code>.d</code> 依赖文件需要重建）</li></ol>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=11&amp;e=16&amp;mode=part" data-f="Makefile" data-s="11" data-e="16">Makefile<span class="rng">L11-16</span></a>, <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=20&amp;e=22&amp;mode=part" data-f="AGENTS.md" data-s="20" data-e="22">AGENTS.md<span class="rng">L20-22</span></a></p>
+<h2>命名</h2>
+<table><thead><tr><th>元素</th><th>约定</th><th>例</th></tr></thead><tbody><tr><td>公共 API</td><td><code>h3_&lt;名词&gt;_&lt;动词&gt;</code></td><td><code>h3_load_dir</code>、<code>h3_generate</code></td></tr><tr><td>内部模块 API</td><td><code>h3_&lt;模块&gt;_&lt;动作&gt;</code></td><td><code>h3_video_vae_decode</code>、<code>h3_dit_schedule_precompute</code></td></tr><tr><td>GPU 算子</td><td><code>h3_gpu_&lt;算子&gt;_&lt;dtype&gt;</code></td><td><code>h3_gpu_linear_bf16</code>、<code>h3_gpu_adaln_f32</code></td></tr><tr><td>Metal 内核</td><td><code>h3_&lt;算子&gt;_&lt;dtype&gt;[_&lt;特化&gt;]</code></td><td><code>h3_qkv_project_split_int8_rope_nax_r128_k5376_morton4</code></td></tr><tr><td>类型</td><td><code>h3_&lt;名词&gt;[_kind]</code></td><td><code>h3_layout</code>、<code>h3_segment_kind</code></td></tr><tr><td>文件内静态</td><td>无前缀</td><td><code>fail</code>、<code>gpu_op</code>、<code>load_block</code></td></tr></tbody></table>
+<h2>错误处理</h2>
+<p><strong>没有异常，没有 errno，统一用「返回 0/NULL + 写错误缓冲」</strong>：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int some_operation(..., char *error, size_t error_size);</code></pre></div>
+<p>几乎每个模块都有一个本地 <code>fail()</code> 辅助（如 <code>h3_dit.c:223</code>、<code>h3_video_vae.c:107</code>、<code>h3_audio_vae.c:70</code>），它只是 <code>vsnprintf</code> 的 <code>format</code> 包装：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">static void fail(char *error, size_t error_size, const char *format, ...)
+    __attribute__((format(printf, 3, 4)));</code></pre></div>
+<p>上下文级错误用 <code>h3_set_error(ctx, format, ...)</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_internal.h&amp;s=36&amp;e=37&amp;mode=part" data-f="h3_internal.h" data-s="36" data-e="37">h3_internal.h<span class="rng">L36-37</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=223&amp;e=230&amp;mode=part" data-f="h3_dit.c" data-s="223" data-e="230">h3_dit.c<span class="rng">L223-230</span></a></p>
+<h2>资源释放：单一出口</h2>
+<p>大型函数（尤其 <code>h3_generate</code>）用<strong>入口初始化 + 单一 <code>cleanup:</code> 出口</strong>的写法：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">h3_result *result = NULL;
+float *video = NULL, *audio = NULL;
+/* 所有指针/标志在声明处初始化 */
+
+/* ... 任何失败都 goto cleanup ... */
+
+cleanup:
+    free(video); free(audio);
+    return result;</code></pre></div>
+<p>缓存存活靠标志排除：<code>if (!dit_is_cached) h3_dit_free(dit);</code></p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=947&amp;e=992&amp;mode=part" data-f="h3.c" data-s="947" data-e="992">h3.c<span class="rng">L947-992</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1789&amp;e=1824&amp;mode=part" data-f="h3.c" data-s="1789" data-e="1824">h3.c<span class="rng">L1789-1824</span></a></p>
+<h2>所有权</h2>
+<p>每个返回指针的 API 都在头文件注释里写明归属：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">/* The caller owns *ids and releases it with h3_tokenizer_ids_free(). */
+int h3_tokenizer_encode(..., uint32_t **ids, ...);
+
+/* The caller owns *output. */
+int h3_resize_rgb24_high_quality(..., uint8_t **output);</code></pre></div>
+<p><strong>新 API 必须遵守这个约定并写明。</strong></p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_tokenizer.h&amp;s=15&amp;e=19&amp;mode=part" data-f="h3_tokenizer.h" data-s="15" data-e="19">h3_tokenizer.h<span class="rng">L15-19</span></a>, <a class="src-ref" href="../source.html?f=h3_host.h&amp;s=128&amp;e=134&amp;mode=part" data-f="h3_host.h" data-s="128" data-e="134">h3_host.h<span class="rng">L128-134</span></a></p>
+<h2>重复常量的同步义务</h2>
+<p>以下常量<strong>有意在两处定义，改动必须同步</strong>：</p>
+<table><thead><tr><th>常量</th><th>位置</th></tr></thead><tbody><tr><td><code>HIDDEN=5376</code> / <code>HEADS=56</code> / <code>HEAD_DIM=96</code> / <code>MLP=21504</code> / <code>H3_DIT_BLOCKS=50</code></td><td><code>h3_dit.h</code> 与 <code>h3_dit_schedule.h</code></td></tr><tr><td><code>H3_DIT_HIDDEN</code> / <code>H3_DIT_TIME_DIM</code> / <code>H3_DIT_MODALITIES</code> / <code>H3_DIT_ADALN_SLOTS</code></td><td><code>h3_dit_schedule.h</code>（与 <code>h3_dit.c</code> 的枚举对应）</td></tr></tbody></table>
+<p><code>H3_VIDEO_VAE_LAYERS</code> 则<strong>必须</strong>从 <code>h3_video_vae.h</code> 引入，<strong>绝不硬编码</strong>——内存规划器依赖它，硬编码会随真实块数静默漂移。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=62&amp;e=64&amp;mode=part" data-f="AGENTS.md" data-s="62" data-e="64">AGENTS.md<span class="rng">L62-64</span></a>, <a class="src-ref" href="../source.html?f=h3_video_vae.h&amp;s=20&amp;e=24&amp;mode=part" data-f="h3_video_vae.h" data-s="20" data-e="24">h3_video_vae.h<span class="rng">L20-24</span></a></p>
+<h2>保持同步的成对代码</h2>
+<table><thead><tr><th>成对</th><th>约束</th></tr></thead><tbody><tr><td><code>run_resident_tile</code> / <code>run_stream_tile</code></td><td>都对 <code>vae-&gt;streaming</code> 分叉</td></tr><tr><td><code>decoder_decode_chunk</code> / <code>decode_chunked</code></td><td><strong>两个解码入口都必须对流式标志分叉</strong></td></tr><tr><td><code>h3_qkv_rope_bf16</code> / <code>h3_gpu_grouped_qkv_rope_bf16</code></td><td>前者 <code>[q/k/v,head,dim]</code>，后者 H3 的 <code>[head,q/k/v,dim]</code></td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=44&amp;e=48&amp;mode=part" data-f="AGENTS.md" data-s="44" data-e="48">AGENTS.md<span class="rng">L44-48</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=454&amp;e=465&amp;mode=part" data-f="h3_gpu.h" data-s="454" data-e="465">h3_gpu.h<span class="rng">L454-465</span></a></p>
+<h2>融合优化的义务</h2>
+<p><strong>每一项融合/特化都必须配一个回退开关</strong>，形式二选一：</p>
+<ul><li>CLI：<code>--use-slower-&lt;对象&gt;</code></li><li>环境：<code>H3_DISABLE_FUSED_&lt;名称&gt;=1</code> / <code>H3_DISABLE_&lt;名称&gt;=1</code></li></ul>
+<p>理由写在 README 里：这些开关不只是用户选项，更是<strong>同一进程内做精确 A/B 的唯一手段</strong>。新增融合时若没有回退路径，回归就无法定位。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=502&amp;e=519&amp;mode=part" data-f="README.md" data-s="502" data-e="519">README.md<span class="rng">L502-519</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=786&amp;e=874&amp;mode=part" data-f="README.md" data-s="786" data-e="874">README.md<span class="rng">L786-874</span></a></p>
+<h2>禁止引入的东西</h2>
+<ul><li><strong>不要引入 Python 或外部 ML 运行时</strong>。项目的价值在于自包含的本机引擎。</li><li>不要依赖 Xcode 的可选离线 Metal 工具链（Metal 源码在运行时编译）。</li><li>不要引入第三方分词/JSON/媒体库（Foundation 与 ffmpeg 子进程已足够）。</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=50&amp;e=52&amp;mode=part" data-f="AGENTS.md" data-s="50" data-e="52">AGENTS.md<span class="rng">L50-52</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=459&amp;e=467&amp;mode=part" data-f="README.md" data-s="459" data-e="467">README.md<span class="rng">L459-467</span></a></p>
+<h2>添加一个新算子的路径</h2>
+<pre class="mermaid">flowchart LR
+    A[&quot;h3_gpu.h 声明&lt;br/&gt;int h3_gpu_xxx_bf16(...)&quot;]
+    --&gt; B[&quot;h3_shaders.metal 内核&lt;br/&gt;kernel void h3_xxx_bf16(...)&quot;]
+    B --&gt; C[&quot;h3_gpu.m 实现&lt;br/&gt;编码到当前命令缓冲&quot;]
+    C --&gt; D[&quot;调用方（h3_dit.c 等）&quot;]
+    D --&gt; E[&quot;如需：加 --use-slower / H3_DISABLE 回退&quot;]</pre>
+<h2>添加一个新测试</h2>
+<ol><li>在 <code>tests/</code> 下新建 <code>test_&lt;用途&gt;.c</code>，独立 <code>main()</code></li><li>需要真实权重的用 <code>test_real_</code> 前缀</li><li>在 <code>Makefile</code> 里加链接规则</li><li>若应纳入 <code>make test</code>，用 <code>test -f &lt;fixture&gt;</code> 包一层并打印 <code>skip:</code> 提示</li><li><strong>不要</strong>把测试塞进库</li></ol>
+<p>Sources: <a class="src-ref" href="../source.html?f=AGENTS.md&amp;s=48&amp;e=50&amp;mode=part" data-f="AGENTS.md" data-s="48" data-e="50">AGENTS.md<span class="rng">L48-50</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=36&amp;e=196&amp;mode=part" data-f="Makefile" data-s="36" data-e="196">Makefile<span class="rng">L36-196</span></a></p></div></body></html>

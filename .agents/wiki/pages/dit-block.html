@@ -1,0 +1,75 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DiT 块执行流程</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>DiT 块执行流程</h1>
+<p><code>h3_dit.c</code> 的 <code>run_block</code>（2420）是单个 DiT 块的执行体。整个文件 3775 行，其中大量篇幅服务于「如何在不改变输出字节的前提下少做一次 dispatch、少读一次全局内存」。</p>
+<h2>一个块的权重</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">typedef struct {
+    h3_gpu_tensor *norm1, *norm2;
+    h3_gpu_tensor *qkv, *qkv_int8, *qkv_scales;
+    h3_gpu_tensor *q_norm, *k_norm;
+    h3_gpu_tensor *out, *out_int8, *out_scales;
+    h3_gpu_tensor *fc1, *fc2, *fc1_int8, *fc1_scales, *fc2_int8, *fc2_scales;
+} h3_dit_block;</code></pre></div>
+<p>BF16 与 int8 两套并存。正常 int8 加载会在量化提交完成后<strong>释放该块的 BF16 FC1/FC2 缓冲</strong>——这是 int8 路径把峰值张量存储从 36.4 GiB 降到 25.9 GiB 的机制。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=41&amp;e=58&amp;mode=part" data-f="h3_dit.c" data-s="41" data-e="58">h3_dit.c<span class="rng">L41-58</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=780&amp;e=784&amp;mode=part" data-f="README.md" data-s="780" data-e="784">README.md<span class="rng">L780-784</span></a></p>
+<h2>标准块流程</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;隐藏状态（打包）&quot;] --&gt; B[&quot;AdaLN 调制 norm1&quot;]
+    B --&gt; C[&quot;QKV 投影&quot;]
+    C --&gt; D[&quot;Q/K RMS norm + RoPE&quot;]
+    D --&gt; E[&quot;SDPA&quot;]
+    E --&gt; F[&quot;注意力输出投影&quot;]
+    F --&gt; G[&quot;门控：residual += gate · branch&quot;]
+    G --&gt; H[&quot;AdaLN 调制 norm2（MLP 输入）&quot;]
+    H --&gt; I[&quot;FC1 → SwiGLU → FC2&quot;]
+    I --&gt; J[&quot;门控：residual += gate · branch&quot;]
+    J --&gt; K[&quot;下一块&quot;]</pre>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=2420&amp;e=2598&amp;mode=part" data-f="h3_dit.c" data-s="2420" data-e="2598">h3_dit.c<span class="rng">L2420-2598</span></a></p>
+<h2>三类融合</h2>
+<p>融合的<strong>统一原则</strong>：被舍入的 BF16 残差仍然精确写出，但同一行保留在 threadgroup 内存里供归一化复用，从而消掉一次 dispatch 与一次全局回读。</p>
+<h3>1. 门控 AdaLN 融合</h3>
+<p>每个活跃块把<strong>注意力残差门控</strong>与<strong>紧随其后的 MLP AdaLN</strong> 融合。<code>h3_gpu_gate_adaln_bf16</code> 一次完成两件事。</p>
+<p>回退开关：<code>H3_DISABLE_FUSED_GATE_ADALN=1</code></p>
+<h3>2. 跨块 AdaLN</h3>
+<p>在 <strong>token 缩减边界之外</strong>，MLP 残差门控还会产出<strong>下一块的注意力 AdaLN</strong>，并把归一化后的状态带过循环。</p>
+<p>回退开关：<code>H3_DISABLE_FUSED_CROSS_BLOCK_ADALN=1</code></p>
+<h3>3. 最终切片与最终头</h3>
+<ul><li>最终音频/视频 AdaLN 内核<strong>直接绑定到残差流的偏移量</strong>上，省掉两次切片 blit 与 512×512 下 18.8 MiB（864 类几何下 29.4 MiB）的暂存。</li></ul>
+<p>  回退：<code>H3_DISABLE_FUSED_FINAL_SLICE=1</code></p>
+<ul><li>BF16 最终头在加载 16×16 投影瓦片时<strong>顺带施加 AdaLN</strong>，保留独立的舍入与累加顺序。</li></ul>
+<p>  回退：<code>H3_DISABLE_FUSED_FINAL_HEAD=1</code></p>
+<p>两项合计省下 37.5 / 58.9 MiB。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=502&amp;e=519&amp;mode=part" data-f="README.md" data-s="502" data-e="519">README.md<span class="rng">L502-519</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=420&amp;e=444&amp;mode=part" data-f="h3_gpu.h" data-s="420" data-e="444">h3_gpu.h<span class="rng">L420-444</span></a></p>
+<h2>MLP 的两条路</h2>
+<table><thead><tr><th>路径</th><th>条件</th><th>入口</th></tr></thead><tbody><tr><td>融合 BF16 图</td><td>默认 <code>H3_DISABLE_FUSED_MLP≠1</code></td><td>把 <code>fc1 → SwiGLU → fc2</code> 作为<strong>一张缓存图</strong>求值</td></tr><tr><td>分离操作</td><td><code>H3_DISABLE_FUSED_MLP=1</code></td><td>保留近参考的操作边界，用于数值诊断</td></tr></tbody></table>
+<p>融合路径避免独立的图边界与持久的中间张量。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=767&amp;e=770&amp;mode=part" data-f="README.md" data-s="767" data-e="770">README.md<span class="rng">L767-770</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=301&amp;e=315&amp;mode=part" data-f="h3_gpu.h" data-s="301" data-e="315">h3_gpu.h<span class="rng">L301-315</span></a></p>
+<h2>int8 路径的融合</h2>
+<p>在 M5 int8 路径上，还有一串更细的融合（每项都有对应的 <code>--use-slower-*</code> 回退）：</p>
+<table><thead><tr><th>融合</th><th>效果</th><th>回退开关</th></tr></thead><tbody><tr><td>QKV / MLP 激活量化折进前一个门控 AdaLN 内核</td><td>每次 50 层 forward 减少 99 次独立量化 dispatch</td><td><code>--use-slower-unfused-int8-inputs</code></td></tr><tr><td>Q/K RMS norm + RoPE 折进 int8 QKV 投影瓦片</td><td>字节一致，512 提升 2.1–3.2%</td><td><code>--use-slower-unfused-qkv-rope</code></td></tr><tr><td>SDPA 保留 <code>[head,row,dim]</code> 原生序，直投 int8 行主序</td><td>消掉全宽 BF16 转置</td><td><code>--use-slower-row-major-attention-output</code></td></tr><tr><td>int8 注意力输出投影缓存 128 行/列 scale 到 1 KiB threadgroup</td><td>512/864 提升 0.2–0.7%</td><td><code>--use-slower-uncached-int8-scales</code></td></tr><tr><td>FC1 用编译期 5376 宽的 TensorOps 循环</td><td>提升 0.1–0.4%</td><td><code>--use-slower-dynamic-fc1-k</code></td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=786&amp;e=856&amp;mode=part" data-f="README.md" data-s="786" data-e="856">README.md<span class="rng">L786-856</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=484&amp;e=504&amp;mode=part" data-f="h3_gpu.h" data-s="484" data-e="504">h3_gpu.h<span class="rng">L484-504</span></a></p>
+<h2>专门化的投影内核</h2>
+<h3>窄输出头</h3>
+<p>DiT 的音频/视频输出头很窄。它们的少量 F32 权重<strong>一次性转成 BF16</strong>，然后用 Iris 派生的 16×16 分块线性直接作用在 BF16 激活上。</p>
+<p>生产 320 渲染几何下，成对输出头的隔离实测：<strong>M3 Max 快 2.30×，M5 Max 快 1.83×</strong>，相对 L2 <code>8.64e-4</code>。</p>
+<p>回退：<code>H3_DIT_F32_FINAL=1</code></p>
+<h3>F32 patch 投影</h3>
+<p><code>96→5376</code> 视频与 <code>32→5376</code> 音频的 patch 投影保留 F32 权重、输入与累加，只用<strong>专门的 16×16 协作瓦片</strong>并把瓦片结果直接舍入到 BF16。</p>
+<p>生产形状下的成对实测：M3 快 1.77×，M5 快 1.62–1.78×，<strong>生成的 RGB 流与标量路径逐字节相同</strong>。</p>
+<p>进一步把输出直接绑定进打包隐藏流，消掉 BF16 媒体暂存缓冲及其 blit：再省 19.13 / 29.83 MiB。连续 T2VA 用字节偏移；FL2VA/Ref2VA 用紧凑的目标行映射，使每个模态仍是一次大 dispatch。</p>
+<p>回退：<code>H3_DISABLE_FUSED_PATCH_CAST=1</code>、<code>H3_SCALAR_PATCH=1</code>、<code>H3_DISABLE_FUSED_PATCH_PACK=1</code></p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=654&amp;e=681&amp;mode=part" data-f="README.md" data-s="654" data-e="681">README.md<span class="rng">L654-681</span></a></p>
+<h2>编码一次的 forward</h2>
+<p><code>encode_forward</code>（2636）把一次速度场求值的所有 GPU 操作编码进命令缓冲。它受 <a href="../pages/dit-denoise.html">DiT 去噪与采样器</a> 里描述的两段命令缓冲拆分控制（<code>command_block_interval</code>，231）。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=223&amp;e=243&amp;mode=part" data-f="h3_dit.c" data-s="223" data-e="243">h3_dit.c<span class="rng">L223-243</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=2636&amp;e=3014&amp;mode=part" data-f="h3_dit.c" data-s="2636" data-e="3014">h3_dit.c<span class="rng">L2636-3014</span></a></p></div></body></html>

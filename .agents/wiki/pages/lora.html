@@ -1,0 +1,78 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LoRA 合并</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>LoRA 合并</h1>
+<p><code>h3_lora.c</code>（227 行）实现 Turbo / distillation LoRA 的<strong>加载时合并</strong>。合并发生在统一内存中，推理仍然用普通的 BF16 矩阵——没有额外的运行时算子。</p>
+<h2>支持的格式</h2>
+<p>MiniMax-H3 的加速 LoRA（LightX2V Turbo、官方 Lightning）是标准 safetensors 文件，含 BF16 低秩因子与 Diffusers 风格的键布局：</p>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>transformer_blocks.N.attn.to_q.lora_A.default.weight
+transformer_blocks.N.attn.to_q.lora_B.default.weight
+transformer_blocks.N.attn.to_k / attn.to_v / attn.to_out.0
+transformer_blocks.N.ff.net.0.proj    (MLP 输入)
+transformer_blocks.N.ff.net.2         (MLP 输出)
+token_refiner.refiner_blocks.N.*      (同样的子键)</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_lora.h&amp;s=8&amp;e=27&amp;mode=part" data-f="h3_lora.h" data-s="8" data-e="27">h3_lora.h<span class="rng">L8-27</span></a></p>
+<h2>合并公式</h2>
+<div class="codeblock"><div class="cb-bar"><span>code</span><button class="btn" data-cb="copy">复制</button></div><pre><code>W&#x27; = W + scale · (B @ A)
+A: [r, in]    B: [out, r]    scale = alpha / rank</code></pre></div>
+<p><code>alpha</code> 从 safetensors 的 <code>__metadata__</code> 块里读——但张量解析器会跳过 <code>__metadata__</code>，所以 <code>h3_lora_open</code> 会<strong>重新打开原始文件、读出 JSON 头、手工找 <code>&quot;alpha&quot;</code></strong>：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">const char *alpha_key = strstr(json, &quot;\&quot;alpha\&quot;&quot;);
+if (alpha_key) {
+    alpha_key = strchr(alpha_key + 7, &#x27;:&#x27;);
+    /* 跳过 :、&quot; 、空格、制表符 */
+    alpha = (float)strtod(alpha_key, NULL);
+    if (!(alpha &gt; 0.0f)) alpha = 1.0f;
+}
+lora-&gt;scale = alpha / (float)lora-&gt;rank;</code></pre></div>
+<p>rank 则从第一个 <code>lora_A</code> 因子的 <code>shape[0]</code> 推出。Diffusers 把 alpha 写成 JSON 字符串（如 <code>&quot;128&quot;</code>），所以拷贝出时必须跳过引号。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_lora.c&amp;s=64&amp;e=109&amp;mode=part" data-f="h3_lora.c" data-s="64" data-e="109">h3_lora.c<span class="rng">L64-109</span></a></p>
+<h2>行带更新</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_lora_apply(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
+                  const char *lora_prefix, const char *target,
+                  size_t row0, size_t rows, size_t in_dim,
+                  char *error, size_t error_size);</code></pre></div>
+<table><thead><tr><th>参数</th><th>取值</th></tr></thead><tbody><tr><td><code>lora_prefix</code></td><td><code>&quot;transformer_blocks.N&quot;</code> 或 <code>&quot;token_refiner.refiner_blocks.N&quot;</code></td></tr><tr><td><code>target</code></td><td><code>&quot;attn.to_q&quot;</code> / <code>&quot;attn.to_k&quot;</code> / <code>&quot;attn.to_v&quot;</code> / <code>&quot;attn.to_out.0&quot;</code> / <code>&quot;ff.net.0.proj&quot;</code> / <code>&quot;ff.net.2&quot;</code></td></tr></tbody></table>
+<p><strong>只有行带 <code>[row0, row0+rows)</code> 被更新</strong>，因此多个目标（q/k/v）可以共享同一份存储张量（<code>qkv_proj</code>）——这与 DiT 块里 <code>qkv</code> 是单个张量的事实直接对应。</p>
+<p>替换规则：该行带被替换为「旧值 + GPU 上算出的 LoRA 增量」。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_lora.h&amp;s=37&amp;e=52&amp;mode=part" data-f="h3_lora.h" data-s="37" data-e="52">h3_lora.h<span class="rng">L37-52</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=41&amp;e=58&amp;mode=part" data-f="h3_dit.c" data-s="41" data-e="58">h3_dit.c<span class="rng">L41-58</span></a></p>
+<h2>生命周期</h2>
+<pre class="mermaid">flowchart LR
+    A[&quot;h3_lora_open(path)&quot;] --&gt; B[&quot;h3_lora_apply × 多次&quot;]
+    B --&gt; C[&quot;h3_lora_close&quot;]</pre>
+<p><code>h3_lora</code> 结构体极简：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">struct h3_lora {
+    h3_st_header header;
+    float scale;    /* alpha / rank */
+    size_t rank;
+};</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_lora.c&amp;s=11&amp;e=15&amp;mode=part" data-f="h3_lora.c" data-s="11" data-e="15">h3_lora.c<span class="rng">L11-15</span></a>, <a class="src-ref" href="../source.html?f=h3_lora.c&amp;s=111&amp;e=115&amp;mode=part" data-f="h3_lora.c" data-s="111" data-e="115">h3_lora.c<span class="rng">L111-115</span></a></p>
+<h2>不改写 checkpoint</h2>
+<p><code>h3.c</code> 消费的是官方 BF16 checkpoint（<code>model.language_model.layers.N.<em></code> 用于文本，<code>blocks.N.</em></code> 用于 DiT），<strong>从不回写这些文件</strong>。合并只在统一内存里发生。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_lora.h&amp;s=23&amp;e=26&amp;mode=part" data-f="h3_lora.h" data-s="23" data-e="26">h3_lora.h<span class="rng">L23-26</span></a></p>
+<h2>约束</h2>
+<p><strong>SSD 流式与 int8 量化路径不支持合并。</strong> 原因是这两条路径都不保留完整的 BF16 常驻权重供原地更新：</p>
+<ul><li><code>ssd_streaming</code> 只保留 2 个 BF16 块槽位，轮转覆盖</li><li>int8 路径在量化完成后就释放了 BF16 缓冲</li></ul>
+<p>因此 <code>--lora</code> 与 <code>--ssd-streaming</code> 不能同时使用。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_lora.h&amp;s=26&amp;e=27&amp;mode=part" data-f="h3_lora.h" data-s="26" data-e="27">h3_lora.h<span class="rng">L26-27</span></a>, <a class="src-ref" href="../source.html?f=h3.h&amp;s=99&amp;e=102&amp;mode=part" data-f="h3.h" data-s="99" data-e="102">h3.h<span class="rng">L99-102</span></a></p>
+<h2>参数传递</h2>
+<p><code>lora_path</code> 是 <code>h3_params</code> 的一个字段，直接透传给 DiT 的两个加载入口：</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">dit = h3_dit_load_conditioned(dit_path, &quot;h3_shaders.metal&quot;, &amp;text, &amp;layout, &amp;sigmas,
+                              ..., params-&gt;ssd_streaming,
+                              params-&gt;lora_path,
+                              spatial_rope_scale, ...);</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.h&amp;s=99&amp;e=102&amp;mode=part" data-f="h3.h" data-s="99" data-e="102">h3.h<span class="rng">L99-102</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=1571&amp;e=1591&amp;mode=part" data-f="h3.c" data-s="1571" data-e="1591">h3.c<span class="rng">L1571-1591</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.h&amp;s=31&amp;e=32&amp;mode=part" data-f="h3_dit.h" data-s="31" data-e="32">h3_dit.h<span class="rng">L31-32</span></a></p>
+<h2>测试</h2>
+<p><code>tests/test_lora.c</code> 配合 <code>tests/gen_lora_data.py</code>（生成已知答案的合成 LoRA）验证合并的数值正确性：</p>
+<div class="codeblock"><div class="cb-bar"><span>sh</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-sh">make h3_lora_tests &amp;&amp; ./h3_lora_tests</code></pre></div>
+<p>注意 <code>make test</code> 的默认目标里<strong>没有</strong>包含 <code>h3_lora_tests</code>——它是一个独立目标，需要显式构建与运行。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=Makefile&amp;s=48&amp;e=49&amp;mode=part" data-f="Makefile" data-s="48" data-e="49">Makefile<span class="rng">L48-49</span></a>, <a class="src-ref" href="../source.html?f=Makefile&amp;s=115&amp;e=121&amp;mode=part" data-f="Makefile" data-s="115" data-e="121">Makefile<span class="rng">L115-121</span></a></p></div></body></html>

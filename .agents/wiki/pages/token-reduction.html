@@ -1,0 +1,56 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Token 缩减</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>Token 缩减</h1>
+<p><code>--token-reduction</code> 是一个<strong>独立的激进 DiT 加速模式</strong>。它在中段块里把相邻的水平目标视频 token 配对，同时保留完整分辨率的残差旁路。</p>
+<p>它不是默认档位，因为<strong>会改变构图</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=521&amp;e=559&amp;mode=part" data-f="README.md" data-s="521" data-e="559">README.md<span class="rng">L521-559</span></a></p>
+<h2>算法</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;block 3 之后：enter_token_reduction&quot;] --&gt; B[&quot;成对池化水平相邻的目标视频 token&quot;]
+    B --&gt; C[&quot;保存完整分辨率状态作为旁路&quot;]
+    C --&gt; D[&quot;中段块在缩减后的序列上跑&quot;]
+    D --&gt; E{&quot;当前评估处在哪个区间?&quot;}
+    E --&gt;|前 10 次带噪评估| F[&quot;block 40 之前恢复&quot;]
+    E --&gt;|后续细节成形评估| G[&quot;block 30 之前恢复&quot;]
+    F &amp; G --&gt; H[&quot;leave_token_reduction：展开&quot;]
+    H --&gt; I[&quot;每个 token = 原值 + 其配对学到的更新&quot;]</pre>
+<p><strong>关键性质</strong>：恢复时每个 token 返回的是<strong>原值 + 配对学到的更新</strong>，因此<strong>配对内部的细节不会被丢弃</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=2333&amp;e=2419&amp;mode=part" data-f="h3_dit.c" data-s="2333" data-e="2419">h3_dit.c<span class="rng">L2333-2419</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=401&amp;e=497&amp;mode=part" data-f="h3_dit.c" data-s="401" data-e="497">h3_dit.c<span class="rng">L401-497</span></a></p>
+<h2>被排除在外的 token</h2>
+<p>以下<strong>保持精确</strong>，不参与配对：</p>
+<ul><li>文本 token</li><li>音频 token</li><li>条件 token</li><li>参考 token</li></ul>
+<p>只有<strong>目标视频</strong>的水平相邻 token 会被配对。奇数宽度的单个 token 不需要基线。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=523&amp;e=525&amp;mode=part" data-f="README.md" data-s="523" data-e="525">README.md<span class="rng">L523-525</span></a></p>
+<h2>相关函数</h2>
+<table><thead><tr><th>函数</th><th>行</th><th>职责</th></tr></thead><tbody><tr><td><code>configure_token_reduction</code></td><td>401</td><td>依据布局与开关决定启用与否、计算缩减后的行数</td></tr><tr><td><code>token_pool_sources</code></td><td>498</td><td>生成配对源索引</td></tr><tr><td><code>token_reduced_parent</code></td><td>516</td><td>缩减 token 到其父（原）token 的映射</td></tr><tr><td><code>enter_token_reduction</code> / <code>_adaln</code></td><td>2333 / 2351</td><td>进入缩减区间（后者融合 AdaLN）</td></tr><tr><td><code>leave_token_reduction</code> / <code>_adaln</code></td><td>2375 / 2395</td><td>退出缩减区间（后者融合 AdaLN）</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=401&amp;e=516&amp;mode=part" data-f="h3_dit.c" data-s="401" data-e="516">h3_dit.c<span class="rng">L401-516</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=2333&amp;e=2419&amp;mode=part" data-f="h3_dit.c" data-s="2333" data-e="2419">h3_dit.c<span class="rng">L2333-2419</span></a></p>
+<h2>GPU 算子</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_gpu_token_pool_bf16(...);          /* 池化 + 保存旁路 */
+int h3_gpu_token_pool_adaln_bf16(...);    /* 池化 + 产出首个缩减块的注意力 AdaLN */
+int h3_gpu_token_expand_delta_bf16(...);  /* 展开：原值 + 配对更新 */
+int h3_gpu_token_expand_adaln_bf16(...);  /* 展开 + 融合首个全分辨率注意力 AdaLN */</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=568&amp;e=624&amp;mode=part" data-f="h3_gpu.h" data-s="568" data-e="624">h3_gpu.h<span class="rng">L568-624</span></a></p>
+<h2>内存上的巧思</h2>
+<p>这一串优化几乎不增加激活内存：</p>
+<ul><li><strong>池化内核只把真配对基线写进已分配的注意力暂存缓冲的密集尾部</strong>；奇数宽度的单 token 无需基线</li><li><strong>完整旁路复用超大的 QKV 尾部</strong>（放得下的话），只有参考密集的布局才走受保护的专用回退</li><li>因此<strong>常见纯文本画布在任何 token 网格宽度下都不增加激活竞技场</strong></li><li>池化在 BF16 值已在寄存器里时顺带快照两个源 token，避免一次全隐藏 blit 与冗余的源读取</li><li>同一入口内核把每个池化行留在 threadgroup 内存里并产出第一个缩减块的注意力 AdaLN，又消掉一次全局残差读取</li><li>在恢复边界，首个全分辨率注意力 AdaLN 折进展开：一个 10.5 KiB 的 threadgroup 行避免全局残差回读，同时仍写出后续残差分支需要的精确旁路</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=530&amp;e=541&amp;mode=part" data-f="README.md" data-s="530" data-e="541">README.md<span class="rng">L530-541</span></a></p>
+<h2>实测</h2>
+<p>512×512×22、19 次 forward、热平衡 IT M5 Max A/B：</p>
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>去噪时间</td><td>39.13 s → <strong>28.06 s</strong>（−28.3%）</td></tr><tr><td>最终视频潜变量相对 L2</td><td>5.56%</td></tr><tr><td>最终音频潜变量相对 L2</td><td>15.14%</td></tr></tbody></table>
+<p>与已验证的 <code>--layers 45 --reuse 2</code> 组合：16.69 s → <strong>12.60 s</strong>（边际 −24.5%）。独立的狐狸与冲浪者渲染保持连贯。</p>
+<p><strong>不要</strong>同时叠加 <code>--layers 40</code> 与 <code>--reuse 3</code>：那次 6.47 秒的实验产生了彩色振铃、描边与重影肢体，尽管潜变量范数尚可接受。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=541&amp;e=559&amp;mode=part" data-f="README.md" data-s="541" data-e="559">README.md<span class="rng">L541-559</span></a></p>
+<h2>诊断开关</h2>
+<table><thead><tr><th>环境变量</th><th>作用</th></tr></thead><tbody><tr><td><code>H3_TOKEN_REDUCTION_BLOCKS</code></td><td>覆盖后续的 <code>4:30</code> 区间</td></tr><tr><td><code>H3_TOKEN_REDUCTION_EARLY=STEPS:END</code></td><td>覆盖早期调度；<code>0</code> 禁用</td></tr><tr><td><code>H3_DISABLE_TOKEN_REDUCTION=1</code></td><td>提供上下文内的精确对照</td></tr><tr><td><code>H3_DISABLE_FUSED_TOKEN_POOL_ADALN=1</code></td><td>恢复双内核的入口边界</td></tr><tr><td><code>H3_DISABLE_FUSED_TOKEN_ADALN=1</code></td><td>恢复双内核的出口边界</td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=548&amp;e=553&amp;mode=part" data-f="README.md" data-s="548" data-e="553">README.md<span class="rng">L548-553</span></a></p></div></body></html>

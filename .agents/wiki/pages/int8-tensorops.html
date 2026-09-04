@@ -1,0 +1,72 @@
+<!doctype html><html lang="zh" data-theme="dark"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>int8 与 TensorOps 路径</title>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('cw-theme')||'dark')}catch(e){}</script>
+<link rel="stylesheet" href="../style/wiki.css">
+<link rel="stylesheet" href="../style/hljs.css">
+<script>window.__WIKI_ROOT__='../';</script>
+<script src="../data/src/index.js"></script>
+<script src="../script/highlight.min.js"></script>
+<script src="../script/source-viewer.js"></script>
+<script src="../script/mermaid.min.js"></script>
+<script src="../script/wiki.js" defer></script>
+</head><body><div class="wrap"><h1>int8 与 TensorOps 路径</h1>
+<p>M5 级 GPU（Metal 4）上，DiT 的默认路径是<strong>原生 int8</strong>：动态量化激活、每输出通道一个权重量化 scale、并对敏感的 FC2 输入每 1024 通道给一个 scale。这是把 512×512 的 50 层 19 次转换渲染从 36.30 秒压到 19.32 秒的那条路。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=772&amp;e=799&amp;mode=part" data-f="README.md" data-s="772" data-e="799">README.md<span class="rng">L772-799</span></a></p>
+<h2>准入条件</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_gpu_is_m5(const h3_gpu *gpu);
+int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
+int h3_gpu_has_nax_mlp(const h3_gpu *gpu);</code></pre></div>
+<ul><li><code>use_int8_row_fc2</code> 需要 <code>device.metal4</code>，否则 <code>h3_valid_params</code> 直接报错</li><li>更老的 Metal 硬件在所需原生 TensorOps 内核不可用时<strong>自动选择</strong>可移植的 BF16 MPS 路径</li><li>选择是运行时守卫的：编译失败会回退到未改动的可移植库</li></ul>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3.c&amp;s=586&amp;e=589&amp;mode=part" data-f="h3.c" data-s="586" data-e="589">h3.c<span class="rng">L586-589</span></a>, <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=38&amp;e=40&amp;mode=part" data-f="h3_gpu.h" data-s="38" data-e="40">h3_gpu.h<span class="rng">L38-40</span></a></p>
+<h2>量化方案</h2>
+<table><thead><tr><th>对象</th><th>方案</th></tr></thead><tbody><tr><td>权重</td><td>每输出通道一个 F32 scale（<code>h3_gpu_quantize_weight_int8</code>）</td></tr><tr><td>激活（一般）</td><td>每 1024 通道分组量化（<code>h3_quantize_bf16_int8_groups*</code>）</td></tr><tr><td>FC2 输入（敏感）</td><td>每 1024 通道一组</td></tr><tr><td>FC2 行模式（<code>--use-int8-row-fc2</code>）</td><td><strong>每行一个激活 scale</strong> + M5 全宽 K 内核</td></tr></tbody></table>
+<p>行模式更快但比分组 int8 <strong>在数值上更激进</strong>，因此是可选的。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=316&amp;e=365&amp;mode=part" data-f="h3_gpu.h" data-s="316" data-e="365">h3_gpu.h<span class="rng">L316-365</span></a>, <a class="src-ref" href="../source.html?f=README.md&amp;s=196&amp;e=201&amp;mode=part" data-f="README.md" data-s="196" data-e="201">README.md<span class="rng">L196-201</span></a></p>
+<h2>相关的 GPU 算子</h2>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">int h3_gpu_quantize_weight_int8(...);              /* 权重量化 */
+int h3_gpu_linear_int8_bf16(...);                  /* 动态量化 + int8 GEMM */
+int h3_gpu_linear_int8_head_major_bf16(...);       /* 直接消费 SDPA 的 [head,row,dim] 输出 */
+int h3_gpu_mlp_int8_bf16(...);                     /* 融合 FC1→SwiGLU→FC2 的 int8 */
+int h3_gpu_grouped_qkv_linear_rope_int8(...);      /* QKV int8 投影 + Q/K norm + RoPE */
+int h3_gpu_gate_adaln_quantize_int8(...);          /* 门控 AdaLN + 顺带量化 */
+int h3_gpu_weight_dequant_unrotate_int8(...);      /* ConvRot：反量化 + 反旋转 */
+int h3_gpu_convrot_remap_qkv_bf16(...);            /* ConvRot：q/k/v 行重排 */</code></pre></div>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_gpu.h&amp;s=318&amp;e=504&amp;mode=part" data-f="h3_gpu.h" data-s="318" data-e="504">h3_gpu.h<span class="rng">L318-504</span></a></p>
+<h2>融合链</h2>
+<pre class="mermaid">flowchart TD
+    A[&quot;门控 AdaLN 内核&quot;] --&gt;|&quot;顺带量化激活（省 99 次 dispatch/forward）&quot;| B[&quot;int8 激活&quot;]
+    B --&gt; C[&quot;QKV int8 投影&quot;]
+    C --&gt;|&quot;折进瓦片的 Q/K RMS norm + RoPE&quot;| D[&quot;SDPA&quot;]
+    D --&gt;|&quot;保留 [head,row,dim] 原生序&quot;| E[&quot;注意力输出 int8 投影&quot;]
+    E --&gt; F[&quot;下一门控 AdaLN&quot;]
+    F --&gt; G[&quot;FC1 int8（编译期 5376 宽）&quot;]
+    G --&gt; H[&quot;SwiGLU&quot;]
+    H --&gt; I[&quot;FC2 int8（行 scale 或分组 scale）&quot;]</pre>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=786&amp;e=856&amp;mode=part" data-f="README.md" data-s="786" data-e="856">README.md<span class="rng">L786-856</span></a></p>
+<h2>逐项收益与回退</h2>
+<table><thead><tr><th>融合 / 特化</th><th>实测收益</th><th>回退开关</th></tr></thead><tbody><tr><td>基础 int8 MLP vs BF16 MPS</td><td>36.30 s → 25.80 s</td><td><code>--use-slower-bf16-mlp</code></td></tr><tr><td>int8 QKV 投影</td><td>25.80 s → 19.32 s</td><td><code>--use-slower-bf16-qkv</code></td></tr><tr><td>int8 注意力输出投影</td><td>再 4.5–5.5%</td><td><code>--use-slower-bf16-attention-output</code></td></tr><tr><td>激活量化折进门控 AdaLN</td><td>0.3–0.6%</td><td><code>--use-slower-unfused-int8-inputs</code></td></tr><tr><td>Q/K norm + RoPE 折进 QKV 瓦片</td><td>512: 2.1–3.2%</td><td><code>--use-slower-unfused-qkv-rope</code></td></tr><tr><td>SDPA 原生 head-major 直投</td><td>0.2–1.2%</td><td><code>--use-slower-row-major-attention-output</code></td></tr><tr><td>int8 scale 缓存在 threadgroup</td><td>0.2–0.7%</td><td><code>--use-slower-uncached-int8-scales</code></td></tr><tr><td>FC1 编译期 5376 宽循环</td><td>0.1–0.4%</td><td><code>--use-slower-dynamic-fc1-k</code></td></tr><tr><td>FC2 激活量化的 128 线程精确规约（≤2048 行）</td><td>0.2–0.8%</td><td><code>--use-slower-grouped-quantizer</code></td></tr></tbody></table>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=772&amp;e=874&amp;mode=part" data-f="README.md" data-s="772" data-e="874">README.md<span class="rng">L772-874</span></a></p>
+<h2>NAX（Metal 4 原生线性）</h2>
+<table><thead><tr><th>环境变量</th><th>语义</th></tr></thead><tbody><tr><td><code>H3_NAX=0</code></td><td>禁用 TensorOps，做精确 A/B 诊断</td></tr><tr><td><code>H3_NAX=1</code></td><td>强制更宽的原生 BF16 线性路径（<strong>opt-in</strong>：微基准偏好其 128 行瓦片，但完整 DiT 运行目前更偏好 MPSGraph 调度）</td></tr><tr><td><code>H3_NAX=mlp</code></td><td>更专门的路径：成对 FC1 gate/up TensorOps 瓦片在 threadgroup 内存里做 SwiGLU，只写出 14336 宽的激活中间量，FC2 也留在 TensorOps 上</td></tr><tr><td><code>H3_DISABLE_NAX_MLP=1</code></td><td>在以此方式创建的上下文里保留 MPSGraph MLP，用于同进程 A/B</td></tr></tbody></table>
+<p><code>H3_NAX=mlp</code> 之所以刻意 opt-in，是因为<strong>调度依赖 OS GPU 栈</strong>：主要测试机（macOS 26.5.2 M5 Max）在隔离真实权重 MLP 上快 1.3–2.0%，但完整 50 块 forward 慢 1–3%；另一台同配置的 macOS 26.5 M5 Max 在同上下文 A/B 中快 1.4%。两者得到的 50 块速度场接近（视频 1.9%、音频 2.4% 相对 L2）但<strong>不逐字节相同</strong>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=638&amp;e=652&amp;mode=part" data-f="README.md" data-s="638" data-e="652">README.md<span class="rng">L638-652</span></a></p>
+<h2>峰值内存</h2>
+<p>正常 int8 加载会在每个块的量化提交完成后<strong>释放该块的 BF16 FC1/FC2 缓冲</strong>，把实测峰值张量存储从 BF16 路径的 36.4 GiB 降到 <strong>25.9 GiB</strong>。</p>
+<p>代价是<strong>运行时权重量化增加了启动时间</strong>。</p>
+<p>当前的诊断实现只在 A/B 诊断请求时同时保留 BF16 与 int8 MLP 权重。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=README.md&amp;s=780&amp;e=784&amp;mode=part" data-f="README.md" data-s="780" data-e="784">README.md<span class="rng">L780-784</span></a></p>
+<h2>ConvRot int8</h2>
+<p><code>h3_weights.c</code> 支持一种 int8 权重存储：读 int8 + scale，用<strong>快速 Walsh-Hadamard 反旋转</strong>还原成真 BF16 权重。</p>
+<div class="codeblock"><div class="cb-bar"><span>c</span><button class="btn" data-cb="copy">复制</button></div><pre><code class="language-c">uint32_t layout = (source-&gt;field == STREAM_QKV) ? 1u : 0u;
+for (uint32_t start = 0; start &lt; rows; start += 1024)
+    convrot_unrotate_cpu(raw + start * cols, scales + start, full,
+                         start, count, cols, layout, HEADS, HEAD_DIM);</code></pre></div>
+<p><code>layout == 1</code> 表示 <code>qkv_proj</code> 是以 q/k/v 交错存的，需要重排到分离布局，使反旋转后的权重落在真实行上。</p>
+<p>这条路径<strong>在 CPU 上完成</strong>（不发 GPU 命令，主线程拥有命令缓冲），之后 GPU 上只做 M5 流式块的 int8 重量化。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=1049&amp;e=1106&amp;mode=part" data-f="h3_dit.c" data-s="1049" data-e="1106">h3_dit.c<span class="rng">L1049-1106</span></a>, <a class="src-ref" href="../source.html?f=h3_weights.c&amp;s=160&amp;e=206&amp;mode=part" data-f="h3_weights.c" data-s="160" data-e="206">h3_weights.c<span class="rng">L160-206</span></a>, <a class="src-ref" href="../source.html?f=h3_dit.c&amp;s=525&amp;e=673&amp;mode=part" data-f="h3_dit.c" data-s="525" data-e="673">h3_dit.c<span class="rng">L525-673</span></a></p>
+<h2>与流式的关系</h2>
+<p><strong>int8 与 SSD 流式是正交的</strong>（流式 = 权重住哪，int8 = 权重怎么压），这一点在 <code>h3_memory_plan.h</code> 的注释里被明确强调，也是从 ds4 的解耦路由 / expert 缓存设计借鉴来的。</p>
+<p>但在<strong>用户显式指定</strong>的层面，二者仍互斥：<code>h3_valid_params</code> 拒绝 <code>ssd_streaming &amp;&amp; use_int8_row_fc2</code>。</p>
+<p>Sources: <a class="src-ref" href="../source.html?f=h3_memory_plan.h&amp;s=21&amp;e=29&amp;mode=part" data-f="h3_memory_plan.h" data-s="21" data-e="29">h3_memory_plan.h<span class="rng">L21-29</span></a>, <a class="src-ref" href="../source.html?f=h3.c&amp;s=577&amp;e=581&amp;mode=part" data-f="h3.c" data-s="577" data-e="581">h3.c<span class="rng">L577-581</span></a></p></div></body></html>

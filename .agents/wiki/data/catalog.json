@@ -2,162 +2,222 @@
   "language": "zh",
   "sections": [
     {
-      "name": "h3-metal 引擎总览",
+      "name": "概览",
       "topics": [
         {
-          "title": "项目总览 (Overview)",
+          "title": "项目总览与架构",
           "level": 1,
           "slug": "overview",
           "group": null
         },
         {
-          "title": "系统架构 (Architecture)",
+          "title": "构建与运行",
           "level": 1,
-          "slug": "architecture",
+          "slug": "build-and-run",
           "group": null
         },
         {
-          "title": "构建与运行 (Build & Run)",
+          "title": "公共 API（h3.h）",
           "level": 1,
-          "slug": "build-run",
+          "slug": "public-api",
+          "group": null
+        },
+        {
+          "title": "命令行与交互会话",
+          "level": 1,
+          "slug": "cli-and-session",
           "group": null
         }
       ],
       "groups": []
     },
     {
-      "name": "核心 API 与编排",
+      "name": "推理流水线",
       "topics": [
         {
-          "title": "公共 API: h3.h / h3.c",
+          "title": "六阶段流水线",
           "level": 1,
-          "slug": "api-public",
+          "slug": "pipeline-overview",
           "group": null
         },
         {
-          "title": "宿主逻辑与张量布局: h3_host",
+          "title": "模型加载与检查点布局",
           "level": 1,
-          "slug": "host",
+          "slug": "model-loading",
           "group": null
         },
         {
-          "title": "命令行交互: h3_cli / main / terminal",
+          "title": "条件构建与多模态编码",
           "level": 1,
-          "slug": "cli",
-          "group": null
-        }
-      ],
-      "groups": []
-    },
-    {
-      "name": "权重与设备层",
-      "topics": [
-        {
-          "title": "Safetensors 解析: h3_safetensors",
-          "level": 1,
-          "slug": "safetensors",
+          "slug": "conditioning",
           "group": null
         },
         {
-          "title": "权重存储: h3_weights",
+          "title": "序列布局与位置编码",
           "level": 1,
-          "slug": "weights",
+          "slug": "layout-and-rope",
           "group": null
         },
         {
-          "title": "Metal / MPS 设备封装: h3_gpu",
+          "title": "DiT 去噪与采样器",
           "level": 1,
-          "slug": "gpu",
+          "slug": "dit-denoise",
           "group": null
         },
         {
-          "title": "Metal 着色器与后端: h3_metal / h3_gpu.m",
-          "level": 1,
-          "slug": "metal-shaders",
-          "group": null
-        }
-      ],
-      "groups": []
-    },
-    {
-      "name": "文本与多模态编码",
-      "topics": [
-        {
-          "title": "Tokenizer: h3_tokenizer",
-          "level": 1,
-          "slug": "tokenizer",
-          "group": null
-        },
-        {
-          "title": "Qwen3-VL 文本编码器: h3_text_encoder",
-          "level": 1,
-          "slug": "text-encoder",
-          "group": null
-        },
-        {
-          "title": "Qwen 视觉编码器: h3_vision_encoder",
-          "level": 1,
-          "slug": "vision-encoder",
-          "group": null
-        },
-        {
-          "title": "多模态嵌入编排: h3_multimodal",
-          "level": 1,
-          "slug": "multimodal",
-          "group": null
-        }
-      ],
-      "groups": []
-    },
-    {
-      "name": "扩散 Transformer (DiT)",
-      "topics": [
-        {
-          "title": "DiT 主干与去噪: h3_dit",
-          "level": 1,
-          "slug": "dit",
-          "group": null
-        },
-        {
-          "title": "AdaLN 调度与门控剪枝: h3_dit_schedule",
-          "level": 1,
-          "slug": "dit-schedule",
-          "group": null
-        }
-      ],
-      "groups": []
-    },
-    {
-      "name": "VAE 与媒体编解码",
-      "topics": [
-        {
-          "title": "视频 VAE 解码/编码: h3_video_vae / h3_video_encoder",
+          "title": "视频 VAE 解码",
           "level": 1,
           "slug": "video-vae",
           "group": null
         },
         {
-          "title": "音频 VAE (BigVGAN): h3_audio_vae",
+          "title": "音频 VAE 编解码",
           "level": 1,
           "slug": "audio-vae",
           "group": null
         },
         {
-          "title": "FFmpeg 媒体读写: h3_ffmpeg",
+          "title": "封装输出与超分后处理",
           "level": 1,
-          "slug": "ffmpeg",
+          "slug": "mux-and-superres",
           "group": null
         }
       ],
       "groups": []
     },
     {
-      "name": "测试",
+      "name": "文本与视觉编码",
       "topics": [
         {
-          "title": "测试套件: tests/",
+          "title": "Qwen3-VL 文本编码器",
           "level": 1,
-          "slug": "tests",
+          "slug": "text-encoder",
+          "group": null
+        },
+        {
+          "title": "Qwen 视觉塔与 Deepstack",
+          "level": 1,
+          "slug": "vision-encoder",
+          "group": null
+        },
+        {
+          "title": "分词器",
+          "level": 1,
+          "slug": "tokenizer",
+          "group": null
+        },
+        {
+          "title": "ClipProj 轻量文本路径",
+          "level": 1,
+          "slug": "clipproj",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "DiT 内核",
+      "topics": [
+        {
+          "title": "AdaLN 调度与门控排序",
+          "level": 1,
+          "slug": "dit-schedule",
+          "group": null
+        },
+        {
+          "title": "DiT 块执行流程",
+          "level": 1,
+          "slug": "dit-block",
+          "group": null
+        },
+        {
+          "title": "Token 缩减",
+          "level": 1,
+          "slug": "token-reduction",
+          "group": null
+        },
+        {
+          "title": "LoRA 合并",
+          "level": 1,
+          "slug": "lora",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "Metal 后端",
+      "topics": [
+        {
+          "title": "GPU 抽象层（h3_gpu）",
+          "level": 1,
+          "slug": "gpu-abstraction",
+          "group": null
+        },
+        {
+          "title": "Metal 内核库",
+          "level": 1,
+          "slug": "metal-shaders",
+          "group": null
+        },
+        {
+          "title": "int8 与 TensorOps 路径",
+          "level": 1,
+          "slug": "int8-tensorops",
+          "group": null
+        },
+        {
+          "title": "权重与 safetensors",
+          "level": 1,
+          "slug": "weights-safetensors",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "内存与性能",
+      "topics": [
+        {
+          "title": "SSD 流式权重",
+          "level": 1,
+          "slug": "ssd-streaming",
+          "group": null
+        },
+        {
+          "title": "自动内存规划",
+          "level": 1,
+          "slug": "memory-plan",
+          "group": null
+        },
+        {
+          "title": "性能分析与诊断开关",
+          "level": 1,
+          "slug": "profiling",
+          "group": null
+        },
+        {
+          "title": "会话缓存与复用",
+          "level": 1,
+          "slug": "session-cache",
+          "group": null
+        }
+      ],
+      "groups": []
+    },
+    {
+      "name": "质量保障",
+      "topics": [
+        {
+          "title": "测试与数值对齐",
+          "level": 1,
+          "slug": "test-suite",
+          "group": null
+        },
+        {
+          "title": "代码约定与扩展指南",
+          "level": 1,
+          "slug": "conventions",
           "group": null
         }
       ],
