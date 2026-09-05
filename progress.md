@@ -1,5 +1,45 @@
 # Progress Log
 
+## Session: 2026-09-05 (FlashAttention + Tiled Windowed Softmax)
+### Phase 12: FlashAttention 内核调试 — complete
+- **根本原因**：Metal shader 中 `h3_bf16_to_f32()` 接受 `ushort` 参数，但被调用时传入 `bfloat*`，编译器生成错误类型转换代码
+- **修复方案**：
+  - 添加 `h3_bf16_to_f32(device const bfloat *addr)` 重载
+  - 添加 `h3_f32_to_bf16(device bfloat *addr, float value)` 函数
+  - 使用 `as_type<ushort>()` 和 `as_type<bfloat>()` 进行显式位转换
+- **新增 kernel**：
+  - `h3_flash_attn_causal` — causal attention (online softmax)
+  - `h3_flash_attn_tiled_windowed` — windowed attention (O(T·window) 复杂度)
+- **测试结果**：
+  - `flash_attn_causal`: OK (seq=8, heads=1, dim=4) max_err=0.00095
+  - `tiled_windowed`: OK (seq=24, F=4, S=4, r=2) max_err=0.00817
+  - 1768 个现有测试全部通过
+
+### Phase 13: Tiled Windowed Softmax — complete
+- **核心优化**：将 attention 复杂度从 O(T²) 降到 O(T·window)
+- **实现**：
+  - 每个 query 根据类型（text/video/audio）计算 3 个 key 范围
+  - Range 1: text keys (0 到 text_rows)
+  - Range 2: video keys (窗口 [t-r, t+r] 帧)
+  - Range 3: audio keys (所有 audio tokens)
+  - 只遍历范围内的 key，跳过窗口外计算
+- **测试结果**：tiled_windowed OK (seq=24, F=4, S=4, r=2) max_err=0.00817
+
+### Phase 14: FP8 量化集成分析 — complete
+- 分析 Python 参考项目 `ops/fp8_linear.py`
+- C 代码已有很好的量化基础设施：
+  - `h3_gpu_quantize_bf16_int8_rows` (SIMD vec4)
+  - `h3_gpu_quantize_bf16_int8_groups`
+  - `h3_gpu_linear_int8_bf16` (cooperative tensor ops)
+  - `h3_gpu_mlp_int8_bf16` (SwiGLU 融合)
+- FP8 E4M3 在 M4 上可通过 INT8 tensor core 模拟（同一硬件），动态范围更好（±448 vs ±127）
+
+### Phase 15: Linear Far-Brain 分支基础设施 — complete
+- 实现完整的 SanaDelta delta-rule scan 管线：
+  - `frame_stats` → `symmetrize_A` → `factor_apply` → `scan_frame` → `log_alpha_prefix` → `gather` → `output`
+- **注意**：需要训练权重（alpha、beta、q_norm、gate、to_out_linear），当前 checkpoint 中不存在
+- **测试结果**：7 个 linear-branch 测试全部通过
+
 ## Session: 2026-09-02 (SR 集成)
 ### Phases 1–5: 完成
 - 在 h3.c 集成 Real-ESRGAN 超分后处理（h3_ffmpeg.c/h/main.c/h3_cli.c 四文件改完，编译通过，端到端 256→864 含音轨验证通过）

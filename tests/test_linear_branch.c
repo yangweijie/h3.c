@@ -48,7 +48,10 @@ static h3_gpu_tensor *new_bf16(test_context *test, size_t elements) {
 }
 
 static float bf16_to_f32(uint16_t v) {
-    return (union { uint32_t i; float f; }){.i = (uint32_t)v << 16}.f;
+    uint32_t bits = (uint32_t)v << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
 }
 
 static uint16_t f32_to_bf16(float v) {

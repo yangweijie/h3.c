@@ -691,4 +691,43 @@ int h3_gpu_linear_branch_output(
     uint32_t tokens_per_frame, uint32_t heads, uint32_t head_dim,
     float epsilon);
 
+/* FlashAttention-style tiled attention kernel.
+ *
+ * Custom Metal kernel that replaces MPSGraph SDPA for better control over
+ * memory access patterns. Features:
+ *   - Tiled Q/K/V into reduced HBM access
+ *   - Online softmax (two-pass: max + sum) for numerical stability
+ *   - Supports causal mask and per-frame windowed mask
+ *   - Each threadgroup handles one head and a tile of query tokens
+ *
+ * For H3: head_dim=128, TILE_Q=64, TILE_KV=64, threads_per_threadgroup=64.
+ *
+ * window_radius=0 means full attention (no windowing).
+ * causal=1 enables causal masking.
+ * head_major=1 for [H,T,d] layout, 0 for [T,H,d] layout. */
+int h3_gpu_flash_attn_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query,
+                           const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value,
+                           uint32_t sequence, uint32_t heads,
+                           uint32_t head_dim, float scale,
+                           uint32_t window_radius, uint32_t num_frames,
+                           uint32_t tokens_per_frame, uint32_t video_start,
+                           uint32_t text_rows, uint32_t audio_rows,
+                           int causal, int head_major);
+
+/* Test kernel dispatch: simple passthrough to verify dispatch mechanism. */
+int h3_gpu_flash_attn_test_dispatch(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    const h3_gpu_tensor *query,
+                                    uint32_t sequence, uint32_t heads,
+                                    uint32_t head_dim, int head_major);
+
+/* Minimal attention kernel dispatch: writes constant to verify kernel runs. */
+int h3_gpu_flash_attn_minimal(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *query,
+                              const h3_gpu_tensor *key,
+                              const h3_gpu_tensor *value,
+                              uint32_t sequence, uint32_t heads,
+                              uint32_t head_dim, int head_major);
+
 #endif

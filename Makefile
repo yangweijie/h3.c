@@ -109,6 +109,15 @@ tests/bench_dit_864.o: tests/bench_dit.c
 h3_linear_branch_tests: tests/test_linear_branch.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_flash_attn_tests: tests/test_flash_attn.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_tiled_windowed_tests: tests/test_tiled_windowed.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_flash_attn_debug: tests/test_flash_attn_debug.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

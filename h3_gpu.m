@@ -358,6 +358,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                                                      encoding:NSUTF8StringEncoding
                                                         error:&libraryError];
         if (source) {
+            /* Debug: print first 200 chars of source */
+            printf("[DEBUG] Shader source loaded, length: %lu, first 200 chars: %.200s\n",
+                   (unsigned long)source.length, source.UTF8String);
             MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
             options.mathMode = MTLMathModeSafe;
             const char *nax = getenv("H3_NAX");
@@ -443,7 +446,11 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_linear_branch_scan_frame",
             @"h3_linear_branch_log_alpha_prefix",
             @"h3_linear_branch_gather",
-            @"h3_linear_branch_output"
+            @"h3_linear_branch_output",
+            @"h3_flash_attn_bf16",
+            @"h3_flash_attn_causal",
+            @"h3_flash_attn_tiled_windowed",
+            @"h3_flash_attn_test"
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
@@ -5034,4 +5041,174 @@ int h3_gpu_linear_branch_output(
             [encoder setBytes:&args length:sizeof(args) atIndex:5];
             [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:6];
         });
+}
+
+/* =============================================================================
+ * FlashAttention-style tiled attention kernel dispatch.
+ *
+ * Dispatches the custom Metal FlashAttention kernel that replaces MPSGraph SDPA.
+ * Each threadgroup handles one head and a tile of 64 query tokens.
+ * K/V are processed in tiles of 64 tokens with online softmax accumulation.
+ * ============================================================================ */
+int h3_gpu_flash_attn_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query,
+                           const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value,
+                           uint32_t sequence, uint32_t heads,
+                           uint32_t head_dim, float scale,
+                           uint32_t window_radius, uint32_t num_frames,
+                           uint32_t tokens_per_frame, uint32_t video_start,
+                           uint32_t text_rows, uint32_t audio_rows,
+                           int causal, int head_major) {
+    H3GPU *dev = GPU(gpu);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!sequence || !heads || !head_dim ||
+        !h3_gpu_require_command(dev) ||
+        !h3_gpu_require_elements(dev, query, count, @"flash attn query") ||
+        !h3_gpu_require_elements(dev, key, count, @"flash attn key") ||
+        !h3_gpu_require_elements(dev, value, count, @"flash attn value") ||
+        !h3_gpu_require_elements(dev, output, count, @"flash attn output")) return 0;
+    if (TENSOR(query).dtype != H3_GPU_BF16 || TENSOR(key).dtype != H3_GPU_BF16 ||
+        TENSOR(value).dtype != H3_GPU_BF16 || TENSOR(output).dtype != H3_GPU_BF16) {
+        h3_gpu_set_error(dev, @"flash attn tensor dtype mismatch");
+        return 0;
+    }
+    NSString *kernel = causal ? @"h3_flash_attn_causal" : @"h3_flash_attn_tiled_windowed";
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(dev, kernel);
+    if (!pipeline) {
+        h3_gpu_set_error(dev, @"flash attn pipeline not found: %@", kernel);
+        return 0;
+    }
+    if (pipeline.maxTotalThreadsPerThreadgroup < 64) {
+        h3_gpu_set_error(dev, @"flash attn pipeline has insufficient threads: %lu", (unsigned long)pipeline.maxTotalThreadsPerThreadgroup);
+        return 0;
+    }
+    uint32_t tile_q = 64;
+    uint32_t q_tiles = (sequence + tile_q - 1) / tile_q;
+    struct {
+        uint32_t sequence, heads, head_dim;
+        float scale;
+        uint32_t window_radius, num_frames, tokens_per_frame, video_start, text_rows, audio_rows;
+        uint32_t causal, head_major;
+    } args = {sequence, heads, head_dim, scale, window_radius, num_frames,
+              tokens_per_frame, video_start, text_rows, audio_rows,
+              (uint32_t)causal, (uint32_t)head_major};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [dev.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads, q_tiles, 1)
+                 threadsPerThreadgroup:MTLSizeMake(tile_q, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = dev.stats;
+    stats.direct_dispatches++;
+    dev.stats = stats;
+    return 1;
+}
+
+/* =============================================================================
+ * Test kernel dispatch: simple passthrough to verify dispatch mechanism.
+ * ============================================================================ */
+int h3_gpu_flash_attn_test_dispatch(h3_gpu *gpu, h3_gpu_tensor *output,
+                                    const h3_gpu_tensor *query,
+                                    uint32_t sequence, uint32_t heads,
+                                    uint32_t head_dim, int head_major) {
+    H3GPU *dev = GPU(gpu);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!sequence || !heads || !head_dim ||
+        !h3_gpu_require_command(dev) ||
+        !h3_gpu_require_elements(dev, query, count, @"test query") ||
+        !h3_gpu_require_elements(dev, output, count, @"test output")) return 0;
+    if (TENSOR(query).dtype != H3_GPU_BF16 || TENSOR(output).dtype != H3_GPU_BF16) {
+        h3_gpu_set_error(dev, @"test tensor dtype mismatch");
+        return 0;
+    }
+    NSString *kernel = @"h3_flash_attn_test";
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(dev, kernel);
+    if (!pipeline) {
+        h3_gpu_set_error(dev, @"test pipeline not found");
+        return 0;
+    }
+    uint32_t tile_q = 64;
+    uint32_t q_tiles = (sequence + tile_q - 1) / tile_q;
+    struct {
+        uint32_t sequence, heads, head_dim;
+        float scale;
+        uint32_t window_radius, num_frames, tokens_per_frame, video_start, text_rows, audio_rows;
+        uint32_t causal, head_major;
+    } args = {sequence, heads, head_dim, 1.0f, 0, 0, 0, 0, 0, 0, 0, (uint32_t)head_major};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [dev.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+        [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads, q_tiles, 1)
+                 threadsPerThreadgroup:MTLSizeMake(tile_q, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = dev.stats;
+    stats.direct_dispatches++;
+    dev.stats = stats;
+    return 1;
+}
+
+/* Minimal attention kernel dispatch: writes constant to verify kernel runs. */
+int h3_gpu_flash_attn_minimal(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *query,
+                              const h3_gpu_tensor *key,
+                              const h3_gpu_tensor *value,
+                              uint32_t sequence, uint32_t heads,
+                              uint32_t head_dim, int head_major) {
+    H3GPU *dev = GPU(gpu);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!sequence || !heads || !head_dim ||
+        !h3_gpu_require_command(dev) ||
+        !h3_gpu_require_elements(dev, query, count, @"minimal query") ||
+        !h3_gpu_require_elements(dev, key, count, @"minimal key") ||
+        !h3_gpu_require_elements(dev, value, count, @"minimal value") ||
+        !h3_gpu_require_elements(dev, output, count, @"minimal output")) return 0;
+    if (TENSOR(query).dtype != H3_GPU_BF16 || TENSOR(key).dtype != H3_GPU_BF16 ||
+        TENSOR(value).dtype != H3_GPU_BF16 || TENSOR(output).dtype != H3_GPU_BF16) {
+        h3_gpu_set_error(dev, @"minimal tensor dtype mismatch");
+        return 0;
+    }
+    NSString *kernel = @"h3_flash_attn_causal";
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(dev, kernel);
+    if (!pipeline) {
+        h3_gpu_set_error(dev, @"minimal pipeline not found: %@", kernel);
+        return 0;
+    }
+    /* Debug: print pipeline info */
+    printf("  [DEBUG] Kernel: %s, maxThreadsPerThreadgroup: %lu\n",
+           [kernel UTF8String], (unsigned long)pipeline.maxTotalThreadsPerThreadgroup);
+    uint32_t tile_q = 64;
+    uint32_t q_tiles = (sequence + tile_q - 1) / tile_q;
+    struct {
+        uint32_t sequence, heads, head_dim;
+        float scale;
+        uint32_t window_radius, num_frames, tokens_per_frame, video_start, text_rows, audio_rows;
+        uint32_t causal, head_major;
+    } args = {sequence, heads, head_dim, 1.0f, 0, 0, 0, 0, 0, 0, 0, (uint32_t)head_major};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [dev.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads, q_tiles, 1)
+                 threadsPerThreadgroup:MTLSizeMake(tile_q, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = dev.stats;
+    stats.direct_dispatches++;
+    dev.stats = stats;
+    return 1;
 }

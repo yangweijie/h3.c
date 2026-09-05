@@ -1,4 +1,4 @@
-# Findings & Decisions: h3.c 超分集成 + 生成调优
+# Findings & Decisions: h3.c 超分集成 + 生成调优 + Metal 内核优化
 
 ## Requirements (SR 集成，已完成)
 - 命令行参数：`--sr-bin` / `--sr-model-dir`（两者有效才启用 SR）
@@ -16,6 +16,36 @@
   - 文本编码器：`/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot`
   - **本机无任何 Turbo/distill LoRA**（`find` 全盘无 turbo/lora/distill 文件）
 - 运行时：macOS Apple M4，Metal；`setsid` 不可用，用 `nohup ... & disown` 后台
+
+## Metal BF16 类型转换（关键发现）
+- **问题**：Metal shader 中 `h3_bf16_to_f32()` 接受 `ushort` 参数，但被调用时传入 `bfloat*`，编译器生成错误类型转换代码，导致 kernel 输出全零
+- **根因**：`bfloat` 和 `ushort` 是不同 Metal 类型，不能隐式转换
+- **修复**：
+  - 添加 `h3_bf16_to_f32(device const bfloat *addr)` 重载，使用 `as_type<ushort>(*addr)` 读取
+  - 添加 `h3_f32_to_bf16(device bfloat *addr, float value)` 函数，使用 `as_type<bfloat>(ushort(bits >> 16))` 写入
+- **经验**：Metal 中 BF16 必须使用 `as_type<>()` 进行显式位转换，不能依赖 C 风格的 `(ushort)` 或 `(bfloat)` 转换
+
+## FlashAttention 内核优化
+- **Causal attention** (`h3_flash_attn_causal`)：
+  - Online softmax（two-pass: max + sum）
+  - 复杂度 O(T²/2)（只处理 k <= q 的 key）
+  - 测试：seq=8, heads=1, dim=4, max_err=0.00095
+- **Tiled windowed attention** (`h3_flash_attn_tiled_windowed`)：
+  - 每个 query 根据类型（text/video/audio）计算 3 个 key 范围
+  - 只遍历窗口内的 key，复杂度 O(T·window)
+  - 测试：seq=24, F=4, S=4, r=2, max_err=0.00817
+- **Linear far-branch 基础设施**：
+  - 完整的 SanaDelta delta-rule scan 管线
+  - 需要训练权重（alpha、beta、q_norm、gate、to_out_linear），当前 checkpoint 中不存在
+  - 7 个测试全部通过
+
+## FP8 量化集成分析
+- C 代码已有量化基础设施：
+  - `h3_gpu_quantize_bf16_int8_rows` (SIMD vec4)
+  - `h3_gpu_quantize_bf16_int8_groups`
+  - `h3_gpu_linear_int8_bf16` (cooperative tensor ops)
+  - `h3_gpu_mlp_int8_bf16` (SwiGLU 融合)
+- FP8 E4M3 在 M4 上可通过 INT8 tensor core 模拟（同一硬件），动态范围更好（±448 vs ±127）
 
 ## 色块根因（关键发现）
 - 失败运行：target 256×192 / **render 128×96** / layer 40 / token-reduction / SR→1024×768 / 15s → 全屏 3 段水平色带
