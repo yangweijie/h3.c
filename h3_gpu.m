@@ -435,7 +435,15 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vae_encoder_pad_f32",
             @"h3_vae_encoder_group_norm_silu_f32",
             @"h3_weight_dequant_unrotate_int8",
-            @"h3_convrot_remap_qkv_bf16"
+            @"h3_convrot_remap_qkv_bf16",
+            @"h3_sdpa_window_mask",
+            @"h3_linear_branch_frame_stats",
+            @"h3_linear_branch_factor_apply",
+            @"h3_linear_branch_symmetrize_A",
+            @"h3_linear_branch_scan_frame",
+            @"h3_linear_branch_log_alpha_prefix",
+            @"h3_linear_branch_gather",
+            @"h3_linear_branch_output"
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
@@ -4826,5 +4834,204 @@ int h3_gpu_silu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(up).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+/* =============================================================================
+ * Windowed SDPA mask builder.
+ *
+ * Builds a [total_rows, total_rows] causal mask where video<->video pairs are
+ * restricted to a per-frame window |t_q - t_k| <= radius. Text and audio tokens
+ * attend densely (text sees all text, audio sees all). This is the mask the
+ * Python reference project's HybridAttention uses for the softmax branch.
+ * ============================================================================ */
+int h3_gpu_sdpa_window_mask_bf16(h3_gpu *opaque, h3_gpu_tensor *mask,
+                                 uint32_t window_radius, uint32_t num_frames,
+                                 uint32_t tokens_per_frame, uint32_t video_start,
+                                 uint32_t total_rows, uint32_t text_rows,
+                                 uint32_t audio_rows) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)total_rows * total_rows;
+    if (!total_rows || !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, mask, count, @"window mask")) return 0;
+    if (TENSOR(mask).dtype != H3_GPU_F32) {
+        h3_gpu_set_error(gpu, @"window mask must be f32");
+        return 0;
+    }
+    return h3_gpu_dispatch_2d(gpu, @"h3_sdpa_window_mask",
+        total_rows, total_rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(mask).buffer offset:0 atIndex:0];
+            [encoder setBytes:&window_radius length:sizeof(window_radius) atIndex:1];
+            [encoder setBytes:&num_frames length:sizeof(num_frames) atIndex:2];
+            [encoder setBytes:&tokens_per_frame length:sizeof(tokens_per_frame) atIndex:3];
+            [encoder setBytes:&video_start length:sizeof(video_start) atIndex:4];
+            [encoder setBytes:&total_rows length:sizeof(total_rows) atIndex:5];
+            [encoder setBytes:&text_rows length:sizeof(text_rows) atIndex:6];
+            [encoder setBytes:&audio_rows length:sizeof(audio_rows) atIndex:7];
+        });
+}
+
+/* =============================================================================
+ * Linear far-branch attention kernels.
+ *
+ * These implement the SanaDelta delta-rule scan for O(n) far-field attention.
+ * They require trained weights (alpha, beta, q_norm, gate, to_out_linear) that
+ * are NOT in the current H3 checkpoint. Provided as infrastructure for future
+ * training. See h3_shaders.metal for the kernel implementations.
+ * ============================================================================ */
+
+int h3_gpu_linear_branch_frame_stats(
+    h3_gpu *opaque, h3_gpu_tensor *A, h3_gpu_tensor *B,
+    const h3_gpu_tensor *k, const h3_gpu_tensor *v, const h3_gpu_tensor *beta,
+    uint32_t num_frames, uint32_t tokens_per_frame, uint32_t heads,
+    uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t stats_count = (size_t)num_frames * heads * head_dim * head_dim;
+    if (!h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, A, stats_count, @"linear branch A") ||
+        !h3_gpu_require_elements(gpu, B, stats_count, @"linear branch B")) return 0;
+    return h3_gpu_dispatch_3d(gpu, @"h3_linear_branch_frame_stats",
+        MTLSizeMake(heads, num_frames, head_dim * head_dim),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(k).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(v).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(beta).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(A).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(B).buffer offset:0 atIndex:4];
+            struct { uint32_t f, s, h, d; } args =
+                {num_frames, tokens_per_frame, heads, head_dim};
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        });
+}
+
+int h3_gpu_linear_branch_factor_apply(
+    h3_gpu *opaque, h3_gpu_tensor *transition, h3_gpu_tensor *injection,
+    const h3_gpu_tensor *A, const h3_gpu_tensor *B, const h3_gpu_tensor *alpha,
+    uint32_t num_frames, uint32_t tokens_per_frame, uint32_t heads,
+    uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)num_frames * heads * head_dim * head_dim;
+    if (!h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, transition, count, @"linear transition") ||
+        !h3_gpu_require_elements(gpu, injection, count, @"linear injection")) return 0;
+    return h3_gpu_dispatch_3d(gpu, @"h3_linear_branch_factor_apply",
+        MTLSizeMake(heads, num_frames, head_dim * head_dim),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(A).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(B).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(transition).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(injection).buffer offset:0 atIndex:4];
+            struct { uint32_t f, s, h, d; } args =
+                {num_frames, tokens_per_frame, heads, head_dim};
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        });
+}
+
+int h3_gpu_linear_branch_symmetrize_A(
+    h3_gpu *opaque, h3_gpu_tensor *A, uint32_t num_frames, uint32_t heads,
+    uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)num_frames * heads * head_dim * head_dim;
+    if (!h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, A, count, @"symmetrize A")) return 0;
+    return h3_gpu_dispatch_3d(gpu, @"h3_linear_branch_symmetrize_A",
+        MTLSizeMake(heads, num_frames, head_dim * head_dim),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(A).buffer offset:0 atIndex:0];
+            struct { uint32_t f, s, h, d; } args =
+                {num_frames, 0, heads, head_dim};
+            [encoder setBytes:&args length:sizeof(args) atIndex:1];
+        });
+}
+
+int h3_gpu_linear_branch_scan_frame(
+    h3_gpu *opaque, h3_gpu_tensor *state_out, const h3_gpu_tensor *state_in,
+    const h3_gpu_tensor *transition, const h3_gpu_tensor *injection,
+    uint32_t heads, uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)heads * head_dim * head_dim;
+    if (!h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, state_out, count, @"scan out") ||
+        !h3_gpu_require_elements(gpu, state_in, count, @"scan in")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_linear_branch_scan_frame", heads,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(state_in).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(transition).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(injection).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(state_out).buffer offset:0 atIndex:3];
+            struct { uint32_t f, s, h, d; } args =
+                {0, 0, heads, head_dim};
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
+int h3_gpu_linear_branch_log_alpha_prefix(
+    h3_gpu *opaque, h3_gpu_tensor *log_alpha_prefix, const h3_gpu_tensor *alpha,
+    uint32_t num_frames, uint32_t heads, uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)(num_frames + 1) * heads * head_dim;
+    if (!h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, log_alpha_prefix, count, @"log_alpha")) return 0;
+    return h3_gpu_dispatch_2d(gpu, @"h3_linear_branch_log_alpha_prefix",
+        heads, head_dim,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(log_alpha_prefix).buffer offset:0 atIndex:1];
+            struct { uint32_t f, s, h, d; } args =
+                {num_frames, 0, heads, head_dim};
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_linear_branch_gather(
+    h3_gpu *opaque, h3_gpu_tensor *gathered, const h3_gpu_tensor *prefix,
+    const h3_gpu_tensor *suffix, const h3_gpu_tensor *alpha,
+    const h3_gpu_tensor *bounds, const h3_gpu_tensor *text_state,
+    const h3_gpu_tensor *log_alpha_prefix, uint32_t num_frames,
+    uint32_t tokens_per_frame, uint32_t heads, uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)num_frames * heads * head_dim * head_dim;
+    if (!h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, gathered, count, @"gather")) return 0;
+    return h3_gpu_dispatch_3d(gpu, @"h3_linear_branch_gather",
+        MTLSizeMake(num_frames, heads, head_dim * head_dim),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(prefix).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(suffix).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(alpha).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(bounds).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(text_state).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(gathered).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(log_alpha_prefix).buffer offset:0 atIndex:6];
+            struct { uint32_t f, s, h, d; } args =
+                {num_frames, tokens_per_frame, heads, head_dim};
+            [encoder setBytes:&args length:sizeof(args) atIndex:7];
+        });
+}
+
+int h3_gpu_linear_branch_output(
+    h3_gpu *opaque, h3_gpu_tensor *out, const h3_gpu_tensor *gathered,
+    const h3_gpu_tensor *q, const h3_gpu_tensor *gate,
+    const h3_gpu_tensor *q_norm_weight, uint32_t num_frames,
+    uint32_t tokens_per_frame, uint32_t heads, uint32_t head_dim,
+    float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)num_frames * tokens_per_frame * head_dim;
+    if (!h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_elements(gpu, out, count, @"branch output")) return 0;
+    return h3_gpu_dispatch_3d(gpu, @"h3_linear_branch_output",
+        MTLSizeMake(num_frames, heads, tokens_per_frame),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(gathered).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(q).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(gate).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(q_norm_weight).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(out).buffer offset:0 atIndex:4];
+            struct { uint32_t f, s, h, d; } args =
+                {num_frames, tokens_per_frame, heads, head_dim};
+            [encoder setBytes:&args length:sizeof(args) atIndex:5];
+            [encoder setBytes:&epsilon length:sizeof(epsilon) atIndex:6];
         });
 }

@@ -4469,3 +4469,386 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+/* =============================================================================
+ * Windowed softmax attention mask builder.
+ *
+ * The Python reference project (vdn-minimax-h3) uses a HybridAttention where
+ * video<->video pairs are restricted to a per-frame window |t_q - t_k| <= radius,
+ * while pairs involving global (text/audio) tokens stay dense. This reduces the
+ * softmax cost from O(T²) to O(T * window).
+ *
+ * This kernel builds the windowed causal mask for one head. The mask is a
+ * [sequence, sequence] bf16 tensor where 0 = attend, -INF = mask.
+ *
+ * Arguments:
+ *   window_radius: per-frame window radius (frames, not tokens)
+ *   num_frames: number of latent frames
+ *   tokens_per_frame: patched spatial tokens per frame
+ *   video_start: row index where video tokens begin
+ *   total_rows: total sequence length (text + video + audio)
+ *   text_rows: number of text tokens at the start
+ *
+ * The mask allows attention when:
+ *   - query is text/audio (global): attend to all preceding tokens (causal)
+ *   - query is video: attend to all text + video within window + preceding audio
+ * ============================================================================ */
+kernel void h3_sdpa_window_mask(
+                           device float *mask [[buffer(0)]],
+                           constant uint &window_radius [[buffer(1)]],
+                           constant uint &num_frames [[buffer(2)]],
+                           constant uint &tokens_per_frame [[buffer(3)]],
+                           constant uint &video_start [[buffer(4)]],
+                           constant uint &total_rows [[buffer(5)]],
+                           constant uint &text_rows [[buffer(6)]],
+                           constant uint &audio_rows [[buffer(7)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    uint q = gid.x;
+    uint k = gid.y;
+    if (q >= total_rows || k >= total_rows) return;
+    if (k > q) { mask[q * total_rows + k] = -INFINITY; return; }
+
+    /* Text queries: attend to everything causal (text sees text). */
+    if (q < text_rows) {
+        mask[q * total_rows + k] = 0.0f;
+        return;
+    }
+
+    uint video_end = video_start + num_frames * tokens_per_frame;
+    uint audio_start = video_end;
+
+    /* Video queries: windowed attention to video, dense to text + audio. */
+    if (q >= video_start && q < video_end) {
+        if (k < text_rows) { mask[q * total_rows + k] = 0.0f; return; }
+        if (k >= audio_start) { mask[q * total_rows + k] = 0.0f; return; }
+        /* Video-video: check window. */
+        uint q_frame = (q - video_start) / tokens_per_frame;
+        uint k_frame = (k - video_start) / tokens_per_frame;
+        int frame_diff = (int)q_frame - (int)k_frame;
+        if (frame_diff >= -(int)window_radius && frame_diff <= (int)window_radius)
+            mask[q * total_rows + k] = 0.0f;
+        else
+            mask[q * total_rows + k] = -INFINITY;
+        return;
+    }
+
+    /* Audio queries: attend to all text + video + causal audio. */
+    if (q >= audio_start) {
+        mask[q * total_rows + k] = 0.0f;
+        return;
+    }
+
+    mask[q * total_rows + k] = -INFINITY;
+}
+
+/* =============================================================================
+ * Linear far-branch attention (SanaDelta delta-rule scan).
+ *
+ * The softmax window handles nearby tokens (O(window)); this branch handles
+ * everything outside it via a per-frame recurrent state [H,d,d]. For F frames
+ * with S tokens each, it is O(F*H*d²) instead of O(F²*S²*H).
+ *
+ * Reference: vdn-minimax-h3/src/models/linear_attention/ (branch.py, scan.py,
+ * delta_rule.py, features.py). The Python project calls this the
+ * BidirectionalLinearBranch; the delta rule used here is SanaDelta
+ * ("sana_scaled" in DELTA_BACKENDS), which avoids the Cholesky factorization
+ * VDN needs by using the first-order truncation (I - c²A) instead of (I+A)⁻¹.
+ * The two are numerically close when c² = 1/S forces trace(c²A) ≤ 1.
+ *
+ * Pipeline per layer:
+ *   1. frame_stats:   A = (kβ)ᵀk, B = (vβ)ᵀk        per-frame batched GEMM
+ *   2. factor_apply:  T = Diag(α)(I - c²A),  j = cB   pointwise
+ *   3. scan:          forward + backward recurrence     serial in F, parallel in H
+ *   4. gather:        combine both directions with bridge alpha decay
+ *   5. output:        gate · (state @ RMSNorm(q))       per-token
+ *
+ * NOTE: These kernels require trained weights (alpha, beta, q_norm, gate,
+ * to_out_linear) that are NOT present in the current H3 dense checkpoint.
+ * They are provided as infrastructure for future training/fine-tuning.
+ * The windowed SDPA above (h3_sdpa_window_mask) can be used immediately.
+ * ============================================================================ */
+
+struct h3_linear_branch_dims {
+    uint num_frames;       /* F: latent frames */
+    uint tokens_per_frame; /* S: patched spatial tokens per latent frame */
+    uint heads;            /* H: attention heads */
+    uint head_dim;         /* d: per-head dimension (128) */
+};
+
+/* Phase 1: per-frame delta-rule statistics.
+ *
+ * For each frame f and head h:
+ *   A[f,h] = Σ_s β[f,h,s] · k[f,h,s] · k[f,h,s]ᵀ   [d,d]
+ *   B[f,h] = Σ_s β[f,h,s] · v[f,h,s] · k[f,h,s]ᵀ   [d,d]
+ *
+ * k, v are [F, H, S, d] row-major (frame-major). beta is [F, H, S].
+ * Output A, B are [F, H, d, d] row-major, stored as fp32.
+ *
+ * Each thread handles one (frame, head, d-row, d-column) output. The S
+ * contraction is serialized inside the thread — S is small (≤ ~1000 for H3
+ * video) and the output is only [d,d] per frame/head, so the parallelism
+ * over F*H*d*d is ample. The Python reference does this as two batched
+ * GEMMs on tensor cores; here we do it as a tiled contraction so we don't
+ * need an MPS dependency for this kernel. */
+kernel void h3_linear_branch_frame_stats(
+                           device const bfloat *k [[buffer(0)]],
+                           device const bfloat *v [[buffer(1)]],
+                           device const float *beta [[buffer(2)]],
+                           device float *A [[buffer(3)]],
+                           device float *B [[buffer(4)]],
+                           constant h3_linear_branch_dims &args
+                               [[buffer(5)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint head = gid.y;
+    uint di = gid.z % args.head_dim;
+    uint dj = (gid.z / args.head_dim) % args.head_dim;
+    if (frame >= args.num_frames || head >= args.heads) return;
+    if (di >= args.head_dim && dj >= args.head_dim) return;
+    uint base_k = ((frame * args.heads + head) * args.tokens_per_frame) * args.head_dim;
+    float a = 0.0f, b = 0.0f;
+    for (uint s = 0; s < args.tokens_per_frame; s++) {
+        float beta_val = beta[frame * args.heads * args.tokens_per_frame +
+                              head * args.tokens_per_frame + s];
+        float ki = (float)k[base_k + s * args.head_dim + di];
+        float kj = (float)k[base_k + s * args.head_dim + dj];
+        float vi = (float)v[base_k + s * args.head_dim + di];
+        a = fma(beta_val * ki, kj, a);
+        b = fma(beta_val * vi, kj, b);
+    }
+    uint base_out = ((frame * args.heads + head) * args.head_dim) * args.head_dim;
+    A[base_out + di * args.head_dim + dj] = a;
+    B[base_out + di * args.head_dim + dj] = b;
+}
+
+/* Phase 2a: SanaDelta factor_apply.
+ *
+ * transition[f,h,i,j] = alpha[f,h,j] · (δ(i,j) - c² · A[f,h,i,j])
+ * injection[f,h,i,j]  = c · B[f,h,i,j]
+ *
+ * where c = 1/√S and c² = 1/S. A, B are [F,H,d,d] fp32, alpha is [F,H,d] fp32.
+ * Output transition, injection are [F,H,d,d] fp32.
+ *
+ * Each thread handles one (frame, head, d-row, d-column). */
+kernel void h3_linear_branch_factor_apply(
+                           device const float *A [[buffer(0)]],
+                           device const float *B [[buffer(1)]],
+                           device const float *alpha [[buffer(2)]],
+                           device float *transition [[buffer(3)]],
+                           device float *injection [[buffer(4)]],
+                           constant h3_linear_branch_dims &args
+                               [[buffer(5)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint head = gid.y;
+    uint di = gid.z % args.head_dim;
+    uint dj = (gid.z / args.head_dim) % args.head_dim;
+    if (frame >= args.num_frames || head >= args.heads) return;
+    uint base = ((frame * args.heads + head) * args.head_dim + di) * args.head_dim + dj;
+    float c2 = 1.0f / (float)args.tokens_per_frame;
+    float c = sqrt(c2);
+    float a_ij = A[base];
+    float alpha_j = alpha[frame * args.heads * args.head_dim +
+                          head * args.head_dim + dj];
+    float t = (di == dj ? 1.0f : 0.0f) - c2 * a_ij;
+    transition[base] = alpha_j * t;
+    injection[base] = c * B[base];
+}
+
+/* Phase 2b: symmetric-A correction (ensures A + Aᵀ symmetry for the
+ * first-order truncation to be stable). Call once between frame_stats and
+ * factor_apply when exact symmetry is needed. */
+kernel void h3_linear_branch_symmetrize_A(
+                           device float *A [[buffer(0)]],
+                           constant h3_linear_branch_dims &args
+                               [[buffer(1)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint head = gid.y;
+    uint di = gid.z % args.head_dim;
+    uint dj = (gid.z / args.head_dim) % args.head_dim;
+    if (frame >= args.num_frames || head >= args.heads) return;
+    uint base = ((frame * args.heads + head) * args.head_dim) * args.head_dim;
+    A[base + di * args.head_dim + dj] =
+        0.5f * (A[base + di * args.head_dim + dj] +
+                A[base + dj * args.head_dim + di]);
+}
+
+/* Phase 3 helper: one frame's batched state update.
+ *
+ * state_out[h] = Σ_r state_in[h,r] · transition[h,c,r] + injection[h,c]
+ * This is a single [d,d] × [d,d] matmul per head, done in one threadgroup.
+ * Dispatched once per frame per direction by the host. */
+kernel void h3_linear_branch_scan_frame(
+                           device const float *state_in [[buffer(0)]],
+                           device const float *transition [[buffer(1)]],
+                           device const float *injection [[buffer(2)]],
+                           device float *state_out [[buffer(3)]],
+                           constant h3_linear_branch_dims &args
+                               [[buffer(4)]],
+                           uint head [[thread_position_in_grid]]) {
+    if (head >= args.heads) return;
+    uint d = args.head_dim;
+    uint base = head * d * d;
+    /* Each thread computes one element of state_out[head]. */
+    /* Serialized for simplicity — d*d = 16384 threads per head, F frames. */
+    for (uint c = 0; c < d; c++) {
+        for (uint r = 0; r < d; r++) {
+            float sum = injection[base + c * d + r];
+            for (uint k = 0; k < d; k++) {
+                sum = fma(state_in[base + c * d + k],
+                          transition[base + k * d + r], sum);
+            }
+            state_out[base + c * d + r] = sum;
+        }
+    }
+}
+
+/* Phase 4: gather_linear_state with bridge alpha decay.
+ *
+ * For each query frame t with softmax window [lo, hi]:
+ *   state[t] = prefix[lo-1] · α_bridge_before + suffix[hi+1] · α_bridge_after
+ *
+ * where α_bridge is the product of alpha values across the frames between
+ * the gathered state and the query frame (the bridge). Ends of the sequence
+ * read text_state instead of an out-of-range state.
+ *
+ * Input:  prefix [F,H,d,d], suffix [F,H,d,d] fp32
+ *         alpha [F,H,d] fp32, bounds [F,2] uint32, text_state [H,d,d] fp32
+ * Output: gathered [F,H,d,d] fp32 */
+kernel void h3_linear_branch_gather(
+                           device const float *prefix [[buffer(0)]],
+                           device const float *suffix [[buffer(1)]],
+                           device const float *alpha [[buffer(2)]],
+                           device const uint *bounds [[buffer(3)]],
+                           device const float *text_state [[buffer(4)]],
+                           device float *gathered [[buffer(5)]],
+                           device const float *log_alpha_prefix [[buffer(6)]],
+                           constant h3_linear_branch_dims &args
+                               [[buffer(7)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint head = gid.y;
+    uint di = gid.z % args.head_dim;
+    uint dj = (gid.z / args.head_dim) % args.head_dim;
+    if (frame >= args.num_frames || head >= args.heads) return;
+    uint d = args.head_dim;
+    uint base_state = ((frame * args.heads + head) * d + di) * d + dj;
+    uint lo = bounds[frame * 2 + 0];
+    uint hi = bounds[frame * 2 + 1];
+
+    /* Gather indices: prefix[lo-1], suffix[hi+1], clamped. */
+    int before_idx = (int)lo - 1;
+    int after_idx = (int)hi + 1;
+    int has_before = before_idx >= 0;
+    int has_after = after_idx < (int)args.num_frames;
+    before_idx = max(before_idx, 0);
+    after_idx = min(after_idx, (int)args.num_frames - 1);
+
+    /* Bridge alpha: product of alpha over frames between gather idx and query.
+     * Computed via log-prefix-sum difference: exp(log_pref[t+1] - log_pref[a]). */
+    float alpha_before = 1.0f, alpha_after = 1.0f;
+    if (has_before && frame > 0) {
+        int a = before_idx + 1;
+        int b = frame;
+        if (a <= b) {
+            float log_sum = log_alpha_prefix[(b + 1) * args.heads * d +
+                                             head * d + dj] -
+                            log_alpha_prefix[a * args.heads * d + head * d + dj];
+            alpha_before = exp(log_sum);
+        }
+    }
+    if (has_after && frame < args.num_frames - 1) {
+        int a = frame;
+        int b = after_idx;
+        if (a <= b) {
+            float log_sum = log_alpha_prefix[(b + 1) * args.heads * d +
+                                             head * d + dj] -
+                            log_alpha_prefix[a * args.heads * d + head * d + dj];
+            alpha_after = exp(log_sum);
+        }
+    }
+
+    uint base_before = ((before_idx * args.heads + head) * d + di) * d + dj;
+    uint base_after = ((after_idx * args.heads + head) * d + di) * d + dj;
+    uint base_text = (head * d + di) * d + dj;
+
+    float sb = has_before ? prefix[base_before] : text_state[base_text];
+    float sa = has_after ? suffix[base_after] : text_state[base_text];
+    gathered[base_state] = sb * alpha_before + sa * alpha_after;
+}
+
+/* Phase 4 helper: build log-alpha prefix sums.
+ *
+ * log_alpha_prefix[f+1] = log_alpha_prefix[f] + log(alpha[f])
+ * with log_alpha_prefix[0] = 0. This lets gather compute any range product
+ * as a single subtraction. Input alpha is [F,H,d] fp32, output is [F+1,H,d]. */
+kernel void h3_linear_branch_log_alpha_prefix(
+                           device const float *alpha [[buffer(0)]],
+                           device float *log_alpha_prefix [[buffer(1)]],
+                           constant h3_linear_branch_dims &args
+                               [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    uint head = gid.x;
+    uint dj = gid.y;
+    if (head >= args.heads || dj >= args.head_dim) return;
+    float sum = 0.0f;
+    log_alpha_prefix[head * args.head_dim + dj] = 0.0f;
+    for (uint f = 0; f < args.num_frames; f++) {
+        float a = alpha[f * args.heads * args.head_dim +
+                        head * args.head_dim + dj];
+        sum += log(max(a, 1e-12f));
+        log_alpha_prefix[(f + 1) * args.heads * args.head_dim +
+                         head * args.head_dim + dj] = sum;
+    }
+}
+
+/* Phase 5: linear-branch output projection.
+ *
+ * For each token (frame f, head h, token s):
+ *   q_normed = RMSNorm(q[f,h,s])    (the branch has its own norm)
+ *   out[f,h,s,d_v] = gate[f,h,s,d_v] · (gathered[f,h] @ q_normed)
+ *
+ * gathered is [F,H,d,d_v], q is [F,H,S,d], gate is [F,H,S,d_v].
+ * Output out is [F,H,S,d_v] bf16.
+ *
+ * d_v == d == 128 for H3. */
+kernel void h3_linear_branch_output(
+                           device const float *gathered [[buffer(0)]],
+                           device const bfloat *q [[buffer(1)]],
+                           device const bfloat *gate [[buffer(2)]],
+                           device const bfloat *q_norm_weight [[buffer(3)]],
+                           device bfloat *out [[buffer(4)]],
+                           constant h3_linear_branch_dims &args
+                               [[buffer(5)]],
+                           constant float &epsilon [[buffer(6)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint head = gid.y;
+    uint token = gid.z;
+    if (frame >= args.num_frames || head >= args.heads ||
+        token >= args.tokens_per_frame) return;
+    uint d = args.head_dim;
+    uint q_base = ((frame * args.heads + head) * args.tokens_per_frame + token) * d;
+    uint out_base = q_base;
+
+    /* RMSNorm(q) over d dimensions. */
+    float sum_sq = 0.0f;
+    for (uint i = 0; i < d; i++) {
+        float qi = (float)q[q_base + i];
+        sum_sq = fma(qi, qi, sum_sq);
+    }
+    float inv_r2 = rsqrt(sum_sq / (float)d + epsilon);
+
+    /* state @ q_normed: gathered is [d,d], q_normed is [d]. */
+    uint g_base = (frame * args.heads + head) * d * d;
+    for (uint j = 0; j < d; j++) {
+        float dot = 0.0f;
+        for (uint k = 0; k < d; k++) {
+            float qk = (float)q[q_base + k] * inv_r2 * (float)q_norm_weight[k];
+            dot = fma(gathered[g_base + j * d + k], qk, dot);
+        }
+        float g = (float)gate[out_base + j];
+        out[out_base + j] = (bfloat)(g * dot);
+    }
+}

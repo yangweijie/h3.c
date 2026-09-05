@@ -632,4 +632,63 @@ int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
 
+/* Windowed SDPA: build a causal mask where video<->video pairs are restricted
+ * to a per-frame window |t_q - t_k| <= radius. Output mask is [total_rows,
+ * total_rows] fp32 where 0 = attend, -INFINITY = mask. This reduces the
+ * attention compute from O(T²) to O(T * window) when used with a sparse SDPA. */
+int h3_gpu_sdpa_window_mask_bf16(h3_gpu *gpu, h3_gpu_tensor *mask,
+                                 uint32_t window_radius, uint32_t num_frames,
+                                 uint32_t tokens_per_frame, uint32_t video_start,
+                                 uint32_t total_rows, uint32_t text_rows,
+                                 uint32_t audio_rows);
+
+/* Linear far-branch attention (SanaDelta delta-rule scan).
+ *
+ * These kernels implement O(n) far-field attention via a per-frame recurrent
+ * state [H,d,d]. They require trained weights (alpha, beta, q_norm, gate,
+ * to_out_linear) that are NOT in the current H3 dense checkpoint. Provided
+ * as infrastructure for future training/fine-tuning.
+ *
+ * Pipeline: frame_stats -> symmetrize_A -> factor_apply -> scan_frame (F
+ * times per direction) -> log_alpha_prefix -> gather -> output. */
+
+int h3_gpu_linear_branch_frame_stats(
+    h3_gpu *gpu, h3_gpu_tensor *A, h3_gpu_tensor *B,
+    const h3_gpu_tensor *k, const h3_gpu_tensor *v, const h3_gpu_tensor *beta,
+    uint32_t num_frames, uint32_t tokens_per_frame, uint32_t heads,
+    uint32_t head_dim);
+
+int h3_gpu_linear_branch_symmetrize_A(
+    h3_gpu *gpu, h3_gpu_tensor *A, uint32_t num_frames, uint32_t heads,
+    uint32_t head_dim);
+
+int h3_gpu_linear_branch_factor_apply(
+    h3_gpu *gpu, h3_gpu_tensor *transition, h3_gpu_tensor *injection,
+    const h3_gpu_tensor *A, const h3_gpu_tensor *B, const h3_gpu_tensor *alpha,
+    uint32_t num_frames, uint32_t tokens_per_frame, uint32_t heads,
+    uint32_t head_dim);
+
+int h3_gpu_linear_branch_scan_frame(
+    h3_gpu *gpu, h3_gpu_tensor *state_out, const h3_gpu_tensor *state_in,
+    const h3_gpu_tensor *transition, const h3_gpu_tensor *injection,
+    uint32_t heads, uint32_t head_dim);
+
+int h3_gpu_linear_branch_log_alpha_prefix(
+    h3_gpu *gpu, h3_gpu_tensor *log_alpha_prefix, const h3_gpu_tensor *alpha,
+    uint32_t num_frames, uint32_t heads, uint32_t head_dim);
+
+int h3_gpu_linear_branch_gather(
+    h3_gpu *gpu, h3_gpu_tensor *gathered, const h3_gpu_tensor *prefix,
+    const h3_gpu_tensor *suffix, const h3_gpu_tensor *alpha,
+    const h3_gpu_tensor *bounds, const h3_gpu_tensor *text_state,
+    const h3_gpu_tensor *log_alpha_prefix, uint32_t num_frames,
+    uint32_t tokens_per_frame, uint32_t heads, uint32_t head_dim);
+
+int h3_gpu_linear_branch_output(
+    h3_gpu *gpu, h3_gpu_tensor *out, const h3_gpu_tensor *gathered,
+    const h3_gpu_tensor *q, const h3_gpu_tensor *gate,
+    const h3_gpu_tensor *q_norm_weight, uint32_t num_frames,
+    uint32_t tokens_per_frame, uint32_t heads, uint32_t head_dim,
+    float epsilon);
+
 #endif

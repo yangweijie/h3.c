@@ -106,6 +106,9 @@ tests/bench_dit_864.o: tests/bench_dit.c
 	$(CC) $(CFLAGS) -I. -DH3_BENCH_LATENT_H=30 \
 		-DH3_BENCH_LATENT_W=54 -c $< -o $@
 
+h3_linear_branch_tests: tests/test_linear_branch.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
