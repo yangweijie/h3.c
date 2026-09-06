@@ -208,6 +208,17 @@ void h3_cache_set_enabled(h3_ctx *ctx, int enabled);
 void h3_cache_clear(h3_ctx *ctx);
 void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 
+/* Persist the text/vision conditioning cache to `directory` so a later
+ * process re-running the same prompt and visual inputs skips the Qwen
+ * encoder entirely (no weight-store reopen, no Metal shader compile).
+ *
+ * The cache key covers the prompt, every referenced media file's stat, and a
+ * model fingerprint of the encoder/tokenizer/VAE directories, so any input or
+ * checkpoint change falls through to a fresh encode. Files are written
+ * atomically and validated before use; a corrupted entry is discarded and
+ * re-encoded. Pass NULL or "" to disable (the default). */
+void h3_cache_set_disk_dir(h3_ctx *ctx, const char *directory);
+
 /* Generate media, delivering decoded frames incrementally through on_frame. */
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params);

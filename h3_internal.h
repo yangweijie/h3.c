@@ -15,6 +15,7 @@ struct h3_ctx {
     h3_device_info device;
     h3_model_info model;
     int cache_enabled;
+    char *conditioning_disk_dir;
     char *conditioning_key;
     size_t conditioning_tokens;
     size_t conditioning_width;
