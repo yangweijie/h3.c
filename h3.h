@@ -205,6 +205,7 @@ const h3_model_info *h3_model(const h3_ctx *ctx);
 /* Interactive-session reuse. Disabled by default so one-shot callers retain
  * the original phase-by-phase memory lifetime. */
 void h3_cache_set_enabled(h3_ctx *ctx, int enabled);
+void h3_cache_set_models_enabled(h3_ctx *ctx, int enabled);
 void h3_cache_clear(h3_ctx *ctx);
 void h3_cache_get_info(const h3_ctx *ctx, h3_cache_info *info);
 

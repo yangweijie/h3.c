@@ -830,6 +830,7 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     memset(&state, 0, sizeof(state));
     state.ctx = ctx;
     h3_cache_set_enabled(ctx, 1);
+    h3_cache_set_models_enabled(ctx, 1);
     state.model_dir = model_dir;
     state.params = *initial;
     const h3_reference *initial_references = initial->references;
