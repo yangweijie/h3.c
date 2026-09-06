@@ -91,3 +91,64 @@
 - 生成入口：`main.c` prompt 分支 → `h3_generate()` → `params.output_path`
 - SR 实现：`h3_ffmpeg.c::h3_superres`
 - 交互：`h3_cli.c::process_command` 的 `!sr`
+
+# VDN-H3 规格研究 (2026-09-05 session)
+
+## 混合注意力（hybrid_attention.py）
+- `softmax_out = to_out[0](softmax_gate(x)⊙window_softmax(q,k,v)) → to_out[1]`；`out[video行] += to_out_linear(output_gate(xv)⊙RMSNorm(linear_readout))`
+- 线性分支共享 softmax 的 raw q/k/v（pre-QK-norm、pre-RoPE，NoPE）；只处理 video 行
+- full_cover（窗口覆盖全部帧）时走原稠密 attention，线性分支关闭
+
+## softmax 窗口（window.py）
+- `window_bounds(F, radius, chunk)`：chunk=0 帧模式 `|t−k|≤r`；chunk=K 块模式 frame t → `[(t//K−r)·K, (t//K+r+1)·K−1]`
+- VDN checkpoint: chunk=5, radius=1 → 每 query 帧看 3 个整块（15 帧）
+- anchor_frames="both"：帧 0 与 F−1 (a) 作为行 dense（query 看全序列），(b) 作为列（所有 query 可见，不与窗口重复）；此时线性分支 skip_ends（首尾帧输入整段删除、读出=0，bounds 重基 −1）
+- text/audio 行稠密双向
+
+## 线性分支（branch.py + scan.py + delta_rule.py + features.py + layers.py）
+- 特征：k,v 先 depthwise 5×5 空间 conv（padding2, groups=7168）再 5-tap 时间 conv（零填充非因果）；k: conv→SiLU→L2Norm(1e-6)；q: SiLU→L2Norm；v: conv→SiLU 不归一
+- beta=sigmoid(beta_proj(x)) [F,H,S]；A=(βk)ᵀk fp32 对称化；B=(βv)ᵀk fp32
+- alpha=exp(−exp(A_log_h)·softplus(up(down(x̄_f))+dt_bias)) fp32，x̄_f=帧均值(dtype=fp32)
+- vdn_solve（released checkpoint 用的规则）：chol(I+A)，inv=L⁻ᵀL⁻¹，transition=Diag(alpha)·inv，injection=B@inv（全部 fp32 算完再回 bf16）
+- 文本状态：text 行无 conv，beta 同 beta_proj，alpha=ones，c=1/sqrt(L_text) 缩放 A/B 后同规则得 S_text；双向扫描起点 = 0.5·S_text
+- 扫描：S_t = S_{t-1}·transition_t + injection_t，forward 前缀 + reverse 后缀（fp32 状态库）
+- gather：left=prefix[lo−1]、right=suffix[hi+1]；bridge=α 在 [边,t] 帧区间乘积（log 前缀差）；窗口触界侧读 text_state 按 α 衰减；两侧相加
+- 读出：einsum(fshv, fhvk) → RMSNorm(head_dim=128) → ×output_gate（down[128,5376]+up[7168,128]+bias, sigmoid, per token/head/channel）→ reshape [T, 7168]
+- softmax_gate：per head [56,5376]+bias，sigmoid 后乘 softmax 输出
+
+## LoRA / 调度
+- default: rank64 alpha64 → scale=1.0，targets `attn.orig.to_{q,k,v}`、`attn.orig.to_out.0`、token_refiner 同四件
+- turbo: 同 targets、后缀 `.lora_A.turbo`（非 default），另含 `norm_out.linear.lora_*.turbo.weight` [16,2688]/[10752,16]（final layer）
+- turbo 8 steps；video_shift=12.0 / audio_shift=3.0 —— 与 h3_host.h 的 H3_VIDEO_SIGMA_SHIFT/H3_AUDIO_SIGMA_SHIFT 完全一致，调度无需改
+
+## h3.c 现状要点（调研结论）
+- DiT 常量已匹配：HEADS=56, HEAD_DIM=128, INNER=7168, FFN=14336（h3_dit.c:18-33）
+- run_block 在 h3_dit.c:2420-2592；全序列稠密 SDPA（h3_gpu_sdpa_bf16），无窗口/线性分支接线
+- 已有未接线基础设施：h3_flash_attn_tiled_windowed（shaders:5468）、h3_sdpa_window_mask（4507）、SanaDelta linear-branch 内核组（4555-4850，一阶截断 ≠ vdn_solve）
+- h3_lora.c：仅 6 个固定 target、仅 `.default` 后缀、单 alpha、仅 BF16、不支持 streaming/int8；机制上 target 字符串任意，扩 orig.* 行带映射即可
+- 权重目录：h3_weight_store_open glob 目录全部 *.safetensors（多分片 OK）；h3_load_dir 只认 FL2VA 自有布局 → VDN stage 目录需单独加载器
+- 缺 depthwise conv Metal 内核；缺批量 Cholesky；kernel 注册流程明确（shaders + h3_gpu.m 名单 + wrapper）
+
+## VDN 集成实现要点 (2026-09-05/06 session)
+- 新增 16 个 h3_vdn_* Metal 内核 + h3_vdn_window_args/feat_args/bmm_args（C/Metal 字段对齐）
+- bf16 加载陷阱：h3_bf16_to_f32(value) 的隐式转换会产生垃圾 → 必须用指针重载
+  h3_bf16_to_f32(ptr + idx)；Metal 无 log1p；线程组内存上限 32KB
+- bmm 的 add 缓冲必须始终绑定（缺绑定 → 命令缓冲中止，且无显式报错）——
+  用 Metal API Validation（MTL_DEBUG_LAYER=1）抓到
+- vdn_solve 精确求逆 = h3_vdn_cholesky（线程=列, 右移更新, 共享列广播）
+  + h3_vdn_triinv（行广播前代）+ bmm(XᵀX)；对角线在内核内 +I
+- LoRA 流式合并：SSD 预读线程用 h3_lora_merge_blocking /
+  h3_gpu_blocking_linear_bf16（私有 command buffer，不与主线程 open buffer 冲突）
+- to_out_linear 走 STREAM_LIN_OUT 流式；其余分支张量常驻 ~12MB/块
+- 坑：qsort 越界（未初始化的第 5 个 source）——SEGFAULT 在无关位置，靠
+  原HEAD对照+栈回溯定位；stream source 需显式 source_count
+- 端到端：convrot 基座 + stage-dmd adapters(default+turbo) + linear_branch
+  在 16GB 机 streaming 模式下可完成全部 8 步去噪 + VAE 解码
+
+## 视频 VAE streaming 崩溃（既有 bug，与 VDN 无关）
+- 现象：audio VAE 7/7 之后、video VAE 解码阶段静默 SIGSEGV（exit 139），无 MP4
+- 复现：任何开启 auto memory plan 的运行（planner 会打开 video_vae_streaming）
+  —— 基座（无 --linear-branch/--lora）同样 139；显式 --ssd-streaming
+  （绕过 planner → video_vae_streaming=0）则 exit 0 正常出片
+- 结论：崩溃点在 run_stream_tile 流式 VAE 解码路径，与本次 VDN 改动无关
+- 规避：运行 VDN 时显式加 --ssd-streaming（禁用 auto plan）

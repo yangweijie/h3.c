@@ -32,7 +32,21 @@ typedef struct h3_lora h3_lora;
  * if the file is missing, not BF16, or has no alpha/rank metadata. */
 h3_lora *h3_lora_open(const char *path, char *error, size_t error_size);
 
+/* Merge on a private, immediately-committed command buffer: usable from the
+ * SSD prefetch thread while the main thread has a command buffer open. */
+int h3_lora_merge_blocking(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
+                           const char *lora_prefix, const char *target,
+                           size_t row0, size_t rows, size_t in_dim,
+                           char *error, size_t error_size);
+
 void h3_lora_close(h3_lora *lora);
+
+/* 1 when this adapter carries a BF16 lora_A factor for `target` whose input
+ * width equals `in_dim` (the merge can proceed); 0 when the target is absent
+ * or shape-incompatible. Used to skip adapters that do not fit the base
+ * (e.g. a diffusers-shaped turbo LoRA over a pruned ConvRot checkpoint). */
+int h3_lora_matches(h3_lora *lora, const char *lora_prefix,
+                    const char *target, size_t rows, size_t in_dim);
 
 /* Merge into the already-loaded GPU tensor `weight`, which represents a
  * [rows_total, in_dim] BF16 matrix laid out row-major.
@@ -50,5 +64,14 @@ int h3_lora_apply(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
                   const char *lora_prefix, const char *target,
                   size_t row0, size_t rows, size_t in_dim,
                   char *error, size_t error_size);
+
+/* Same merge with an explicit PEFT adapter name in the factor keys
+ * ("...lora_A.<adapter>.weight"). "default" matches h3_lora_apply. VDN turbo
+ * adapters store their factors under ".turbo". */
+int h3_lora_apply_named(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
+                        const char *lora_prefix, const char *target,
+                        const char *adapter,
+                        size_t row0, size_t rows, size_t in_dim,
+                        char *error, size_t error_size);
 
 #endif

@@ -225,8 +225,14 @@ static void *vae_prefetch_thread(void *opaque) {
 }
 
 static int vae_prefetch_enabled(void) {
+    /* Default OFF. The prefetch worker loads block N+1 by calling the same
+     * h3_gpu tensor allocators on the shared vae->gpu while the main thread
+     * has an open command buffer decoding block N; that concurrent ObjC/Metal
+     * access races and crashes (objc_retain of a dangling pointer). Until that
+     * is made thread-safe, keep the serial path. Opt in with H3_VAE_PREFETCH=1.
+     */
     const char *flag = getenv("H3_VAE_PREFETCH");
-    return !(flag && *flag && strcmp(flag, "0") == 0);
+    return flag && strcmp(flag, "1") == 0;
 }
 /* --- end P12 ----------------------------------------------------------- */
 

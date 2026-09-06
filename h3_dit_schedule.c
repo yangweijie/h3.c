@@ -1,5 +1,7 @@
 #include "h3_dit_schedule.h"
 
+#include "h3_lora.h"
+
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -404,10 +406,35 @@ static h3_gpu_tensor *time_table_embeddings(h3_gpu *gpu, uint32_t rows,
     return bf16;
 }
 
+/* Merge LoRA adapters into an AdaLN projection weight before the per-step
+ * precompute consumes it. Adapters that do not fit the base layout (pruned
+ * ConvRot checkpoints shrink the AdaLN input) are skipped with a warning
+ * instead of failing the load. Returns 0 on hard failure. */
+static int merge_adaln_loras(h3_lora **loras, int lora_count, h3_gpu *gpu,
+                             h3_gpu_tensor *weight, const char *lora_prefix,
+                             const char *target, size_t rows, size_t in_dim,
+                             char *error, size_t error_size) {
+    if (!loras || !lora_count) return 1;
+    for (int index = 0; index < lora_count; index++) {
+        h3_lora *lora = loras[index];
+        if (!h3_lora_matches(lora, lora_prefix, target, rows, in_dim)) {
+            fprintf(stderr,
+                    "warning: LoRA adapter skipped for %s%s (%zu-wide AdaLN "
+                    "input does not fit this checkpoint)\n",
+                    lora_prefix ? lora_prefix : "", target, in_dim);
+            continue;
+        }
+        if (!h3_lora_apply(gpu, lora, weight, lora_prefix, target, 0, rows,
+                           in_dim, error, error_size))
+            return 0;
+    }
+    return 1;
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
-    int audio_condition,
+    int audio_condition, h3_lora **loras, int lora_count,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -501,7 +528,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             goto failed;
         }
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
-        int ok = gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
+        char lora_prefix[64];
+        snprintf(lora_prefix, sizeof(lora_prefix), "transformer_blocks.%u",
+                 block);
+        int ok = merge_adaln_loras(loras, lora_count, gpu, weight,
+                                   lora_prefix, "adaln_proj.linear",
+                                   BLOCK_OUTPUT, time_dim, error, error_size) &&
+            gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
             gpu_op(gpu, h3_gpu_linear_bf16(
                 gpu, schedule->blocks[block], time, weight, bias,
                 schedule->time_rows, time_dim, BLOCK_OUTPUT),
@@ -539,6 +572,9 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
     if (!final_w || !final_b || !schedule->final ||
+        !merge_adaln_loras(loras, lora_count, gpu, final_w, "",
+                           "norm_out.linear", FINAL_OUTPUT, time_dim,
+                           error, error_size) ||
         !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                 "begin final AdaLN") ||
         !gpu_op(gpu, h3_gpu_linear_bf16(

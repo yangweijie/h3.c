@@ -115,6 +115,9 @@ h3_flash_attn_tests: tests/test_flash_attn.o $(LIB_OBJ)
 h3_tiled_windowed_tests: tests/test_tiled_windowed.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_vdn_tests: tests/test_vdn_branch.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_flash_attn_debug: tests/test_flash_attn_debug.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -129,7 +132,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test \
-	h3_convrot_test
+	h3_convrot_test h3_vdn_tests
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -151,6 +154,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	fi
 	./h3_audio_gpu_tests
 	./h3_convrot_test
+	./h3_vdn_tests
 	@if test -f MiniMax-H3/FL2VA/audio_vae/model.safetensors && \
 	         test -f misc/fixtures/h3_real_audio_vae_37.safetensors; then \
 		./h3_real_audio_vae_test; \

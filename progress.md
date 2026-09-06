@@ -136,3 +136,47 @@
 | What's the goal? | 找最小清晰分辨率并产出可用视频（已定位色块根因=渲染过低）|
 | What have I learned? | 见 findings.md（色块根因 + 帧数下限 12 + SR 行为 + 分辨率矩阵）|
 | What have I done? | 分辨率扫描 + 人脸 1:1 矩阵（13 分辨率 × 3 layer）已出 |
+
+## Session: 2026-09-05 (VDN-H3 完整支持)
+### Phase 1: 规格研究 — complete
+- Python 参考实现精读完成；checkpoint 权重清单实测（每 block 16 张量）；h3.c 调研完成
+- 规格见 findings.md「VDN-H3 规格研究」
+
+### Phase 2: LoRA 扩展 — complete（代码）
+- h3_lora: 新增 h3_lora_apply_named（显式 adapter 名）、h3_lora_matches（形状兼容探测）、
+  自动推断 adapter 名（default/turbo 后缀）
+- h3_dit: lora[4] 数组，--lora 逗号分隔多 adapter 顺序合并；load_block 增加 attn.orig.* targets
+- h3_dit_schedule: precompute 增加 loras 参数；adaln_proj.linear / norm_out.linear 合并
+  （形状不匹配时告警跳过，兼容 pruned convrot 基座）
+- main.c: --linear-branch DIR 参数；h3.h: params.linear_branch_path
+- 全库编译通过（仅预存警告）
+
+### Phase 3: 线性分支权重加载 — complete（代码）
+- h3_dit_block 新增 16 个 lin_* 字段 + free
+- load_vdn_block: 从 vdn_weights store 加载（sp/tm 卷积权重按真实 4/3 维校验）
+- load_dit 新参数 linear_branch_path；ssd_streaming 互斥；两公开 API + 全部调用点更新
+
+### Phase 4: Metal 内核 — complete（代码 + 单测）
+- 新增 16 个 h3_vdn_* Metal 内核（窗口注意力/门控/特征/短卷积/alpha/Cholesky/三角求逆/bmm/
+  行缩放/扫描/gather/读出）+ h3_gpu.m 包装 + h3_gpu.h 声明 + pipeline 注册
+- 复用既有 h3_linear_branch_frame_stats/symmetrize/log_alpha_prefix
+- 修复：bmm 缺 add 绑定导致命令缓冲中止（Metal 校验层定位）；bf16 值加载必须用指针重载；
+  cholesky 对角写 d 而非 1；triinv 清零上三角；log1p 不存在
+- tests/test_vdn_branch.c：cholesky 求逆 rel=0、窗口注意力 vs CPU rel_l2=0.00167（含 chunk
+  bounds + anchor both 语义），已加入 make test
+
+### Phase 5: run_block 接线 — in_progress
+
+### Phase 5: run_block 接线 — complete（代码）
+- run_block: VDN 模式 = 窗口注意力 + softmax gate + bf16 QKV（禁 int8 qkv/头主输出/
+  token reduction/激活别名）+ 线性分支（features→beta/alpha→stats→cholesky 求逆→双向扫描
+  →gather→readout→to_out_linear→加到 video 行）
+- prepare_vdn：c5 窗口 bounds（softmax 未夹紧 + skip_ends 重基）、全部 scratch 缓冲
+- load_vdn_block：alpha down/up/dt_bias 转 fp32（Python 的 alpha fp32 岛）
+
+### Phase 6: streaming 支持 — complete（代码）
+- 16GB 机器无法全驻留 → STREAM_LIN_OUT 流式 to_out_linear；其余分支张量常驻（~12MB/块）
+- LoRA 在流式读取线程内合并：merge_block_loras(blocking=1) +
+  h3_lora_merge_blocking / h3_gpu_blocking_linear_bf16（私有命令缓冲，不碰主线程 open buffer）
+- 修复内存规划器同时建议 ssd_streaming+int8_row_fc2 的既有互斥冲突
+- 端到端跑通进入去噪循环（8 步 turbo，约 7-8 分钟/步，步骤 1/8 已完成）

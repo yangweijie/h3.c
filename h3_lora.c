@@ -12,6 +12,7 @@ struct h3_lora {
     h3_st_header header;
     float scale;   /* alpha / rank */
     size_t rank;
+    char adapter[64];   /* PEFT adapter name parsed from the lora_A keys */
 };
 
 static float bf16_to_f32(uint16_t value) {
@@ -75,6 +76,27 @@ h3_lora *h3_lora_open(const char *path, char *error, size_t error_size) {
         h3_lora_close(lora);
         return NULL;
     }
+    /* Parse the adapter name out of the first lora_A key
+     * ("...lora_A.<adapter>.weight"); "default" is the PEFT fallback. */
+    for (size_t index = 0; index < lora->header.tensor_count; index++) {
+        const h3_st_tensor *tensor = &lora->header.tensors[index];
+        if (tensor->ndim == 2 && strstr(tensor->name, "lora_A") != NULL) {
+            const char *start = strstr(tensor->name, "lora_A.");
+            if (start) {
+                start += 7;
+                const char *end = strstr(start, ".weight");
+                size_t length = end && end > start ?
+                    (size_t)(end - start) : 0;
+                if (length && length < sizeof(lora->adapter)) {
+                    memcpy(lora->adapter, start, length);
+                    lora->adapter[length] = '\0';
+                }
+            }
+            break;
+        }
+    }
+    if (!lora->adapter[0]) snprintf(lora->adapter, sizeof(lora->adapter),
+                                    "default");
     /* Read alpha from the raw JSON header (the tensor parser skips
      * __metadata__). Diffusers writes it as a JSON string, e.g. "128". */
     float alpha = 1.0f;
@@ -108,26 +130,87 @@ h3_lora *h3_lora_open(const char *path, char *error, size_t error_size) {
     return lora;
 }
 
+static int lora_merge(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
+                      const char *lora_prefix, const char *target,
+                      const char *adapter, size_t row0, size_t rows,
+                      size_t in_dim, int blocking,
+                      char *error, size_t error_size);
+
+int h3_lora_merge_blocking(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
+                           const char *lora_prefix, const char *target,
+                           size_t row0, size_t rows, size_t in_dim,
+                           char *error, size_t error_size) {
+    return lora_merge(gpu, lora, weight, lora_prefix, target, NULL, row0,
+                      rows, in_dim, 1, error, error_size);
+}
+
 void h3_lora_close(h3_lora *lora) {
     if (!lora) return;
     h3_st_free_header(&lora->header);
     free(lora);
 }
 
+int h3_lora_matches(h3_lora *lora, const char *lora_prefix,
+                    const char *target, size_t rows, size_t in_dim) {
+    (void)rows;   /* the lora_A factor constrains only the input width */
+    if (!lora || !target) return 0;
+    char key[256];
+    int written = lora_prefix && lora_prefix[0]
+        ? snprintf(key, sizeof(key), "%s.%s.lora_A.%s.weight",
+                   lora_prefix, target, lora->adapter)
+        : snprintf(key, sizeof(key), "%s.lora_A.%s.weight",
+                   target, lora->adapter);
+    if (written >= (int)sizeof(key)) return 0;
+    const h3_st_tensor *a = h3_st_find(&lora->header, key);
+    if (!a || a->dtype != H3_DTYPE_BF16 || a->ndim != 2) return 0;
+    return (size_t)a->shape[1] == in_dim;
+}
+
 int h3_lora_apply(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
                   const char *lora_prefix, const char *target,
                   size_t row0, size_t rows, size_t in_dim,
                   char *error, size_t error_size) {
+    return h3_lora_apply_named(gpu, lora, weight, lora_prefix, target,
+                               "default", row0, rows, in_dim, error, error_size);
+}
+
+int h3_lora_apply_named(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
+                        const char *lora_prefix, const char *target,
+                        const char *adapter, size_t row0, size_t rows,
+                        size_t in_dim, char *error, size_t error_size) {
+    return lora_merge(gpu, lora, weight, lora_prefix, target, adapter, row0,
+                      rows, in_dim, 0, error, error_size);
+}
+
+/* Shared merge body. `blocking` runs the delta GEMM on a private command
+ * buffer so the SSD prefetch thread can merge without touching the main
+ * thread's open command buffer. */
+static int lora_merge(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
+                      const char *lora_prefix, const char *target,
+                      const char *adapter, size_t row0, size_t rows,
+                      size_t in_dim, int blocking,
+                      char *error, size_t error_size) {
     if (!gpu || !lora || !weight || !lora_prefix || !target) {
         fail(error, error_size, "invalid LoRA apply arguments");
         return 0;
     }
     if (!rows) return 1;
+    if (!adapter || !*adapter) adapter = lora->adapter;
     char key_a[256], key_b[256];
-    if (snprintf(key_a, sizeof(key_a), "%s.%s.lora_A.default.weight",
-                 lora_prefix, target) >= (int)sizeof(key_a) ||
-        snprintf(key_b, sizeof(key_b), "%s.%s.lora_B.default.weight",
-                 lora_prefix, target) >= (int)sizeof(key_b)) {
+    int written_a, written_b;
+    if (lora_prefix[0])
+        written_a = snprintf(key_a, sizeof(key_a), "%s.%s.lora_A.%s.weight",
+                             lora_prefix, target, adapter);
+    else
+        written_a = snprintf(key_a, sizeof(key_a), "%s.lora_A.%s.weight",
+                             target, adapter);
+    if (lora_prefix[0])
+        written_b = snprintf(key_b, sizeof(key_b), "%s.%s.lora_B.%s.weight",
+                             lora_prefix, target, adapter);
+    else
+        written_b = snprintf(key_b, sizeof(key_b), "%s.lora_B.%s.weight",
+                             target, adapter);
+    if (written_a >= (int)sizeof(key_a) || written_b >= (int)sizeof(key_b)) {
         fail(error, error_size, "LoRA key overflow");
         return 0;
     }
@@ -179,44 +262,24 @@ int h3_lora_apply(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
     h3_gpu_tensor *b_t = h3_gpu_tensor_from_bf16(gpu, b_bf16, rows * rank);
     h3_gpu_tensor *at_t =
         h3_gpu_tensor_from_bf16(gpu, at_bf16, in_dim * rank);
-    h3_gpu_tensor *delta = h3_gpu_tensor_new_bf16(gpu, rows * in_dim);
-    int ok = b_t && at_t && delta;
-    if (ok) ok = h3_gpu_begin(gpu);
-    if (ok) {
-        ok = h3_gpu_linear_bf16(gpu, delta, b_t, at_t, NULL,
-                                (uint32_t)rows, (uint32_t)rank,
-                                (uint32_t)in_dim);
-    }
-    if (ok) ok = h3_gpu_submit(gpu);
-    if (ok) {
-        /* Update the weight band: current + delta (both BF16). */
-        size_t band = rows * in_dim;
-        uint16_t *delta_bf16 = malloc(band * sizeof(uint16_t));
-        uint16_t *current_bf16 = malloc(band * sizeof(uint16_t));
-        uint16_t *merged_bf16 = malloc(band * sizeof(uint16_t));
-        if (!delta_bf16 || !current_bf16 || !merged_bf16) {
-            fail(error, error_size, "cannot allocate LoRA merge buffers");
-            ok = 0;
-        }
-        if (ok) ok = h3_gpu_tensor_read_bf16(delta, delta_bf16, band);
-        if (ok) ok = h3_gpu_tensor_read_bf16_range(
-            weight, row0 * in_dim, current_bf16, band);
-        if (ok) {
-            for (size_t index = 0; index < band; index++) {
-                merged_bf16[index] = f32_to_bf16(
-                    bf16_to_f32(current_bf16[index]) +
-                    bf16_to_f32(delta_bf16[index]));
-            }
-            ok = h3_gpu_tensor_write_bf16_range(
-                weight, row0 * in_dim, merged_bf16, band);
-        }
-        free(delta_bf16);
-        free(current_bf16);
-        free(merged_bf16);
+    int ok = b_t && at_t;
+    /* One fused kernel: weight += scale * B @ A, all on the GPU. The old path
+     * read the delta back to the host, added it there and wrote it back, which
+     * dominated the SSD streaming loop (about 1 GiB of host traffic per block
+     * per adapter, every step). */
+    if (ok && blocking) {
+        ok = h3_gpu_blocking_lora_geam_bf16(gpu, weight, row0, b_t, at_t,
+                                            (uint32_t)rows, (uint32_t)rank,
+                                            (uint32_t)in_dim);
+    } else if (ok) {
+        ok = h3_gpu_begin(gpu);
+        if (ok) ok = h3_gpu_lora_geam_bf16(gpu, weight, row0, b_t, at_t,
+                                           (uint32_t)rows, (uint32_t)rank,
+                                           (uint32_t)in_dim);
+        if (ok) ok = h3_gpu_submit(gpu);
     }
     h3_gpu_tensor_free(b_t);
     h3_gpu_tensor_free(at_t);
-    h3_gpu_tensor_free(delta);
     free(a_bf16);
     free(b_bf16);
     free(at_bf16);

@@ -30,3 +30,4 @@ libh3.a
 .DS_Store
 __pycache__/
 candidate.npz
+tmp_lora_test/

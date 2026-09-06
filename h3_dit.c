@@ -55,6 +55,27 @@ typedef struct {
     h3_gpu_tensor *fc1_scales;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    /* VDN-H3 linear attention branch (all NULL unless a linear-branch
+     * checkpoint was supplied). Shapes are the released stage-b layout. */
+    h3_gpu_tensor *lin_alpha_down;    /* [128, HIDDEN] */
+    h3_gpu_tensor *lin_alpha_up;      /* [INNER, 128] */
+    h3_gpu_tensor *lin_alpha_dt_bias; /* [INNER] */
+    h3_gpu_tensor *lin_alpha_a_log;   /* [HEADS] */
+    h3_gpu_tensor *lin_beta_proj;     /* [HEADS, HIDDEN] */
+    h3_gpu_tensor *lin_norm;          /* [HEAD_DIM] */
+    h3_gpu_tensor *lin_conv_k_sp;     /* [INNER, 25] flattened 5x5 */
+    h3_gpu_tensor *lin_conv_k_tm;     /* [INNER, 5] */
+    h3_gpu_tensor *lin_conv_v_sp;     /* [INNER, 25] */
+    h3_gpu_tensor *lin_conv_v_tm;     /* [INNER, 5] */
+    h3_gpu_tensor *lin_gate_down;     /* [128, HIDDEN] */
+    h3_gpu_tensor *lin_gate_up;       /* [INNER, 128] */
+    h3_gpu_tensor *lin_gate_bias;     /* [INNER] */
+    h3_gpu_tensor *lin_softmax_gate;  /* [HEADS, HIDDEN] */
+    h3_gpu_tensor *lin_softmax_bias;  /* [HEADS] */
+    h3_gpu_tensor *lin_to_out;        /* [HIDDEN, INNER] */
+    h3_gpu_tensor *lin_alpha_down32;  /* fp32 copies for the alpha island */
+    h3_gpu_tensor *lin_alpha_up32;
+    h3_gpu_tensor *lin_alpha_dt_bias32;
 } h3_dit_block;
 
 enum {
@@ -62,6 +83,7 @@ enum {
     STREAM_OUT,
     STREAM_FC1,
     STREAM_FC2,
+    STREAM_LIN_OUT,
     STREAM_MATRICES
 };
 
@@ -80,7 +102,35 @@ typedef struct {
 
 typedef struct {
     h3_dit_stream_source sources[STREAM_MATRICES];
+    unsigned source_count;   /* STREAM_MATRICES, or 4 without the VDN branch */
 } h3_dit_stream_layer;
+/* Per-request scratch state for the VDN linear attention branch. All tensors
+ * are allocated once in prepare_vdn and reused for every block and step. */
+typedef struct {
+    uint32_t f_inner;      /* F - 2 inner frames (anchor frames are softmax-only) */
+    uint32_t s;            /* tokens per frame */
+    uint32_t gh, gw;       /* patched frame grid */
+    uint32_t inner_tokens; /* f_inner * s */
+    uint32_t row_start;    /* first sequence row of the inner slab */
+    h3_vdn_window_args window;
+    h3_vdn_feat_args feat_q, feat_k, feat_v;
+    h3_gpu_tensor *bounds_softmax;  /* [F, 2] f32, unclamped chunk windows */
+    h3_gpu_tensor *bounds_rebase;   /* [F_in, 2] f32, skip_ends rebased */
+    h3_gpu_tensor *spatial, *q_feat, *k_feat, *v_feat;
+    h3_gpu_tensor *beta_lin, *beta;
+    h3_gpu_tensor *mean, *alpha1, *alpha_delta, *alpha;
+    h3_gpu_tensor *A, *B, *xinv, *inv, *transition, *injection;
+    h3_gpu_tensor *prefix, *suffix, *lp, *gathered;
+    h3_gpu_tensor *softmax_gate_lin;
+    h3_gpu_tensor *gate1, *gate, *gate_f32, *readout, *branch_out;
+    h3_gpu_tensor *tk_feat, *tv_feat, *tbeta_lin, *tbeta;
+    h3_gpu_tensor *tA, *tB, *tX, *tinv, *tstate, *state;
+    /* int8 scratch for the VDN branch matmuls when H3_VDN_INT8 is set. */
+    h3_gpu_tensor *qkv_in_i8, *qkv_in_scales, *qkv_w_i8, *qkv_w_scales;
+    h3_gpu_tensor *readout_i8, *readout_scales, *toout_w_i8, *toout_w_scales;
+    size_t qkv_in_cap, readout_cap;  /* element capacity of the input int8 buffers */
+} h3_vdn_state;
+
 
 struct h3_dit {
     h3_gpu *gpu;
@@ -103,7 +153,11 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
-    h3_lora *lora;
+    h3_lora *lora[4];
+    int lora_count;
+    h3_weight_store *vdn_weights;   /* linear-branch checkpoint directory */
+    int vdn;
+    h3_vdn_state *vdn_state;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -784,6 +838,11 @@ static h3_gpu_tensor *bf2_convrot(h3_dit *dit, const char *name,
     return w;
 }
 
+static int merge_block_loras(h3_dit *dit, const char *lora_prefix,
+                             h3_gpu_tensor *qkv, h3_gpu_tensor *out,
+                             h3_gpu_tensor *fc1, h3_gpu_tensor *fc2,
+                             int blocking, char *error, size_t error_size);
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                       char *error, size_t error_size) {
     char name[160];
@@ -807,7 +866,7 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
 #undef LOAD1
 #undef LOAD2
-    if (dit->lora) {
+    if (dit->lora_count) {
         /* Map the native prefix onto the Diffusers LoRA namespace.
          * "blocks.N." -> "transformer_blocks.N", and
          * "token_refiner.blocks.N." -> "token_refiner.refiner_blocks.N". */
@@ -823,25 +882,156 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                      (int)(prefix_length - 22), prefix + 21);
         }
         if (lora_prefix[0] &&
-            (!h3_lora_apply(dit->gpu, dit->lora, block->qkv, lora_prefix,
-                            "attn.to_q", 0, INNER, HIDDEN,
-                            error, error_size) ||
-             !h3_lora_apply(dit->gpu, dit->lora, block->qkv, lora_prefix,
-                            "attn.to_k", INNER, INNER, HIDDEN,
-                            error, error_size) ||
-             !h3_lora_apply(dit->gpu, dit->lora, block->qkv, lora_prefix,
-                            "attn.to_v", 2 * INNER, INNER, HIDDEN,
-                            error, error_size) ||
-             !h3_lora_apply(dit->gpu, dit->lora, block->out, lora_prefix,
-                            "attn.to_out.0", 0, HIDDEN, INNER,
-                            error, error_size) ||
-             !h3_lora_apply(dit->gpu, dit->lora, block->fc1, lora_prefix,
-                            "ff.net.0.proj", 0, FFN * 2, HIDDEN,
-                            error, error_size) ||
-             !h3_lora_apply(dit->gpu, dit->lora, block->fc2, lora_prefix,
-                            "ff.net.2", 0, HIDDEN, FFN,
-                            error, error_size)))
+            !merge_block_loras(dit, lora_prefix, block->qkv, block->out,
+                               block->fc1, block->fc2, 0, error, error_size))
             return 0;
+    }
+    return 1;
+}
+
+/* Load one block's linear-branch weights from the VDN checkpoint store.
+ * Key namespace: transformer_blocks.N.attn.linear_attention.* (plus the
+ * softmax gate and the branch output projection). The short-conv weights are
+ * flattened to [INNER, taps] for the fused feature kernel. */
+static int load_vdn_block(h3_dit *dit, h3_dit_block *block, unsigned index,
+                          char *error, size_t error_size) {
+    char name[192];
+    uint64_t shape2[2];
+#define VLOAD2(field, suffix, rows, cols) do {                                 \
+    snprintf(name, sizeof(name),                                               \
+             "transformer_blocks.%u.attn.%s", index, suffix);                  \
+    shape2[0] = (rows); shape2[1] = (cols);                                    \
+    block->field = h3_weight_load_bf16(dit->vdn_weights, dit->gpu, name, 2,    \
+                                       shape2, error, error_size);             \
+    if (!block->field) return 0;                                               \
+} while (0)
+#define VLOAD1(field, suffix, width) do {                                      \
+    snprintf(name, sizeof(name),                                               \
+             "transformer_blocks.%u.attn.%s", index, suffix);                  \
+    shape2[0] = (width);                                                       \
+    block->field = h3_weight_load_bf16(dit->vdn_weights, dit->gpu, name, 1,    \
+                                       shape2, error, error_size);             \
+    if (!block->field) return 0;                                               \
+} while (0)
+    VLOAD2(lin_alpha_down, "linear_attention.alpha.down.weight",
+           128, HIDDEN);
+    VLOAD2(lin_alpha_up, "linear_attention.alpha.up.weight", INNER, 128);
+    VLOAD1(lin_alpha_dt_bias, "linear_attention.alpha.dt_bias", INNER);
+    VLOAD1(lin_alpha_a_log, "linear_attention.alpha.A_log", HEADS);
+    VLOAD2(lin_beta_proj, "linear_attention.beta_proj.weight", HEADS, HIDDEN);
+    VLOAD1(lin_norm, "linear_attention.norm.weight", HEAD_DIM);
+    /* The depthwise short conv ships as depthwise Conv2d/Conv1d weights with
+     * singleton group axes: [INNER, 1, 5, 5] and [INNER, 1, 5]. */
+    snprintf(name, sizeof(name),
+             "transformer_blocks.%u.attn.linear_attention.short_conv.k_sp.weight",
+             index);
+    { uint64_t shape4[4] = {INNER, 1, 5, 5};
+      block->lin_conv_k_sp = h3_weight_load_bf16(
+          dit->vdn_weights, dit->gpu, name, 4, shape4, error, error_size); }
+    if (!block->lin_conv_k_sp) return 0;
+    snprintf(name, sizeof(name),
+             "transformer_blocks.%u.attn.linear_attention.short_conv.k_tm.weight",
+             index);
+    { uint64_t shape3[3] = {INNER, 1, 5};
+      block->lin_conv_k_tm = h3_weight_load_bf16(
+          dit->vdn_weights, dit->gpu, name, 3, shape3, error, error_size); }
+    if (!block->lin_conv_k_tm) return 0;
+    snprintf(name, sizeof(name),
+             "transformer_blocks.%u.attn.linear_attention.short_conv.v_sp.weight",
+             index);
+    { uint64_t shape4[4] = {INNER, 1, 5, 5};
+      block->lin_conv_v_sp = h3_weight_load_bf16(
+          dit->vdn_weights, dit->gpu, name, 4, shape4, error, error_size); }
+    if (!block->lin_conv_v_sp) return 0;
+    snprintf(name, sizeof(name),
+             "transformer_blocks.%u.attn.linear_attention.short_conv.v_tm.weight",
+             index);
+    { uint64_t shape3[3] = {INNER, 1, 5};
+      block->lin_conv_v_tm = h3_weight_load_bf16(
+          dit->vdn_weights, dit->gpu, name, 3, shape3, error, error_size); }
+    if (!block->lin_conv_v_tm) return 0;
+    VLOAD2(lin_gate_down, "linear_attention.output_gate.down.weight",
+           128, HIDDEN);
+    VLOAD2(lin_gate_up, "linear_attention.output_gate.up.weight",
+           INNER, 128);
+    VLOAD1(lin_gate_bias, "linear_attention.output_gate.up.bias", INNER);
+    VLOAD2(lin_softmax_gate, "softmax_gate.up.weight", HEADS, HIDDEN);
+    VLOAD1(lin_softmax_bias, "softmax_gate.up.bias", HEADS);
+    VLOAD2(lin_to_out, "to_out_linear.weight", HIDDEN, INNER);
+#undef VLOAD1
+#undef VLOAD2
+    /* The alpha island runs in fp32 (bf16 alpha errors compound across the
+     * ~100-frame scan, exactly as the Python reference warns). */
+    block->lin_alpha_down32 = h3_gpu_tensor_new_f32(dit->gpu,
+        (size_t)128 * HIDDEN);
+    block->lin_alpha_up32 = h3_gpu_tensor_new_f32(dit->gpu,
+        (size_t)INNER * 128);
+    block->lin_alpha_dt_bias32 = h3_gpu_tensor_new_f32(dit->gpu, INNER);
+    if (!block->lin_alpha_down32 || !block->lin_alpha_up32 ||
+        !block->lin_alpha_dt_bias32) return 0;
+    if (!h3_gpu_begin(dit->gpu)) return 0;
+    if (!h3_gpu_cast_bf16_to_f32(dit->gpu, block->lin_alpha_down32,
+                                 block->lin_alpha_down, 128 * HIDDEN) ||
+        !h3_gpu_cast_bf16_to_f32(dit->gpu, block->lin_alpha_up32,
+                                 block->lin_alpha_up, INNER * 128) ||
+        !h3_gpu_cast_bf16_to_f32(dit->gpu, block->lin_alpha_dt_bias32,
+                                 block->lin_alpha_dt_bias, INNER) ||
+        !h3_gpu_submit(dit->gpu)) return 0;
+    return 1;
+}
+
+/* Merge every adapter's LoRA delta for one block. Target names cover both
+ * the plain "attn.*" turbo namespace and VDN's "attn.orig.*"; missing targets
+ * no-op inside h3_lora_apply. Works on any BF16 matrix storage, so the SSD
+ * streaming path calls it after each block lands in its slot. */
+static int merge_block_loras(h3_dit *dit, const char *lora_prefix,
+                             h3_gpu_tensor *qkv, h3_gpu_tensor *out,
+                             h3_gpu_tensor *fc1, h3_gpu_tensor *fc2,
+                             int blocking, char *error, size_t error_size) {
+    static const char *const qkv_targets[] = {
+        "attn.to_q", "attn.orig.to_q",
+        "attn.to_k", "attn.orig.to_k",
+        "attn.to_v", "attn.orig.to_v",
+    };
+    static const char *const out_targets[] = {
+        "attn.to_out.0", "attn.orig.to_out.0",
+    };
+    for (int index = 0; index < dit->lora_count; index++) {
+        h3_lora *lora = dit->lora[index];
+        int ok = 1;
+        for (size_t t = 0; t < 6 && ok; t++) {
+            size_t band = (size_t)(t % 3) * INNER;
+            ok = blocking
+                ? h3_lora_merge_blocking(dit->gpu, lora, qkv, lora_prefix,
+                                         qkv_targets[t], band, INNER, HIDDEN,
+                                         error, error_size)
+                : h3_lora_apply(dit->gpu, lora, qkv, lora_prefix,
+                                qkv_targets[t], band, INNER, HIDDEN,
+                                error, error_size);
+        }
+        for (size_t t = 0; t < 2 && ok; t++) {
+            ok = blocking
+                ? h3_lora_merge_blocking(dit->gpu, lora, out, lora_prefix,
+                                         out_targets[t], 0, HIDDEN, INNER,
+                                         error, error_size)
+                : h3_lora_apply(dit->gpu, lora, out, lora_prefix,
+                                out_targets[t], 0, HIDDEN, INNER,
+                                error, error_size);
+        }
+        if (ok) ok = blocking
+            ? h3_lora_merge_blocking(dit->gpu, lora, fc1, lora_prefix,
+                                     "ff.net.0.proj", 0, FFN * 2, HIDDEN,
+                                     error, error_size)
+            : h3_lora_apply(dit->gpu, lora, fc1, lora_prefix,
+                            "ff.net.0.proj", 0, FFN * 2, HIDDEN,
+                            error, error_size);
+        if (ok) ok = blocking
+            ? h3_lora_merge_blocking(dit->gpu, lora, fc2, lora_prefix,
+                                     "ff.net.2", 0, HIDDEN, FFN,
+                                     error, error_size)
+            : h3_lora_apply(dit->gpu, lora, fc2, lora_prefix,
+                            "ff.net.2", 0, HIDDEN, FFN, error, error_size);
+        if (!ok) return 0;
     }
     return 1;
 }
@@ -860,6 +1050,17 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
 #undef LOAD1
+    if (dit->vdn) {
+        unsigned index = 0;
+        if (sscanf(prefix, "blocks.%u.", &index) != 1) {
+            fail(error, error_size, "invalid streaming block prefix %s", prefix);
+            return 0;
+        }
+        if (!load_vdn_block(dit, block, index, error, error_size)) return 0;
+        /* to_out_linear is streamed; drop the resident copy the loader made. */
+        h3_gpu_tensor_free(block->lin_to_out);
+        block->lin_to_out = NULL;
+    }
     return 1;
 }
 
@@ -880,6 +1081,25 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    free_tensor(&block->lin_alpha_down);
+    free_tensor(&block->lin_alpha_up);
+    free_tensor(&block->lin_alpha_dt_bias);
+    free_tensor(&block->lin_alpha_a_log);
+    free_tensor(&block->lin_beta_proj);
+    free_tensor(&block->lin_norm);
+    free_tensor(&block->lin_conv_k_sp);
+    free_tensor(&block->lin_conv_k_tm);
+    free_tensor(&block->lin_conv_v_sp);
+    free_tensor(&block->lin_conv_v_tm);
+    free_tensor(&block->lin_gate_down);
+    free_tensor(&block->lin_gate_up);
+    free_tensor(&block->lin_gate_bias);
+    free_tensor(&block->lin_softmax_gate);
+    free_tensor(&block->lin_softmax_bias);
+    free_tensor(&block->lin_to_out);
+    free_tensor(&block->lin_alpha_down32);
+    free_tensor(&block->lin_alpha_up32);
+    free_tensor(&block->lin_alpha_dt_bias32);
 }
 
 static double stream_now(void) {
@@ -954,6 +1174,37 @@ static int prepare_stream_source(h3_dit *dit,
     return 1;
 }
 
+/* The linear branch's output projection is the only VDN tensor big enough to
+ * stream; it lives in the VDN checkpoint store under the diffusers namespace.
+ * All other branch weights stay resident (about 12 MiB per block). */
+static int prepare_vdn_stream_source(h3_dit *dit,
+                                     h3_dit_stream_source *source,
+                                     const char *name, uint64_t rows,
+                                     uint64_t columns, unsigned field,
+                                     char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(dit->vdn_weights, name,
+                                                &header);
+    if (!tensor || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
+        tensor->shape[0] != rows || tensor->shape[1] != columns) {
+        fail(error, error_size,
+             "VDN streaming weight is absent or has the wrong schema: %s",
+             name);
+        return 0;
+    }
+    source->path = header->path;
+    source->file_offset = tensor->file_offset;
+    source->elements = (size_t)(rows * columns);
+    source->rows = (uint32_t)rows;
+    source->columns = (uint32_t)columns;
+    source->field = field;
+    source->scale_path = NULL;
+    source->scale_offset = 0;
+    source->scale_elements = 0;
+    source->scale_name[0] = '\0';
+    return 1;
+}
+
 static int prepare_stream_layer(h3_dit *dit, unsigned layer,
                                 char *error, size_t error_size) {
     char name[160];
@@ -969,8 +1220,17 @@ static int prepare_stream_layer(h3_dit *dit, unsigned layer,
     SOURCE(2, "mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1);
     SOURCE(3, "mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2);
 #undef SOURCE
-    qsort(stream->sources, STREAM_MATRICES, sizeof(stream->sources[0]),
-          compare_stream_sources);
+    if (dit->vdn) {
+        snprintf(name, sizeof(name),
+                 "transformer_blocks.%u.attn.to_out_linear.weight", layer);
+        if (!prepare_vdn_stream_source(dit,
+                                       &stream->sources[STREAM_LIN_OUT], name,
+                                       HIDDEN, INNER, STREAM_LIN_OUT,
+                                       error, error_size)) return 0;
+    }
+    stream->source_count = dit->vdn ? STREAM_MATRICES : STREAM_LIN_OUT;
+    qsort(stream->sources, stream->source_count,
+          sizeof(stream->sources[0]), compare_stream_sources);
     return 1;
 }
 
@@ -988,6 +1248,15 @@ static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
         fail(error, error_size, "cannot allocate BF16 SSD layer slot: %s",
              h3_gpu_error(dit->gpu));
         return 0;
+    }
+    if (dit->vdn) {
+        slot->lin_to_out = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)HIDDEN * INNER);
+        if (!slot->lin_to_out) {
+            fail(error, error_size, "cannot allocate VDN stream slot: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
     }
     if (dit->int8_qkv) {
         slot->qkv_int8 = h3_gpu_tensor_new_i8(
@@ -1025,6 +1294,7 @@ static h3_gpu_tensor *stream_slot_target(h3_dit_block *slot,
     if (field == STREAM_OUT) return slot->out;
     if (field == STREAM_FC1) return slot->fc1;
     if (field == STREAM_FC2) return slot->fc2;
+    if (field == STREAM_LIN_OUT) return slot->lin_to_out;
     return NULL;
 }
 
@@ -1050,16 +1320,14 @@ static int read_stream_layer(h3_dit_stream_job *job) {
      * commands from this thread); GPU work here is only the M5 streamed-block
      * int8 requantization below. */
     int gpu_work = dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out;
+    (void)gpu_work;
     /* ConvRot int8: dequantize + undo the block-Hadamard rotation into the BF16
      * slot; plain BF16: pread straight in. Either way the slot ends up holding the
      * true (unrotated) weight, and the existing int8 requantization below halves
      * the resident footprint exactly as for the BF16 checkpoint. */
-    if (gpu_work && !h3_gpu_begin(dit->gpu)) {
-        snprintf(job->error, sizeof(job->error),
-                 "DiT stream begin failed: %s", h3_gpu_error(dit->gpu));
-        job->ok = 0;
-    }
-    for (unsigned index = 0; index < STREAM_MATRICES && job->ok; index++) {
+
+    for (unsigned index = 0; index < layer->source_count && job->ok;
+         index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
         h3_gpu_tensor *target = stream_slot_target(slot, source->field);
         if (!target) { job->ok = 0; break; }
@@ -1153,6 +1421,22 @@ static int read_stream_layer(h3_dit_stream_job *job) {
             }
             job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
         }
+    }
+    if (job->ok && dit->lora_count) {
+        /* Merge the LoRA deltas into the freshly streamed BF16 matrices,
+         * before the int8 requantization bakes them into the resident slot. */
+        char lora_prefix[64];
+        snprintf(lora_prefix, sizeof(lora_prefix), "transformer_blocks.%u",
+                 job->layer);
+        if (!merge_block_loras(dit, lora_prefix, slot->qkv, slot->out,
+                               slot->fc1, slot->fc2, 1, job->error,
+                               sizeof(job->error)))
+            job->ok = 0;
+    }
+    if (job->ok && gpu_work && !h3_gpu_begin(dit->gpu)) {
+        snprintf(job->error, sizeof(job->error),
+                 "DiT stream begin failed: %s", h3_gpu_error(dit->gpu));
+        job->ok = 0;
     }
     if (job->ok && dit->int8_qkv &&
         !h3_gpu_quantize_weight_int8(dit->gpu, slot->qkv_int8,
@@ -1752,6 +2036,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
+            if (dit->vdn &&
+                !load_vdn_block(dit, &dit->blocks[index], index,
+                                error, error_size)) return 0;
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
@@ -1855,7 +2142,8 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     size_t video = dit->video_rows;
     size_t audio_total = dit->audio_total_rows;
     size_t video_total = dit->video_total_rows;
-    dit->activation_aliases = !getenv("H3_DISABLE_DIT_ACTIVATION_ALIAS");
+    dit->activation_aliases = !dit->vdn &&
+        !getenv("H3_DISABLE_DIT_ACTIVATION_ALIAS");
     dit->fused_patch_projection =
         !getenv("H3_DISABLE_FUSED_PATCH_CAST") && !getenv("H3_SCALAR_PATCH");
     dit->fused_patch_pack = dit->fused_patch_projection &&
@@ -2064,6 +2352,8 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
+static int prepare_vdn(h3_dit *dit, char *error, size_t error_size);
+
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
@@ -2074,6 +2364,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int token_reduction,
                         int ssd_streaming,
                         const char *lora_path,
+                        const char *linear_branch_path,
                         float spatial_rope_scale,
                         int use_slower_bf16_mlp,
                         int use_slower_bf16_qkv,
@@ -2137,18 +2428,38 @@ static h3_dit *load_dit(const char *weight_directory,
         dit->fb_cache_threshold = parsed;
     }
     if (lora_path && *lora_path) {
-        if (ssd_streaming) {
-            fail(error, error_size,
-                 "LoRA merging is not supported with --ssd-streaming");
-            goto failed;
+        /* Comma-separated adapter list, merged in order (VDN default then
+         * turbo). Each entry may target a different PEFT adapter name; the
+         * name is inferred from the first lora_A key layout in the file. */
+        const char *cursor = lora_path;
+        while (*cursor && dit->lora_count < 4) {
+            const char *comma = strchr(cursor, ',');
+            size_t length = comma ? (size_t)(comma - cursor) : strlen(cursor);
+            char path[512];
+            if (length >= sizeof(path)) {
+                fail(error, error_size, "LoRA path too long: %.*s",
+                     (int)length, cursor);
+                goto failed;
+            }
+            memcpy(path, cursor, length);
+            path[length] = '\0';
+            cursor = comma ? comma + 1 : cursor + length;
+            if (!path[0]) continue;
+            h3_lora *adapter = h3_lora_open(path, error, error_size);
+            if (!adapter) goto failed;
+            dit->lora[dit->lora_count++] = adapter;
         }
-        dit->lora = h3_lora_open(lora_path, error, error_size);
-        if (!dit->lora) goto failed;
+    }
+    if (linear_branch_path && *linear_branch_path) {
+        dit->vdn_weights = h3_weight_store_open(linear_branch_path, error,
+                                                error_size);
+        if (!dit->vdn_weights) goto failed;
+        dit->vdn = 1;
     }
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
-        !configure_token_reduction(dit, token_reduction,
+        !configure_token_reduction(dit, dit->vdn ? 0 : token_reduction,
                                    error, error_size)) goto failed;
     size_t wanted_video_condition =
         (size_t)dit->video_condition_rows * VIDEO_PATCH;
@@ -2175,7 +2486,8 @@ static h3_dit *load_dit(const char *weight_directory,
      * were force-mutually-exclusive.) */
     dit->int8_mlp = dit->fused_mlp && !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !use_slower_bf16_qkv && dit->sequence >= 128 &&
+    dit->int8_qkv = !use_slower_bf16_qkv && !dit->vdn &&
+                    dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
     dit->int8_attention_out = !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
@@ -2209,8 +2521,8 @@ static h3_dit *load_dit(const char *weight_directory,
     schedule_progress schedule_state = {progress, progress_opaque};
     dit->schedule = h3_dit_schedule_precompute(
         dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
-        error, error_size);
+        dit->audio_condition_rows != 0, dit->lora, dit->lora_count,
+        schedule_report, &schedule_state, error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
@@ -2221,7 +2533,8 @@ static h3_dit *load_dit(const char *weight_directory,
         !prepare_projection_maps(dit, error, error_size) ||
         !prepare_token_reduction_maps(dit, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
-        !allocate_activations(dit, error, error_size)) goto failed;
+        !allocate_activations(dit, error, error_size) ||
+        (dit->vdn && !prepare_vdn(dit, error, error_size))) goto failed;
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
              wanted_video_condition)) ||
@@ -2248,6 +2561,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int token_reduction,
                          int ssd_streaming,
                          const char *lora_path,
+                         const char *linear_branch_path,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
@@ -2266,6 +2580,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     lora_path,
+                    linear_branch_path,
                     spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
@@ -2292,6 +2607,7 @@ h3_dit *h3_dit_load_conditioned(
                          int token_reduction,
                          int ssd_streaming,
                          const char *lora_path,
+                         const char *linear_branch_path,
                          float spatial_rope_scale,
                          int use_slower_bf16_mlp,
                          int use_slower_bf16_qkv,
@@ -2314,6 +2630,7 @@ h3_dit *h3_dit_load_conditioned(
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     lora_path,
+                    linear_branch_path,
                     spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
                     use_slower_bf16_attention_output,
@@ -2417,6 +2734,315 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
     return 1;
 }
 
+
+/* Chunk-window geometry of the released VDN-H3 checkpoints: whole 5-frame
+ * chunks, one chunk radius each side ("c5"), with frames 0 and F-1 as
+ * bidirectional softmax anchors. */
+#define H3_VDN_CHUNK 5u
+#define H3_VDN_RADIUS 1u
+
+static int prepare_vdn(h3_dit *dit, char *error, size_t error_size) {
+    if (dit->latent_t < 4) {
+        fail(error, error_size,
+             "the VDN linear branch needs at least 4 latent frames");
+        return 0;
+    }
+    h3_vdn_state *v = calloc(1, sizeof(*v));
+    if (!v) {
+        fail(error, error_size, "out of memory creating VDN state");
+        return 0;
+    }
+    dit->vdn_state = v;
+    v->gh = (uint32_t)dit->latent_h / 2;
+    v->gw = (uint32_t)dit->latent_w / 2;
+    v->s = v->gh * v->gw;
+    if (dit->video_rows != dit->latent_t * v->s) {
+        fail(error, error_size,
+             "VDN layout mismatch: %u video rows != %u frames x %u tokens",
+             dit->video_rows, (unsigned)dit->latent_t, v->s);
+        return 0;
+    }
+    v->f_inner = (uint32_t)dit->latent_t - 2;
+    v->inner_tokens = v->f_inner * v->s;
+    v->row_start = dit->video_target_start + v->s;
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    v->window = (h3_vdn_window_args){HEADS, dit->sequence, HEAD_DIM,
+        dit->video_target_start, (uint32_t)dit->latent_t, v->s, 0, 3, 0};
+    memcpy(&v->window.scale_bits, &scale, sizeof(scale));
+    v->feat_q = (h3_vdn_feat_args){v->f_inner, v->s, HEADS, HEAD_DIM,
+        v->row_start, 3 * INNER, 0, INNER, 1};
+    v->feat_k = v->feat_q;
+    v->feat_k.channel_offset = INNER;
+    v->feat_v = v->feat_q;
+    v->feat_v.channel_offset = 2 * INNER;
+    v->feat_v.l2norm = 0;
+
+    float *bounds = malloc(sizeof(float) * 2 * dit->latent_t);
+    float *rebase = malloc(sizeof(float) * 2 * v->f_inner);
+    if (!bounds || !rebase) {
+        fail(error, error_size, "out of memory for VDN window bounds");
+        return 0;
+    }
+    for (unsigned t = 0; t < (unsigned)dit->latent_t; t++) {
+        long chunk = t / H3_VDN_CHUNK;
+        bounds[t * 2] = (float)((chunk - H3_VDN_RADIUS) * H3_VDN_CHUNK);
+        bounds[t * 2 + 1] =
+            (float)((chunk + H3_VDN_RADIUS + 1) * H3_VDN_CHUNK - 1);
+    }
+    for (unsigned t = 1; t + 1 < (unsigned)dit->latent_t; t++) {
+        rebase[(t - 1) * 2] = bounds[t * 2] - 1.0f;
+        rebase[(t - 1) * 2 + 1] = bounds[t * 2 + 1] - 1.0f;
+    }
+    v->bounds_softmax = h3_gpu_tensor_from_f32(dit->gpu, bounds,
+                                               2 * dit->latent_t);
+    v->bounds_rebase = h3_gpu_tensor_from_f32(dit->gpu, rebase, 2 * v->f_inner);
+    free(bounds);
+    free(rebase);
+    if (!v->bounds_softmax || !v->bounds_rebase) {
+        fail(error, error_size, "cannot upload VDN window bounds");
+        return 0;
+    }
+
+    size_t inner = v->inner_tokens;
+    size_t plane = (size_t)v->f_inner * HEADS * HEAD_DIM * HEAD_DIM;
+    size_t text_plane = (size_t)HEADS * HEAD_DIM * HEAD_DIM;
+#define VBF(field, elements) (v->field = h3_gpu_tensor_new_bf16(dit->gpu, (elements)))
+#define VF32(field, elements) (v->field = h3_gpu_tensor_new_f32(dit->gpu, (elements)))
+#define VBI8(field, elements) (v->field = h3_gpu_tensor_new_i8(dit->gpu, (elements)))
+    h3_gpu_tensor *all[] = {
+        VBF(spatial, inner * INNER),
+        VBF(q_feat, inner * INNER),
+        VBF(k_feat, inner * INNER),
+        VBF(v_feat, inner * INNER),
+        VBF(beta_lin, inner * HEADS),
+        VF32(beta, plane / (HEAD_DIM * HEAD_DIM) * v->s * 0 + v->f_inner * HEADS * v->s),
+        VF32(mean, v->f_inner * HIDDEN),
+        VF32(alpha1, v->f_inner * 128),
+        VF32(alpha_delta, v->f_inner * INNER),
+        VF32(alpha, v->f_inner * HEADS * HEAD_DIM),
+        VF32(A, plane),
+        VF32(B, plane),
+        VF32(xinv, plane),
+        VF32(inv, plane),
+        VF32(transition, plane),
+        VF32(injection, plane),
+        VF32(prefix, plane),
+        VF32(suffix, plane),
+        VF32(lp, (size_t)(v->f_inner + 1) * HEADS * HEAD_DIM),
+        VBF(gathered, plane),
+        VBF(softmax_gate_lin, (size_t)dit->sequence * HEADS),
+        VBF(gate1, inner * 128),
+        VBF(gate, inner * INNER),
+        VF32(gate_f32, inner * INNER),
+        VBF(readout, inner * INNER),
+        VBF(branch_out, inner * HIDDEN),
+        VBF(tk_feat, (size_t)dit->text_rows * INNER),
+        VBF(tv_feat, (size_t)dit->text_rows * INNER),
+        VBF(tbeta_lin, (size_t)dit->text_rows * HEADS),
+        VF32(tbeta, (size_t)HEADS * dit->text_rows),
+        VF32(tA, text_plane),
+        VF32(tB, text_plane),
+        VF32(tX, text_plane),
+        VF32(tinv, text_plane),
+        VF32(tstate, text_plane),
+        VF32(state, text_plane),
+        VBI8(qkv_w_i8, (size_t)HIDDEN * 3 * INNER),
+        VF32(qkv_w_scales, (size_t)3 * INNER),
+        VBI8(toout_w_i8, (size_t)INNER * HIDDEN),
+        VF32(toout_w_scales, HIDDEN),
+    };
+#undef VBF
+#undef VF32
+#undef VBI8
+    for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++) {
+        if (!all[index]) {
+            fail(error, error_size,
+                 "cannot allocate VDN linear-branch buffers: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The VDN linear branch: everything the softmax window cannot see, summed
+ * into the attention output's video rows. Runs inside the caller's command
+ * buffer, between the attention output projection and the MLP gate. */
+static int run_vdn_branch(h3_dit *dit, h3_dit_block *weight, uint32_t rows,
+                          char *error, size_t error_size) {
+    h3_vdn_state *v = dit->vdn_state;
+#define OPV(call, label) do {                                                  \
+    if (!gpu_op(dit, (call), error, error_size, label)) return 0;              \
+} while (0)
+    uint32_t inner = v->inner_tokens;
+    uint32_t batch = v->f_inner * HEADS;
+
+    /* Raw (pre-QK-norm, pre-RoPE) shared QKV for the inner video slab. */
+    if (getenv("H3_VDN_INT8")) {
+        uint32_t padded_rows = (rows + 127u) & ~127u;
+        size_t qin_n = (size_t)padded_rows * HIDDEN;
+        if (v->qkv_in_i8 == NULL || v->qkv_in_cap < qin_n) {
+            h3_gpu_tensor_free(v->qkv_in_i8);
+            v->qkv_in_i8 = h3_gpu_tensor_new_i8(dit->gpu, qin_n);
+            h3_gpu_tensor_free(v->qkv_in_scales);
+            v->qkv_in_scales = h3_gpu_tensor_new_f32(dit->gpu, padded_rows);
+            v->qkv_in_cap = qin_n;
+        }
+        OPV(h3_gpu_quantize_weight_int8(dit->gpu, v->qkv_w_i8, v->qkv_w_scales,
+                weight->qkv, 3 * INNER, HIDDEN), "VDN raw QKV weight quantize");
+        OPV(h3_gpu_linear_int8_bf16(dit->gpu, dit->qkv, v->qkv_in_i8,
+                v->qkv_in_scales, dit->mod_attention, v->qkv_w_i8,
+                v->qkv_w_scales, rows, HIDDEN, 3 * INNER, 0), "VDN raw QKV");
+    } else {
+    OPV(h3_gpu_linear_bf16_offset(dit->gpu, dit->qkv, dit->mod_attention, 0,
+        weight->qkv, NULL, rows, HIDDEN, 3 * INNER), "VDN raw QKV");
+    }
+
+    /* Features: q pointwise, k/v through the separable short conv. */
+    OPV(h3_gpu_vdn_pointwise_feat(dit->gpu, v->q_feat, dit->qkv, &v->feat_q),
+        "VDN q features");
+    OPV(h3_gpu_vdn_conv_sp(dit->gpu, v->spatial, dit->qkv,
+        weight->lin_conv_k_sp, &v->feat_k, v->gh, v->gw),
+        "VDN k spatial conv");
+    OPV(h3_gpu_vdn_conv_tm_act(dit->gpu, v->k_feat, v->spatial,
+        weight->lin_conv_k_tm, &v->feat_k), "VDN k temporal conv");
+    OPV(h3_gpu_vdn_conv_sp(dit->gpu, v->spatial, dit->qkv,
+        weight->lin_conv_v_sp, &v->feat_v, v->gh, v->gw),
+        "VDN v spatial conv");
+    OPV(h3_gpu_vdn_conv_tm_act(dit->gpu, v->v_feat, v->spatial,
+        weight->lin_conv_v_tm, &v->feat_v), "VDN v temporal conv");
+
+    /* beta and alpha. */
+    OPV(h3_gpu_linear_bf16_offset(dit->gpu, v->beta_lin, dit->mod_attention,
+        (size_t)v->row_start * HIDDEN, weight->lin_beta_proj, NULL, inner,
+        HIDDEN, HEADS), "VDN beta projection");
+    OPV(h3_gpu_vdn_sigmoid_f32(dit->gpu, v->beta, v->beta_lin,
+        v->f_inner * HEADS * v->s, v->s, HEADS, 1), "VDN beta sigmoid");
+    OPV(h3_gpu_vdn_frame_mean(dit->gpu, v->mean, dit->mod_attention, v->s,
+        HIDDEN, v->row_start, v->f_inner), "VDN frame mean");
+    OPV(h3_gpu_linear_f32(dit->gpu, v->alpha1, v->mean,
+        weight->lin_alpha_down32, NULL, v->f_inner, HIDDEN, 128),
+        "VDN alpha down");
+    OPV(h3_gpu_linear_f32(dit->gpu, v->alpha_delta, v->alpha1,
+        weight->lin_alpha_up32, NULL, v->f_inner, 128, INNER),
+        "VDN alpha up");
+    OPV(h3_gpu_vdn_alpha(dit->gpu, v->alpha, v->alpha_delta,
+        weight->lin_alpha_dt_bias32, weight->lin_alpha_a_log, v->f_inner,
+        HEADS, HEAD_DIM), "VDN alpha");
+
+    /* Frame statistics and the exact vdn_solve factorization. */
+    OPV(h3_gpu_linear_branch_frame_stats(dit->gpu, v->A, v->B, v->k_feat,
+        v->v_feat, v->beta, v->f_inner, v->s, HEADS, HEAD_DIM),
+        "VDN frame stats");
+    OPV(h3_gpu_linear_branch_symmetrize_A(dit->gpu, v->A, v->f_inner, HEADS,
+        HEAD_DIM), "VDN symmetrize");
+    OPV(h3_gpu_vdn_cholesky(dit->gpu, v->A, batch, HEAD_DIM),
+        "VDN cholesky");
+    OPV(h3_gpu_vdn_triinv(dit->gpu, v->xinv, v->A, batch, HEAD_DIM),
+        "VDN triangular inverse");
+    h3_vdn_bmm_args xtx = {batch, HEAD_DIM, HEAD_DIM, HEAD_DIM, 1, 0, 0};
+    OPV(h3_gpu_vdn_bmm(dit->gpu, v->inv, v->xinv, v->xinv, NULL, &xtx),
+        "VDN inverse");
+    OPV(h3_gpu_vdn_row_scale(dit->gpu, v->transition, v->inv, v->alpha, batch,
+        HEAD_DIM), "VDN transition");
+    h3_vdn_bmm_args binv = {batch, HEAD_DIM, HEAD_DIM, HEAD_DIM, 0, 0, 0};
+    OPV(h3_gpu_vdn_bmm(dit->gpu, v->injection, v->B, v->inv, NULL, &binv),
+        "VDN injection");
+
+    /* Text chunk state: one delta-rule chunk over the prompt rows. */
+    h3_vdn_feat_args tf = {1, dit->text_rows, HEADS, HEAD_DIM, 0, 3 * INNER,
+        INNER, INNER, 1};
+    OPV(h3_gpu_vdn_pointwise_feat(dit->gpu, v->tk_feat, dit->qkv, &tf),
+        "VDN text k features");
+    tf.channel_offset = 2 * INNER;
+    tf.l2norm = 0;
+    OPV(h3_gpu_vdn_pointwise_feat(dit->gpu, v->tv_feat, dit->qkv, &tf),
+        "VDN text v features");
+    OPV(h3_gpu_linear_bf16_offset(dit->gpu, v->tbeta_lin, dit->mod_attention,
+        0, weight->lin_beta_proj, NULL, dit->text_rows, HIDDEN, HEADS),
+        "VDN text beta projection");
+    OPV(h3_gpu_vdn_sigmoid_f32(dit->gpu, v->tbeta, v->tbeta_lin,
+        HEADS * dit->text_rows, (uint32_t)dit->text_rows, HEADS, 1),
+        "VDN text beta sigmoid");
+    OPV(h3_gpu_linear_branch_frame_stats(dit->gpu, v->tA, v->tB, v->tk_feat,
+        v->tv_feat, v->tbeta, 1, (uint32_t)dit->text_rows, HEADS, HEAD_DIM),
+        "VDN text stats");
+    OPV(h3_gpu_linear_branch_symmetrize_A(dit->gpu, v->tA, 1, HEADS,
+        HEAD_DIM), "VDN text symmetrize");
+    OPV(h3_gpu_vdn_cholesky(dit->gpu, v->tA, HEADS, HEAD_DIM),
+        "VDN text cholesky");
+    OPV(h3_gpu_vdn_triinv(dit->gpu, v->tX, v->tA, HEADS, HEAD_DIM),
+        "VDN text triangular inverse");
+    h3_vdn_bmm_args tinv_args = {HEADS, HEAD_DIM, HEAD_DIM, HEAD_DIM, 1, 0, 0};
+    OPV(h3_gpu_vdn_bmm(dit->gpu, v->tinv, v->tX, v->tX, NULL, &tinv_args),
+        "VDN text inverse");
+    h3_vdn_bmm_args tinj_args = {HEADS, HEAD_DIM, HEAD_DIM, HEAD_DIM, 0, 0, 0};
+    OPV(h3_gpu_vdn_bmm(dit->gpu, v->tstate, v->tB, v->tinv, NULL, &tinj_args),
+        "VDN text state");
+
+    /* Bidirectional scans seeded with half the text state. */
+    OPV(h3_gpu_add_scaled_f32(dit->gpu, v->state, v->tstate, v->tstate, 0.0f,
+        0.5f, HEADS * HEAD_DIM * HEAD_DIM), "VDN scan seed");
+    for (uint32_t f = 0; f < v->f_inner; f++) {
+        const h3_gpu_tensor *in = f ? v->prefix : v->state;
+        OPV(h3_gpu_vdn_scan_step(dit->gpu, v->prefix, in, v->transition,
+            v->injection, HEADS, HEAD_DIM, f, f ? f - 1 : 0, f),
+            "VDN forward scan");
+    }
+    for (uint32_t f = v->f_inner; f-- > 0;) {
+        const h3_gpu_tensor *in = f + 1 < v->f_inner ? v->suffix : v->state;
+        uint32_t in_frame = f + 1 < v->f_inner ? f + 1 : 0;
+        OPV(h3_gpu_vdn_scan_step(dit->gpu, v->suffix, in, v->transition,
+            v->injection, HEADS, HEAD_DIM, f, in_frame, f),
+            "VDN reverse scan");
+    }
+    OPV(h3_gpu_linear_branch_log_alpha_prefix(dit->gpu, v->lp, v->alpha,
+        v->f_inner, HEADS, HEAD_DIM), "VDN alpha prefix");
+    OPV(h3_gpu_vdn_gather(dit->gpu, v->gathered, v->prefix, v->suffix, v->lp,
+        v->bounds_rebase, v->tstate, v->f_inner, HEADS, HEAD_DIM, 1),
+        "VDN gather");
+
+    /* Readout: RMSNorm(state@q) * output_gate, then to_out_linear. */
+    OPV(h3_gpu_linear_bf16_offset(dit->gpu, v->gate1, dit->mod_attention,
+        (size_t)v->row_start * HIDDEN, weight->lin_gate_down, NULL, inner,
+        HIDDEN, 128), "VDN gate down");
+    OPV(h3_gpu_linear_bf16_offset(dit->gpu, v->gate, dit->mod_attention,
+        (size_t)v->row_start * HIDDEN, weight->lin_gate_up,
+        weight->lin_gate_bias, inner, 128, INNER), "VDN gate up");
+    OPV(h3_gpu_vdn_sigmoid_f32(dit->gpu, v->gate_f32, v->gate,
+        inner * INNER, inner, 1, 0), "VDN gate sigmoid");
+    OPV(h3_gpu_cast_f32_to_bf16(dit->gpu, v->gate, v->gate_f32,
+        inner * INNER), "VDN gate cast");
+    OPV(h3_gpu_vdn_readout(dit->gpu, v->readout, v->gathered, v->q_feat,
+        v->gate, weight->lin_norm, v->f_inner, HEADS, v->s, HEAD_DIM),
+        "VDN readout");
+    if (getenv("H3_VDN_INT8")) {
+        uint32_t padded_inner = (inner + 127u) & ~127u;
+        size_t rout_n = (size_t)padded_inner * INNER;
+        if (v->readout_i8 == NULL || v->readout_cap < rout_n) {
+            h3_gpu_tensor_free(v->readout_i8);
+            v->readout_i8 = h3_gpu_tensor_new_i8(dit->gpu, rout_n);
+            h3_gpu_tensor_free(v->readout_scales);
+            v->readout_scales = h3_gpu_tensor_new_f32(dit->gpu, padded_inner);
+            v->readout_cap = rout_n;
+        }
+        OPV(h3_gpu_quantize_weight_int8(dit->gpu, v->toout_w_i8,
+                v->toout_w_scales, weight->lin_to_out, HIDDEN, INNER),
+            "VDN to_out weight quantize");
+        OPV(h3_gpu_linear_int8_bf16(dit->gpu, v->branch_out, v->readout_i8,
+                v->readout_scales, v->readout, v->toout_w_i8, v->toout_w_scales,
+                inner, INNER, HIDDEN, 0), "VDN to_out_linear");
+    } else {
+    OPV(h3_gpu_linear_bf16(dit->gpu, v->branch_out, v->readout,
+        weight->lin_to_out, NULL, inner, INNER, HIDDEN),
+        "VDN to_out_linear");
+    }
+    OPV(h3_gpu_vdn_add_rows(dit->gpu, dit->attention_output, v->branch_out,
+        v->row_start, HIDDEN, inner), "VDN branch add");
+#undef OPV
+    return 1;
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
                      h3_dit_block *weight,
                      int attention_adaln_ready,
@@ -2442,7 +3068,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    int vdn = dit->vdn && !dit->token_reduction_active;
+    if (dit->int8_qkv && !vdn && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -2461,13 +3088,25 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
-    int int8_attention_output = dit->int8_attention_out &&
+    int int8_attention_output = dit->int8_attention_out && !vdn &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int head_major_attention_output = int8_attention_output &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (head_major_attention_output)
+    if (vdn) {
+        h3_vdn_state *v = dit->vdn_state;
+        OP(h3_gpu_vdn_window_attention(dit->gpu, dit->attention_heads,
+            dit->query, dit->key, dit->value, v->bounds_softmax, &v->window),
+           "VDN windowed attention");
+        OP(h3_gpu_linear_bf16(dit->gpu, v->softmax_gate_lin,
+            dit->mod_attention, weight->lin_softmax_gate,
+            weight->lin_softmax_bias, rows, HIDDEN, HEADS),
+           "VDN softmax gate projection");
+        OP(h3_gpu_vdn_head_gate(dit->gpu, dit->attention_heads,
+            v->softmax_gate_lin, rows, HEADS, HEAD_DIM),
+           "VDN softmax gate");
+    } else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -2496,6 +3135,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
+    if (vdn && !run_vdn_branch(dit, weight, rows, error, error_size))
+        return 0;
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
@@ -2832,6 +3473,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 streamed_weight.out = slot->out;
                 streamed_weight.fc1 = slot->fc1;
                 streamed_weight.fc2 = slot->fc2;
+                if (dit->vdn)
+                    streamed_weight.lin_to_out = slot->lin_to_out;
                 if (dit->int8_qkv) {
                     streamed_weight.qkv_int8 = slot->qkv_int8;
                     streamed_weight.qkv_scales = slot->qkv_scales;
@@ -3612,6 +4255,49 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
     if (dit->convrot_hadamard) h3_gpu_tensor_free(dit->convrot_hadamard);
+    h3_weight_store_free(dit->vdn_weights);
+    if (dit->vdn_state) {
+        h3_vdn_state *v = dit->vdn_state;
+        h3_gpu_tensor_free(v->bounds_softmax);
+        h3_gpu_tensor_free(v->bounds_rebase);
+        h3_gpu_tensor_free(v->spatial);
+        h3_gpu_tensor_free(v->q_feat);
+        h3_gpu_tensor_free(v->k_feat);
+        h3_gpu_tensor_free(v->v_feat);
+        h3_gpu_tensor_free(v->beta_lin);
+        h3_gpu_tensor_free(v->beta);
+        h3_gpu_tensor_free(v->mean);
+        h3_gpu_tensor_free(v->alpha1);
+        h3_gpu_tensor_free(v->alpha_delta);
+        h3_gpu_tensor_free(v->alpha);
+        h3_gpu_tensor_free(v->A);
+        h3_gpu_tensor_free(v->B);
+        h3_gpu_tensor_free(v->xinv);
+        h3_gpu_tensor_free(v->inv);
+        h3_gpu_tensor_free(v->transition);
+        h3_gpu_tensor_free(v->injection);
+        h3_gpu_tensor_free(v->prefix);
+        h3_gpu_tensor_free(v->suffix);
+        h3_gpu_tensor_free(v->lp);
+        h3_gpu_tensor_free(v->gathered);
+        h3_gpu_tensor_free(v->softmax_gate_lin);
+        h3_gpu_tensor_free(v->gate1);
+        h3_gpu_tensor_free(v->gate);
+        h3_gpu_tensor_free(v->gate_f32);
+        h3_gpu_tensor_free(v->readout);
+        h3_gpu_tensor_free(v->branch_out);
+        h3_gpu_tensor_free(v->tk_feat);
+        h3_gpu_tensor_free(v->tv_feat);
+        h3_gpu_tensor_free(v->tbeta_lin);
+        h3_gpu_tensor_free(v->tbeta);
+        h3_gpu_tensor_free(v->tA);
+        h3_gpu_tensor_free(v->tB);
+        h3_gpu_tensor_free(v->tX);
+        h3_gpu_tensor_free(v->tinv);
+        h3_gpu_tensor_free(v->tstate);
+        h3_gpu_tensor_free(v->state);
+        free(v);
+    }
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->row_maps[step]);
@@ -3668,7 +4354,8 @@ void h3_dit_free(h3_dit *dit) {
                 "(threshold %.3f)\n", dit->fb_cache_skips, dit->fb_cache_probes,
                 (double)dit->fb_cache_threshold);
     h3_dit_schedule_free(dit->schedule);
-    if (dit->lora) h3_lora_close(dit->lora);
+    for (int index = 0; index < dit->lora_count; index++)
+        h3_lora_close(dit->lora[index]);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,

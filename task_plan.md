@@ -1,75 +1,92 @@
-# Task Plan: h3.c — 超分集成 + 视频生成参数调优 + Metal 内核优化
+# Task Plan: h3.c 完整支持 VDN-H3（线性注意力混合分支 + LoRA + turbo）
 
 ## Goal
-1. (已完成) 把 Real-ESRGAN 超分作为 CLI 后处理集成进 h3.c，保留音轨。
-2. (已完成) 诊断"生成只有色块、无画面"问题，并调出可用的 15s 视频参数组合。
-3. (已完成) 参考 vdn-minimax-h3 Python 项目，优化 Metal 内核：FlashAttention + Tiled Windowed Softmax。
+让 h3.c 完整支持 VDN-MiniMax-H3（OpenVDN/vdn-minimax-h3 checkpoint，位于
+/Users/jay/.cache/modelscope/models/OpenVDN--vdn-minimax-h3/snapshots/master）：
+- 每 DiT block 增加线性注意力分支（vdn_solve delta rule，与 softmax 窗口分支精确互补）
+- LoRA adapter（default rank64/alpha64；turbo 额外一层，`.turbo` 后缀）加载合并
+- softmax 分支改为 chunk 窗口（c5）+ anchor_frames=both（替代全稠密 SDPA）
+- 8-step turbo 推理（video_shift=12 / audio_shift=3 — h3.c 常量已匹配，无需改）
 
-## Current Phase
-Phase 15：Metal 内核优化完成（FlashAttention + Tiled Windowed Softmax + Linear Far-Brain 基础设施）。
-下一步：用户决定是否继续优化其他方向（FP8 量化、Ulysses 序列并行、训练 linear far-branch 权重）。
+## 权重事实（来自 safetensors 头部实测）
+- 每 block 16 个新张量（800 = 16×50），key `transformer_blocks.N.attn.…`：
+  - `linear_attention.alpha.{A_log[56], dt_bias[7168], down.weight[128,5376], up.weight[7168,128]}`
+  - `linear_attention.beta_proj.weight[56,5376]`、`linear_attention.norm.weight[128]`
+  - `linear_attention.short_conv.{k,v}_{sp[7168,1,5,5],tm[7168,1,5]}.weight`
+  - `linear_attention.output_gate.{down.weight[128,5376], up.weight[7168,128], up.bias[7168]}`
+  - `softmax_gate.up.{weight[56,5376], bias[56]}`
+  - `to_out_linear.weight[5376,7168]`
+- adapter：`transformer_blocks.N.attn.orig.{to_q,to_k,to_v,to_out.0}.lora_A/B.default.weight`
+  rank64；turbo 同 targets 但后缀 `.turbo`，另含 `norm_out.linear.lora_*.turbo`。
+- 基座权重沿用现有 FL2VA/transformer（convrot），只需映射 `transformer_blocks.N`→`blocks.N`、
+  `attn.orig.to_{q,k,v}`→融合 qkv 的行带 [0,7168)/[7168,14336)/[14336,21504)。
 
-## Phases (SR 集成 — 已完成)
-### Phase 1: Requirements & Discovery — complete
-### Phase 2: Planning & Structure — complete
-### Phase 3: Implementation — complete
-### Phase 4: Testing & Verification — complete
-### Phase 5: Delivery — complete（口头说明，git 未提交）
+## 算法规格（源码级确认）
+1. 线性分支只吃 video 行，输入=共享 QKV 的 raw q/k/v（pre-QK-norm、pre-RoPE，NoPE）。
+2. 特征：k,v = depthwise 5×5 空间 conv + 5-tap 时间 conv（零填充、非因果、跨帧）→ SiLU → L2Norm(eps=1e-6, 仅 k)；q = SiLU→L2Norm；v = conv→SiLU（不归一）。
+3. beta = sigmoid(beta_proj(x))；A[f,h]=(βk)ᵀk（fp32+对称化）、B[f,h]=(βv)ᵀk（fp32）。
+4. alpha（fp32）：delta=up(down(x̄_f))+dt_bias，alpha=exp(−exp(A_log_h)·softplus(delta))，x̄_f=帧均值。
+5. vdn_solve：chol(I+A) → inv=L⁻ᵀL⁻¹；transition=Diag(alpha)·inv；injection=B@inv。
+6. 文本状态：S_text=B_text@(I+A_text)⁻¹（text 行无 conv，beta 同投影，ones alpha）；双向扫描起点=0.5·S_text。
+7. 扫描：S_t=S_{t-1}·transition_t+injection_t，forward+reverse 两套状态库（fp32）。
+8. gather（skip_ends：首尾帧读出=0，bounds 减 1 重基）：left=prefix[lo-1]、right=suffix[hi+1]，bridge=α 乘积（log 前缀差）；窗口触界侧读 0.5·S_text 衰减入。
+9. 读出：out_fs = Σ_k linear_state[f,h,v,k]·q[f,s,h,k] → RMSNorm[128] → ×output_gate(xv) → to_out_linear，加到 attention 输出的 video 行。
+10. softmax 侧：gate=sigmoid(softmax_gate.up(x)) per head 乘到 softmax 输出（to_out 之前）。
+11. softmax 窗口：chunk=5 模式，frame t 窗口=[(t//5−1)·5, (t//5+2)·5−1]（clamp）；anchor both：帧 0/F−1 的 query 行 dense，且所有 query 额外看到帧 0/F−1（列）。text/audio 行保持稠密。
 
-## Phases (色块诊断 + 参数调优 — 已完成)
-### Phase 6: 色块根因定位 — complete
-### Phase 7: 2×2 参数对照 — complete
-### Phase 8: 15s 正式基准 — complete
-### Phase 9: 最小清晰分辨率扫描 — complete
-### Phase 10: 人脸清晰度 1:1 矩阵 — complete
-### Phase 11: 加超分出品 — pending（待用户决定）
+## Phases
+### Phase 1: 规格研究 + 计划落盘 — complete
+- [x] Python 参考实现精读（branch/delta_rule/scan/features/layers/hybrid_attention/window）
+- [x] checkpoint 权重清单实测
+- [x] h3.c 现状调研（DiT 前向/LoRA/加载/调度/kernel 注册）
 
-## Phases (Metal 内核优化 — 已完成)
-### Phase 12: FlashAttention 内核调试 — complete
-- [x] 修复 BF16 类型转换 bug（`h3_bf16_to_f32` 参数类型不匹配）
-- [x] 实现 `h3_flash_attn_causal` kernel
-- [x] 实现 `h3_flash_attn_tiled_windowed` kernel
-- [x] 测试通过：causal max_err=0.00095, tiled_windowed max_err=0.00817
+### Phase 2: LoRA 扩展 — in_progress
+- [ ] 支持 `attn.orig.to_q/to_k/to_v` → qkv 行带映射（C 端 target 表）
+- [ ] 支持 `.default` 与 `.turbo` 两套后缀（多 adapter，按顺序合并）
+- [ ] 验证：加载 stage-dmd adapters，检查合并后 delta 数值（h3_lora_tests 扩展）
 
-### Phase 13: Tiled Windowed Softmax — complete
-- [x] 实现 O(T·window) 复杂度的 windowed attention
-- [x] 支持 text（dense）、video（windowed）、audio（dense）三种 query 类型
-- [x] 测试通过：tiled_windowed OK (seq=24, F=4, S=4, r=2)
+### Phase 3: 线性分支权重加载
+- [ ] h3_dit_block 新增 16 字段（norm 常驻 + 大矩阵可流式 STREAM_LIN_*）
+- [ ] 加载/映射 linear_branch/model.safetensors（transformer_blocks.N → blocks.N）
+- [ ] 验证：张量计数、形状断言
 
-### Phase 14: FP8 量化集成分析 — complete
-- [x] 分析 Python 参考项目 `ops/fp8_linear.py`
-- [x] 确认 C 代码已有量化基础设施（int8 tensor core）
-- [x] FP8 E4M3 可通过 INT8 模拟，动态范围更好（±448 vs ±127）
+### Phase 4: Metal 内核
+- [ ] 特征：depthwise 5×5 空间 conv + 5-tap 时间 conv + SiLU + L2Norm（融合）
+- [ ] frame stats（A/B fp32）、alpha、softmax_gate、output_gate（可并入现有 adaln/linear）
+- [ ] vdn_solve：批量 128×128 Cholesky + 三角求逆（threadgroup/矩阵）
+- [ ] scan（逐帧 bmm，主机驱动；forward+reverse）
+- [ ] gather + readout epilogue（readout@q、RMSNorm、gate）
+- [ ] 单元测试：CPU 黄金对照（tests/ 新增）
 
-### Phase 15: Linear Far-Brain 分支基础设施 — complete
-- [x] 实现完整的 SanaDelta delta-rule scan 管线
-- [x] 7 个 linear-branch 测试全部通过
-- [ ] 需要训练权重（alpha、beta、q_norm、gate、to_out_linear）
+### Phase 5: run_block 接线
+- [ ] raw qkv 输出（fused qkv kernel 需输出 pre-norm/pre-rope 值，或拆分）
+- [ ] softmax 窗口注意力接入主路径（chunk c5 + anchors，改造 h3_flash_attn_tiled_windowed/h3_sdpa_window_mask）
+- [ ] 线性分支插入（softmax out + to_out_linear 后、残差前）
+- [ ] 验证：单 block 与 Python golden 对比
 
-## Key Questions
-1. 色块根因 → 128×96 渲染分辨率过低（非 steps / 非 token-reduction）
-2. Metal BF16 类型转换 → 必须使用 `as_type<ushort>()` / `as_type<bfloat>()` 显式位转换
-3. FlashAttention 复杂度 → causal O(T²/2), tiled_windowed O(T·window)
-4. Linear far-branch → 需要训练权重，当前 checkpoint 中不存在
+### Phase 6: 目录/CLI/调度
+- [ ] --vdn-dir 或 lora/linear 分开参数；8 步 turbo（steps=8，shift 已匹配）
+- [ ] token_refiner（文本编码器侧）LoRA 合并检查（h3_lora 已支持 refiner 目标名）
+
+### Phase 7: 端到端验证
+- [ ] make test 全绿
+- [ ] 用 stage-dmd-step-250 生成短片，对比视觉质量/与 Python 输出合理性
 
 ## Decisions Made
 | Decision | Rationale |
-|----------|-----------|
-| 诊断用 2s 短片 + 原生分辨率做 A/B，而非直接 15s | 快速、低成本定位根因 |
-| 最终 15s 基准用原生 512×384 + 无 token-reduction（最不糊）| 内部分辨率越高画面结构越完整 |
-| Metal BF16 使用 `as_type<>()` 显式位转换 | 避免编译器生成错误的类型转换代码 |
-| Tiled windowed 按 query 类型分 3 个 key 范围处理 | 减少不必要的 key 遍历 |
+|---|---|
+| vdn_solve 用精确 Cholesky 求逆（而非 SanaDelta 一阶截断）| released checkpoint 就是用 vdn_solve 训练的；h3.c 已有 SanaDelta 骨架但不能等价替换 |
+| 基座权重继续用 convrot FL2VA 目录 | VDN stage 目录只含新增权重；基座即 MiniMax-H3 |
+| chunk 窗口用 per-frame bounds 表示 | 与现有 window mask/flash kernel 数据结构兼容，bounds 改为 c5 生成即可 |
+| 扫描 v1 用主机逐帧驱动 bmm | 102×2 次/层/步的 launch 开销可接受（~0.5s/步），先求正确 |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| `setsid: command not found`（macOS）| 1 | 改用 `nohup bash -c '...' & disown` |
-| Metal kernel 输出全零 | 多个 | 修复 `h3_bf16_to_f32` 参数类型不匹配 |
-| `(ushort)` cast 产生错误 BF16 值 | 多个 | 使用 `as_type<bfloat>(ushort(bits >> 16))` |
-| `h3_f32_to_bf16()` 被编译器错误内联 | 多个 | 使用 `as_type<uint>()` 直接位操作 |
+| 子代理无写文件权限 | 1 | 报告由主代理落盘 |
 
 ## Notes
-- 修改文件（SR 集成）：`h3_ffmpeg.c` `h3_ffmpeg.h` `main.c` `h3_cli.c`
-- 修改文件（Metal 内核）：`h3_shaders.metal` `h3_gpu.m` `h3_gpu.h`
-- 新增测试：`tests/test_flash_attn.c` `tests/test_tiled_windowed.c` `tests/test_linear_branch.c`
-- 模型路径见 findings.md
+- VDN 配置：chunk=5, radius=1（chunk 模式下 radius 为 chunk 跨度）、anchor_frames=both、
+  bridge=alpha、a_fp32、enable_text_state、short_conv=[k,v]、linear_head_dim=128。
+- turbo: 8 steps, video_shift=12.0, audio_shift=3.0（= h3_host.h 现有常量）。
+- 详细规格见 findings.md「VDN-H3 规格研究」节。

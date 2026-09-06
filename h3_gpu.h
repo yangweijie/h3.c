@@ -315,6 +315,10 @@ int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                         uint32_t output_dim);
 /* Experimental M5 Metal 4 int8 MLP. Weights use one F32 scale per output
  * channel; activations are quantized dynamically with one F32 scale per row. */
+int h3_gpu_quantize_bf16_int8_rows(h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *scales, const h3_gpu_tensor *input,
+                            uint32_t rows, uint32_t dispatch_rows,
+                            uint32_t columns, float clip, void *label);
 int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
@@ -690,6 +694,137 @@ int h3_gpu_linear_branch_output(
     const h3_gpu_tensor *q_norm_weight, uint32_t num_frames,
     uint32_t tokens_per_frame, uint32_t heads, uint32_t head_dim,
     float epsilon);
+
+/* VDN-H3 hybrid attention (chunk-window softmax + vdn_solve linear branch).
+ * Structs mirror the Metal constant layouts field-for-field. */
+typedef struct {
+    uint32_t heads;
+    uint32_t sequence;
+    uint32_t head_dim;
+    uint32_t video_start;
+    uint32_t num_frames;
+    uint32_t tokens_per_frame;
+    uint32_t scale_bits;     /* float bits of the softmax scale */
+    uint32_t anchors;        /* bit0: columns (all queries see 0/F-1),
+                              * bit1: rows (frames 0/F-1 query densely) */
+    uint32_t head_major;     /* q/k/v/out laid out [H, T, d] */
+} h3_vdn_window_args;
+
+typedef struct {
+    uint32_t frames;
+    uint32_t tokens_per_frame;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t row_start;
+    uint32_t row_stride;
+    uint32_t channel_offset;
+    uint32_t channels;
+    uint32_t l2norm;
+} h3_vdn_feat_args;
+
+typedef struct {
+    uint32_t batch;
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
+    uint32_t transpose_a;
+    uint32_t transpose_b;
+    uint32_t add;
+} h3_vdn_bmm_args;
+
+int h3_gpu_vdn_window_attention(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value,
+                                const h3_gpu_tensor *bounds,
+                                const h3_vdn_window_args *args);
+int h3_gpu_vdn_head_gate(h3_gpu *gpu, h3_gpu_tensor *heads,
+                         const h3_gpu_tensor *gate, uint32_t rows,
+                         uint32_t heads_count, uint32_t head_dim);
+int h3_gpu_vdn_add_rows(h3_gpu *gpu, h3_gpu_tensor *dst,
+                        const h3_gpu_tensor *src, uint32_t row_offset,
+                        uint32_t width, uint32_t rows);
+int h3_gpu_vdn_pointwise_feat(h3_gpu *gpu, h3_gpu_tensor *out,
+                              const h3_gpu_tensor *qkv,
+                              const h3_vdn_feat_args *args);
+int h3_gpu_vdn_conv_sp(h3_gpu *gpu, h3_gpu_tensor *out,
+                       const h3_gpu_tensor *qkv, const h3_gpu_tensor *weight,
+                       const h3_vdn_feat_args *args, uint32_t grid_h,
+                       uint32_t grid_w);
+int h3_gpu_vdn_conv_tm_act(h3_gpu *gpu, h3_gpu_tensor *out,
+                           const h3_gpu_tensor *spatial,
+                           const h3_gpu_tensor *weight,
+                           const h3_vdn_feat_args *args);
+int h3_gpu_vdn_sigmoid_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input, uint32_t count,
+                           uint32_t tokens_per_frame, uint32_t heads,
+                           uint32_t permute);
+int h3_gpu_vdn_frame_mean(h3_gpu *gpu, h3_gpu_tensor *mean,
+                          const h3_gpu_tensor *x, uint32_t tokens_per_frame,
+                          uint32_t hidden, uint32_t row_offset,
+                          uint32_t frames);
+int h3_gpu_vdn_alpha(h3_gpu *gpu, h3_gpu_tensor *alpha,
+                     const h3_gpu_tensor *delta,
+                     const h3_gpu_tensor *dt_bias,
+                     const h3_gpu_tensor *a_log, uint32_t frames,
+                     uint32_t heads, uint32_t head_dim);
+/* Run a BF16 linear on a private, immediately-committed command buffer.
+ * Background threads (SSD prefetch) use this so they never touch the main
+ * thread's open command buffer. */
+/* Fused LoRA delta merge: C[row0 + r, c] += sum_k A[r,k] * BT[c,k]. */
+int h3_gpu_lora_geam_bf16(h3_gpu *gpu, h3_gpu_tensor *weight, size_t row0,
+                          const h3_gpu_tensor *a, const h3_gpu_tensor *bt,
+                          uint32_t rows, uint32_t inner, uint32_t columns);
+int h3_gpu_blocking_lora_geam_bf16(h3_gpu *gpu, h3_gpu_tensor *weight,
+                                   size_t row0, const h3_gpu_tensor *a,
+                                   const h3_gpu_tensor *bt, uint32_t rows,
+                                   uint32_t inner, uint32_t columns);
+
+int h3_gpu_blocking_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *weight,
+                                const h3_gpu_tensor *bias, uint32_t rows,
+                                uint32_t input_dim, uint32_t output_dim);
+
+/* h3_gpu_linear_bf16 with an input element offset (buffer-relative), so a
+ * contiguous row slab of a packed tensor can feed a projection without a
+ * copy. */
+int h3_gpu_linear_bf16_offset(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *input,
+                              size_t input_offset_elements,
+                              const h3_gpu_tensor *weight,
+                              const h3_gpu_tensor *bias, uint32_t rows,
+                              uint32_t input_dim, uint32_t output_dim);
+
+int h3_gpu_vdn_cholesky(h3_gpu *gpu, h3_gpu_tensor *matrices,
+                        uint32_t batch, uint32_t dim);
+int h3_gpu_vdn_triinv(h3_gpu *gpu, h3_gpu_tensor *x,
+                      const h3_gpu_tensor *l, uint32_t batch, uint32_t dim);
+int h3_gpu_vdn_bmm(h3_gpu *gpu, h3_gpu_tensor *c, const h3_gpu_tensor *a,
+                   const h3_gpu_tensor *b, const h3_gpu_tensor *add,
+                   const h3_vdn_bmm_args *args);
+int h3_gpu_vdn_row_scale(h3_gpu *gpu, h3_gpu_tensor *transition,
+                         const h3_gpu_tensor *inv, const h3_gpu_tensor *alpha,
+                         uint32_t batch, uint32_t dim);
+int h3_gpu_vdn_scan_step(h3_gpu *gpu, h3_gpu_tensor *state_out,
+                         const h3_gpu_tensor *state_in,
+                         const h3_gpu_tensor *transition,
+                         const h3_gpu_tensor *injection, uint32_t heads,
+                         uint32_t dim, uint32_t frame, uint32_t in_frame,
+                         uint32_t out_frame);
+int h3_gpu_vdn_gather(h3_gpu *gpu, h3_gpu_tensor *out,
+                      const h3_gpu_tensor *prefix,
+                      const h3_gpu_tensor *suffix,
+                      const h3_gpu_tensor *log_alpha_prefix,
+                      const h3_gpu_tensor *bounds,
+                      const h3_gpu_tensor *text_state, uint32_t frames,
+                      uint32_t heads, uint32_t dim, uint32_t has_text_state);
+int h3_gpu_vdn_readout(h3_gpu *gpu, h3_gpu_tensor *out,
+                       const h3_gpu_tensor *state, const h3_gpu_tensor *q,
+                       const h3_gpu_tensor *gate,
+                       const h3_gpu_tensor *norm_weight, uint32_t frames,
+                       uint32_t heads, uint32_t tokens_per_frame,
+                       uint32_t head_dim);
 
 /* FlashAttention-style tiled attention kernel.
  *

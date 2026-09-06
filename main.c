@@ -35,7 +35,10 @@ static void usage(const char *program) {
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
-        "      --lora PATH        Merge a Turbo/distillation LoRA into the DiT\n"
+        "      --lora PATH        Merge LoRA adapter(s) into the DiT; comma-\n"
+        "                         separated list merges in order (VDN: default,turbo)\n"
+        "      --linear-branch DIR  VDN-H3 linear-branch checkpoint directory\n"
+        "                         (hybrid attention; incompatible with --ssd-streaming)\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
@@ -265,6 +268,7 @@ int main(int argc, char **argv) {
            OPT_TOKEN_REDUCTION,
            OPT_SSD_STREAMING,
            OPT_LORA,
+           OPT_LINEAR_BRANCH,
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
            OPT_USE_SLOWER_BF16_MLP,
@@ -301,6 +305,7 @@ int main(int argc, char **argv) {
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
         {"lora", required_argument, NULL, OPT_LORA},
+        {"linear-branch", required_argument, NULL, OPT_LINEAR_BRANCH},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"use-slower-bf16-mlp", no_argument, NULL,
@@ -401,6 +406,7 @@ int main(int argc, char **argv) {
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
             case OPT_LORA: params.lora_path = optarg; break;
+            case OPT_LINEAR_BRANCH: params.linear_branch_path = optarg; break;
             case OPT_USE_INT8_ROW_FC2:
                 params.use_int8_row_fc2 = 1;
                 break;

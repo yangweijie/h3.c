@@ -100,6 +100,11 @@ typedef struct {
      * at load time (4-step/8-step schedulers). Cannot be combined with
      * ssd_streaming. */
     const char *lora_path;
+    /* VDN-H3 linear-branch checkpoint directory (contains linear_branch/
+     * model.safetensors, e.g. .../stage-b-step-2000). Enables the hybrid
+     * attention: chunk-window softmax + linear delta-rule branch. Cannot be
+     * combined with ssd_streaming. */
+    const char *linear_branch_path;
     /* Stream the video VAE decoder weights instead of keeping the whole decoder
      * resident. Off by default; the auto memory planner (h3_memory_plan) turns
      * it on when the device working set is tight. */

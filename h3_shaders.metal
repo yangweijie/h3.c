@@ -887,6 +887,47 @@ kernel void h3_clip_f32(device const float *input [[buffer(0)]],
         output[index] = clamp(input[index], args.minimum, args.maximum);
 }
 
+/* LoRA delta merge: C[row0 + r, c] += sum_k A[r, k] * B^T[c, k], with A the
+ * (already scaled) B factor [rows, rank] and B^T the transposed A factor
+ * [columns, rank]. Fusing the accumulate into the GEMM epilogue keeps the
+ * delta on the GPU: no readback, no host add, no write-back. */
+typedef struct { uint32_t rows, inner, columns, row_offset; } lora_geam_args;
+
+kernel void h3_lora_geam_bf16(device const ushort *a [[buffer(0)]],
+                              device const ushort *bt [[buffer(1)]],
+                              device ushort *c [[buffer(2)]],
+                              constant lora_geam_args &args [[buffer(3)]],
+                              uint2 tid [[thread_position_in_threadgroup]],
+                              uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float a_tile[16][16];
+    threadgroup float b_tile[16][16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = 0.0f;
+    uint tile_count = (args.inner + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint a_k = tile * 16 + tid.x;
+        a_tile[tid.y][tid.x] =
+            a_k < args.inner ? h3_bf16_to_f32(a[row * args.inner + a_k])
+                             : 0.0f;
+        uint b_k = tile * 16 + tid.y;
+        b_tile[tid.y][tid.x] =
+            b_k < args.inner ? h3_bf16_to_f32(bt[column * args.inner + b_k])
+                             : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++) {
+            sum = fma(a_tile[tid.y][k], b_tile[k][tid.x], sum);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    /* No early return above: every thread must reach both barriers. */
+    if (row < args.rows && column < args.columns) {
+        uint index = (args.row_offset + row) * args.columns + column;
+        float current = h3_bf16_to_f32(c[index]);
+        c[index] = h3_f32_to_bf16(current + sum);
+    }
+}
+
 kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
                            device const ushort *weight [[buffer(1)]],
                            device const ushort *bias [[buffer(2)]],
@@ -5577,5 +5618,593 @@ kernel void h3_flash_attn_tiled_windowed(
             bits += 0x7fffu + ((bits >> 16) & 1u);
             output[base_q + i] = as_type<bfloat>(ushort(bits >> 16));
         }
+    }
+}
+
+/* =============================================================================
+ * VDN-H3 hybrid attention kernels (OpenVDN/vdn-minimax-h3).
+ * Softmax branch: chunk-window attention with anchor frames. Linear branch:
+ * exact vdn_solve delta-rule scan (Cholesky inverse), fp32 state math.
+ * ============================================================================ */
+
+struct h3_vdn_window_args {
+    uint heads;
+    uint sequence;
+    uint head_dim;
+    uint video_start;
+    uint num_frames;
+    uint tokens_per_frame;
+    uint scale_bits;
+    uint anchors;          /* bit0: anchor columns, bit1: anchor rows */
+    uint head_major;       /* q/k/v/out [H, T, d] instead of [T, H, d] */
+};
+
+/* Windowed softmax attention, one thread per (head, query row). Video queries
+ * attend to the global rows, their chunk window [lo, hi], requested anchor
+ * frames, and all audio rows. Global rows stay dense. */
+kernel void h3_vdn_window_attention(
+        device const bfloat *query [[buffer(0)]],
+        device const bfloat *key [[buffer(1)]],
+        device const bfloat *value [[buffer(2)]],
+        device bfloat *output [[buffer(3)]],
+        device const float *bounds [[buffer(4)]],
+        constant h3_vdn_window_args &args [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint head = gid.x;
+    uint q_global = gid.y;
+    if (head >= args.heads || q_global >= args.sequence) return;
+    uint d = args.head_dim;
+    uint video_end = args.video_start + args.num_frames * args.tokens_per_frame;
+    bool video_query = q_global >= args.video_start && q_global < video_end;
+    uint q_base = args.head_major
+        ? (size_t)head * args.sequence * d + (size_t)q_global * d
+        : (size_t)q_global * args.heads * d + (size_t)head * d;
+    float q_row[128];
+    for (uint i = 0; i < d; i++)
+        q_row[i] = h3_bf16_to_f32(query + q_base + i);
+    uint ks[6], ke[6];
+    uint range_count = 0;
+    if (!video_query) {
+        ks[range_count] = 0; ke[range_count] = args.sequence; range_count++;
+    } else {
+        uint t = (q_global - args.video_start) / args.tokens_per_frame;
+        ks[range_count] = 0; ke[range_count] = args.video_start; range_count++;
+        ks[range_count] = video_end; ke[range_count] = args.sequence; range_count++;
+        if ((args.anchors & 2u) && (t == 0 || t == args.num_frames - 1)) {
+            ks[range_count] = args.video_start;
+            ke[range_count] = video_end; range_count++;
+        } else {
+            int lo = (int)bounds[t * 2 + 0];
+            int hi = (int)bounds[t * 2 + 1];
+            if (lo < 0) lo = 0;
+            if (hi >= (int)args.num_frames) hi = (int)args.num_frames - 1;
+            if (lo <= hi) {
+                ks[range_count] = args.video_start +
+                    (uint)lo * args.tokens_per_frame;
+                ke[range_count] = args.video_start +
+                    (uint)(hi + 1) * args.tokens_per_frame;
+                range_count++;
+            }
+            if (args.anchors & 1u) {
+                uint anchors[2] = {0u, args.num_frames - 1};
+                for (uint a = 0; a < 2; a++) {
+                    if (((int)anchors[a] < lo) || ((int)anchors[a] > hi)) {
+                        ks[range_count] = args.video_start +
+                            anchors[a] * args.tokens_per_frame;
+                        ke[range_count] = ks[range_count] +
+                            args.tokens_per_frame;
+                        range_count++;
+                    }
+                }
+            }
+        }
+    }
+    float scale = as_type<float>(args.scale_bits);
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+    float acc[128];
+    for (uint i = 0; i < d; i++) acc[i] = 0.0f;
+    for (uint range = 0; range < range_count; range++) {
+        for (uint k_global = ks[range]; k_global < ke[range]; k_global++) {
+            uint base_kv = args.head_major
+                ? (size_t)head * args.sequence * d + (size_t)k_global * d
+                : (size_t)k_global * args.heads * d + (size_t)head * d;
+            float score = 0.0f;
+            for (uint i = 0; i < d; i++)
+                score = fma(q_row[i], h3_bf16_to_f32(key + base_kv + i), score);
+            score *= scale;
+            float new_max = max(max_val, score);
+            float shift = exp(max_val - new_max);
+            float exp_score = exp(score - new_max);
+            for (uint i = 0; i < d; i++) acc[i] *= shift;
+            sum_exp = sum_exp * shift + exp_score;
+            max_val = new_max;
+            for (uint i = 0; i < d; i++)
+                acc[i] = fma(exp_score, h3_bf16_to_f32(value + base_kv + i),
+                             acc[i]);
+        }
+    }
+    if (sum_exp > 0.0f) {
+        float inv_sum = 1.0f / sum_exp;
+        for (uint i = 0; i < d; i++)
+            h3_f32_to_bf16(output + q_base + i, acc[i] * inv_sum);
+    }
+}
+
+/* Per-head softmax gate: heads[i] *= sigmoid(gate[i]). */
+kernel void h3_vdn_head_gate(device bfloat *heads [[buffer(0)]],
+                             device const bfloat *gate [[buffer(1)]],
+                             constant uint &heads_count [[buffer(2)]],
+                             constant uint &head_dim [[buffer(3)]],
+                             uint gid [[thread_position_in_grid]]) {
+    uint plane = heads_count * head_dim;
+    uint row = gid / plane;
+    uint h = (gid % plane) / head_dim;
+    float g = h3_bf16_to_f32(gate + (size_t)row * heads_count + h);
+    float value = h3_bf16_to_f32(heads + gid) / (1.0f + exp(-g));
+    h3_f32_to_bf16(heads + gid, value);
+}
+
+/* Add `src` into `dst` starting at dst row `row_offset` (bf16). */
+kernel void h3_vdn_add_rows(device bfloat *dst [[buffer(0)]],
+                            device const bfloat *src [[buffer(1)]],
+                            constant uint &row_offset [[buffer(2)]],
+                            constant uint &width [[buffer(3)]],
+                            constant uint &rows [[buffer(4)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= width || gid.y >= rows) return;
+    size_t dst_index = ((size_t)row_offset + gid.y) * width + gid.x;
+    float value = h3_bf16_to_f32(dst + dst_index) +
+                  h3_bf16_to_f32(src + (size_t)gid.y * width + gid.x);
+    h3_f32_to_bf16(dst + dst_index, value);
+}
+
+struct h3_vdn_feat_args {
+    uint frames;
+    uint tokens_per_frame;
+    uint heads;
+    uint head_dim;
+    uint row_start;
+    uint row_stride;
+    uint channel_offset;
+    uint channels;
+    uint l2norm;
+};
+
+/* Pointwise branch features: SiLU (+ L2Norm over head_dim) on a raw-QKV row
+ * slab, written frame-major [F, H, S, d]. Also serves the text chunk. */
+kernel void h3_vdn_pointwise_feat(
+        device const bfloat *qkv [[buffer(0)]],
+        device bfloat *out [[buffer(1)]],
+        constant h3_vdn_feat_args &args [[buffer(2)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    uint token = gid.x;
+    uint head = gid.y;
+    if (token >= args.frames * args.tokens_per_frame ||
+        head >= args.heads) return;
+    uint d = args.head_dim;
+    uint frame = token / args.tokens_per_frame;
+    uint within = token % args.tokens_per_frame;
+    device const bfloat *src = qkv +
+        (size_t)(args.row_start + token) * args.row_stride +
+        args.channel_offset + (size_t)head * d;
+    float values[128];
+    float sum_sq = 0.0f;
+    for (uint i = 0; i < d; i++) {
+        float v = h3_bf16_to_f32(src + i);
+        v = v / (1.0f + exp(-v));
+        values[i] = v;
+        sum_sq = fma(v, v, sum_sq);
+    }
+    float inverse = args.l2norm ? rsqrt(sum_sq + 1e-6f) : 1.0f;
+    size_t base = ((size_t)(frame * args.heads + head) *
+                   args.tokens_per_frame + within) * d;
+    for (uint i = 0; i < d; i++)
+        h3_f32_to_bf16(out + base + i, values[i] * inverse);
+}
+
+/* Depthwise 5x5 spatial half of the short conv (zero padded). Input rows are
+ * the raw QKV slab viewed [F, gh, gw, channels]; output token-major
+ * [F*S, channels]. */
+kernel void h3_vdn_conv_sp(
+        device const bfloat *qkv [[buffer(0)]],
+        device const bfloat *weight [[buffer(1)]],
+        device bfloat *out [[buffer(2)]],
+        constant h3_vdn_feat_args &args [[buffer(3)]],
+        constant uint &grid_h [[buffer(4)]],
+        constant uint &grid_w [[buffer(5)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    uint token = gid.x;
+    uint channel = gid.y;
+    if (token >= args.frames * args.tokens_per_frame ||
+        channel >= args.channels) return;
+    uint frame = token / args.tokens_per_frame;
+    uint within = token % args.tokens_per_frame;
+    uint h = within / grid_w;
+    uint w = within % grid_w;
+    float sum = 0.0f;
+    for (uint dy = 0; dy < 5; dy++) {
+        int y = (int)h + (int)dy - 2;
+        if (y < 0 || y >= (int)grid_h) continue;
+        for (uint dx = 0; dx < 5; dx++) {
+            int x = (int)w + (int)dx - 2;
+            if (x < 0 || x >= (int)grid_w) continue;
+            uint neighbour = frame * args.tokens_per_frame +
+                             (uint)y * grid_w + (uint)x;
+            float value = h3_bf16_to_f32(qkv + 
+                (size_t)(args.row_start + neighbour) * args.row_stride +
+                args.channel_offset + channel);
+            float tap = h3_bf16_to_f32(weight + channel * 25 + dy * 5 + dx);
+            sum = fma(value, tap, sum);
+        }
+    }
+    h3_f32_to_bf16(out + (size_t)token * args.channels + channel, sum);
+}
+
+/* Temporal 5-tap half + SiLU (+ per-head L2Norm) finishing the short conv.
+ * Input: spatial intermediate [F*S, channels]; output frame-major
+ * [F, H, S, d]. One thread per (token, head). */
+kernel void h3_vdn_conv_tm_act(
+        device const bfloat *spatial [[buffer(0)]],
+        device const bfloat *weight [[buffer(1)]],
+        device bfloat *out [[buffer(2)]],
+        constant h3_vdn_feat_args &args [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint token = gid.x;
+    uint head = gid.y;
+    if (token >= args.frames * args.tokens_per_frame ||
+        head >= args.heads) return;
+    uint d = args.head_dim;
+    uint frame = token / args.tokens_per_frame;
+    uint within = token % args.tokens_per_frame;
+    uint channel0 = head * d;
+    float values[128];
+    float sum_sq = 0.0f;
+    for (uint i = 0; i < d; i++) {
+        uint channel = channel0 + i;
+        float sum = 0.0f;
+        for (uint tap = 0; tap < 5; tap++) {
+            int f = (int)frame + (int)tap - 2;
+            if (f < 0 || f >= (int)args.frames) continue;
+            uint neighbour = (uint)f * args.tokens_per_frame + within;
+            float value =
+                h3_bf16_to_f32(spatial + (size_t)neighbour * args.channels +
+                                       channel);
+            float w = h3_bf16_to_f32(weight + channel * 5 + tap);
+            sum = fma(value, w, sum);
+        }
+        sum = sum / (1.0f + exp(-sum));
+        values[i] = sum;
+        sum_sq = fma(sum, sum, sum_sq);
+    }
+    float inverse = args.l2norm ? rsqrt(sum_sq + 1e-6f) : 1.0f;
+    size_t base = ((size_t)(frame * args.heads + head) *
+                   args.tokens_per_frame + within) * d;
+    for (uint i = 0; i < d; i++)
+        h3_f32_to_bf16(out + base + i, values[i] * inverse);
+}
+
+/* sigmoid, rounded through bf16, widened to fp32. With permute=1 the input is
+ * token-major [F*S, H] and the output is written in the frame-stats layout
+ * [F, H, S]; with permute=0 the mapping is elementwise. */
+kernel void h3_vdn_sigmoid_f32(device const bfloat *input [[buffer(0)]],
+                               device float *output [[buffer(1)]],
+                               constant uint &count [[buffer(2)]],
+                               constant uint &tokens_per_frame [[buffer(3)]],
+                               constant uint &heads [[buffer(4)]],
+                               constant uint &permute [[buffer(5)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    float value = h3_bf16_to_f32(input + gid);
+    value = 1.0f / (1.0f + exp(-value));
+    value = h3_bf16_to_f32(h3_f32_to_bf16(value));
+    if (!permute) {
+        output[gid] = value;
+        return;
+    }
+    uint token = gid / heads;
+    uint head = gid % heads;
+    uint frame = token / tokens_per_frame;
+    uint within = token % tokens_per_frame;
+    output[((size_t)frame * heads + head) * tokens_per_frame + within] =
+        value;
+}
+
+/* Per-frame mean of the video hidden rows, fp32 [F, hidden]. */
+kernel void h3_vdn_frame_mean(device const bfloat *x [[buffer(0)]],
+                              device float *mean [[buffer(1)]],
+                              constant uint &tokens_per_frame [[buffer(2)]],
+                              constant uint &hidden [[buffer(3)]],
+                              constant uint &row_offset [[buffer(4)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint column = gid.y;
+    if (column >= hidden) return;
+    float sum = 0.0f;
+    size_t base = ((size_t)row_offset + frame * tokens_per_frame) * hidden;
+    for (uint s = 0; s < tokens_per_frame; s++)
+        sum += h3_bf16_to_f32(x + base + (size_t)s * hidden + column);
+    mean[(size_t)frame * hidden + column] = sum / (float)tokens_per_frame;
+}
+
+/* alpha = exp(-exp(A_log_h) * softplus(delta + dt_bias)), fp32 [F, H, d].
+ * delta and dt_bias are fp32: the Python reference keeps the whole alpha
+ * computation in fp32 because per-element bf16 errors compound across the
+ * ~100-frame scan. a_log stays bf16 (one value per head). */
+kernel void h3_vdn_alpha(device const float *delta [[buffer(0)]],
+                         device const float *dt_bias [[buffer(1)]],
+                         device const bfloat *a_log [[buffer(2)]],
+                         device float *alpha [[buffer(3)]],
+                         constant uint &frames [[buffer(4)]],
+                         constant uint &heads [[buffer(5)]],
+                         constant uint &head_dim [[buffer(6)]],
+                         uint3 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint channel = gid.y;
+    if (frame >= frames || channel >= heads * head_dim) return;
+    uint head = channel / head_dim;
+    float scale = exp(h3_bf16_to_f32(a_log + head));
+    float d = delta[(size_t)frame * heads * head_dim + channel] +
+              dt_bias[channel];
+    float softplus = d > 20.0f ? d : log(1.0f + exp(d));
+    alpha[(size_t)frame * heads * head_dim + channel] =
+        exp(-scale * softplus);
+}
+
+/* Batched Cholesky of (I + A), in place. One threadgroup per matrix
+ * (dim threads, thread = column), right-looking with a shared column
+ * broadcast. Produces L in the lower triangle. */
+kernel void h3_vdn_cholesky(device float *matrices [[buffer(0)]],
+                            constant uint &batch [[buffer(1)]],
+                            constant uint &dim [[buffer(2)]],
+                            uint matrix [[threadgroup_position_in_grid]],
+                            uint column [[thread_index_in_threadgroup]]) {
+    if (matrix >= batch || column >= dim) return;
+    device float *m = matrices + (size_t)matrix * dim * dim;
+    threadgroup float colj[128];
+    threadgroup float shared_d[1];
+    /* The caller stores A; factorize (I + A) by bumping the diagonal once. */
+    m[(size_t)column * dim + column] += 1.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = 0; j < dim; j++) {
+        if (column == j)
+            shared_d[0] = sqrt(max(m[(size_t)j * dim + j], 1e-12f));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float d = shared_d[0];
+        colj[column] = column == j ? d
+            : (column > j ? m[(size_t)column * dim + j] / d : 0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (column == j) {
+            for (uint i = j; i < dim; i++)
+                m[(size_t)i * dim + j] = colj[i];
+        } else if (column > j) {
+            float lc = colj[column];
+            for (uint i = j + 1; i < dim; i++) {
+                size_t index = (size_t)i * dim + column;
+                m[index] = fma(-colj[i], lc, m[index]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+/* Batched X = L^-1 by forward substitution. One threadgroup per matrix;
+ * row i is cooperatively broadcast through shared memory, each thread owns
+ * column `column` of X. */
+kernel void h3_vdn_triinv(device const float *l [[buffer(0)]],
+                          device float *x [[buffer(1)]],
+                          constant uint &batch [[buffer(2)]],
+                          constant uint &dim [[buffer(3)]],
+                          uint matrix [[threadgroup_position_in_grid]],
+                          uint column [[thread_index_in_threadgroup]]) {
+    if (matrix >= batch || column >= dim) return;
+    device const float *lm = l + (size_t)matrix * dim * dim;
+    device float *xm = x + (size_t)matrix * dim * dim;
+    threadgroup float row[128];
+    for (uint i = 0; i < dim; i++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        row[column] = lm[(size_t)i * dim + column];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (column <= i) {
+            float sum = (column == i) ? 1.0f : 0.0f;
+            for (uint k = column; k < i; k++)
+                sum -= row[k] * xm[(size_t)k * dim + column];
+            xm[(size_t)i * dim + column] = sum / row[i];
+        } else {
+            xm[(size_t)i * dim + column] = 0.0f;
+        }
+    }
+}
+
+struct h3_vdn_bmm_args {
+    uint batch;
+    uint m;
+    uint k;
+    uint n;
+    uint transpose_a;
+    uint transpose_b;
+    uint add;
+};
+
+/* Batched fp32 GEMM: C[b] = op(A[b]) @ op(B[b]) (+ add[b]). */
+kernel void h3_vdn_bmm(device const float *a [[buffer(0)]],
+                       device const float *b [[buffer(1)]],
+                       device const float *add [[buffer(2)]],
+                       device float *c [[buffer(3)]],
+                       constant h3_vdn_bmm_args &args [[buffer(4)]],
+                       uint3 gid [[thread_position_in_grid]]) {
+    uint matrix = gid.z;
+    uint row = gid.x;
+    uint column = gid.y;
+    if (matrix >= args.batch || row >= args.m || column >= args.n) return;
+    size_t batch_a = (size_t)matrix * args.m * args.k;
+    size_t batch_b = (size_t)matrix * args.k * args.n;
+    size_t batch_c = (size_t)matrix * args.m * args.n;
+    float sum = 0.0f;
+    for (uint i = 0; i < args.k; i++) {
+        float av = args.transpose_a ?
+            a[batch_a + (size_t)i * args.m + row] :
+            a[batch_a + (size_t)row * args.k + i];
+        float bv = args.transpose_b ?
+            b[batch_b + (size_t)column * args.k + i] :
+            b[batch_b + (size_t)i * args.n + column];
+        sum = fma(av, bv, sum);
+    }
+    if (args.add) sum += add[batch_c + (size_t)row * args.n + column];
+    c[batch_c + (size_t)row * args.n + column] = sum;
+}
+
+/* transition = Diag(alpha) . inv: row i scaled by alpha[matrix, i]. The batch
+ * index runs over F*H, matching alpha's [F, H, dim] layout. */
+kernel void h3_vdn_row_scale(device const float *inv [[buffer(0)]],
+                             device const float *alpha [[buffer(1)]],
+                             device float *transition [[buffer(2)]],
+                             constant uint &batch [[buffer(3)]],
+                             constant uint &dim [[buffer(4)]],
+                             uint gid [[thread_position_in_grid]]) {
+    uint plane = dim * dim;
+    uint matrix = gid / plane;
+    uint index = gid % plane;
+    if (matrix >= batch) return;
+    uint row = index / dim;
+    transition[(size_t)matrix * plane + index] =
+        alpha[(size_t)matrix * dim + row] *
+        inv[(size_t)matrix * dim * dim + index];
+}
+
+/* One scan step over all heads:
+ * state_out[out_frame] = state_in[in_frame] @ transition[frame] +
+ * injection[frame]. state_in/out may be scratch banks or frame banks; the
+ * in/out frames address rows of those tensors independently. */
+kernel void h3_vdn_scan_step(device const float *state_in [[buffer(0)]],
+                             device const float *transition [[buffer(1)]],
+                             device const float *injection [[buffer(2)]],
+                             device float *state_out [[buffer(3)]],
+                             constant uint &heads [[buffer(4)]],
+                             constant uint &dim [[buffer(5)]],
+                             constant uint &frame [[buffer(6)]],
+                             constant uint &in_frame [[buffer(7)]],
+                             constant uint &out_frame [[buffer(8)]],
+                             uint3 gid [[thread_position_in_grid]]) {
+    uint head = gid.z;
+    uint index = gid.x;
+    if (head >= heads || index >= dim * dim) return;
+    uint row = index / dim;
+    uint column = index % dim;
+    size_t plane = (size_t)heads * dim * dim;
+    size_t in_base = (size_t)in_frame * plane + (size_t)head * dim * dim;
+    size_t out_base = (size_t)out_frame * plane + (size_t)head * dim * dim;
+    size_t frame_base = ((size_t)frame * heads + head) * dim * dim;
+    float sum = injection[frame_base + index];
+    device const float *t = transition + frame_base + row * dim;
+    device const float *s = state_in + in_base + column;
+    for (uint k = 0; k < dim; k++)
+        sum = fma(s[(size_t)k * dim], t[k], sum);
+    state_out[out_base + index] = sum;
+}
+
+/* VDN gather: the state of everything outside the softmax window, in the
+ * query frame's frame of reference. With a text state, out-of-range sides
+ * read the scan start decayed over the skipped frames (bridge indices follow
+ * gather_linear_state exactly); without one the ends read zero. Bounds are
+ * already rebased (skip_ends). */
+kernel void h3_vdn_gather(device const float *prefix [[buffer(0)]],
+                          device const float *suffix [[buffer(1)]],
+                          device const float *log_alpha_prefix [[buffer(2)]],
+                          device const float *bounds [[buffer(3)]],
+                          device const float *text_state [[buffer(4)]],
+                          device bfloat *out [[buffer(5)]],
+                          constant uint &frames [[buffer(6)]],
+                          constant uint &heads [[buffer(7)]],
+                          constant uint &dim [[buffer(8)]],
+                          constant uint &has_text_state [[buffer(9)]],
+                          uint3 gid [[thread_position_in_grid]]) {
+    uint frame = gid.x;
+    uint head = gid.y;
+    uint index = gid.z;
+    if (frame >= frames || head >= heads || index >= dim * dim) return;
+    uint d = dim;
+    uint row = index / dim;
+    int lo = (int)bounds[frame * 2 + 0];
+    int hi = (int)bounds[frame * 2 + 1];
+    int last_before = lo - 1;
+    int first_after = hi + 1;
+    bool has_before = last_before >= 0;
+    bool has_after = first_after < (int)frames;
+    uint before_idx = (uint)max(last_before, 0);
+    uint after_idx = (uint)min(first_after, (int)frames - 1);
+    uint bridge_before = (uint)max(last_before + 1, 0);
+    uint bridge_after = (uint)min(first_after, (int)frames);
+
+    size_t plane = (size_t)heads * d * d;
+    size_t lp_row = (size_t)heads * d;
+    float log_before = log_alpha_prefix[
+        (size_t)(frame + 1) * lp_row + (size_t)head * d + row] -
+        log_alpha_prefix[(size_t)bridge_before * lp_row +
+                         (size_t)head * d + row];
+    float log_after = log_alpha_prefix[
+        (size_t)bridge_after * lp_row + (size_t)head * d + row] -
+        log_alpha_prefix[(size_t)frame * lp_row + (size_t)head * d + row];
+    float scale_before = exp(log_before);
+    float scale_after = exp(log_after);
+
+    float before = has_before
+        ? prefix[(size_t)before_idx * plane + (size_t)head * d * d + index]
+        : (has_text_state ? text_state[(size_t)head * d * d + index] : 0.0f);
+    float after = has_after
+        ? suffix[(size_t)after_idx * plane + (size_t)head * d * d + index]
+        : (has_text_state ? text_state[(size_t)head * d * d + index] : 0.0f);
+    float value = before * scale_before + after * scale_after;
+    if (!has_text_state) {
+        if (!has_before) value -= before * scale_before;
+        if (!has_after) value -= after * scale_after;
+    }
+    out[(size_t)frame * plane + (size_t)head * d * d + index] =
+        h3_f32_to_bf16(value);
+}
+
+/* Branch readout + epilogue: readout = state @ q per token, RMSNorm over
+ * head_dim with the branch norm weight, times the bf16 output gate, written
+ * row-major [F*S, H*d] (the to_out_linear input layout). */
+kernel void h3_vdn_readout(device const bfloat *state [[buffer(0)]],
+                           device const bfloat *q [[buffer(1)]],
+                           device const bfloat *gate [[buffer(2)]],
+                           device const bfloat *norm_weight [[buffer(3)]],
+                           device bfloat *out [[buffer(4)]],
+                           constant uint &frames [[buffer(5)]],
+                           constant uint &heads [[buffer(6)]],
+                           constant uint &tokens_per_frame [[buffer(7)]],
+                           constant uint &head_dim [[buffer(8)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+    uint token = gid.x;
+    uint head = gid.y;
+    if (token >= frames * tokens_per_frame || head >= heads) return;
+    uint d = head_dim;
+    uint frame = token / tokens_per_frame;
+    uint within = token % tokens_per_frame;
+    size_t state_base = (size_t)(frame * heads + head) * d * d;
+    size_t q_base = ((size_t)(frame * heads + head) *
+                     tokens_per_frame + within) * d;
+    float values[128];
+    float sum_sq = 0.0f;
+    for (uint v = 0; v < d; v++) {
+        device const bfloat *srow = state + state_base + (size_t)v * d;
+        float sum = 0.0f;
+        for (uint k = 0; k < d; k++)
+            sum = fma(h3_bf16_to_f32(srow + k),
+                      h3_bf16_to_f32(q + q_base + k), sum);
+        /* The Python reference materialises the einsum as bf16 before the
+         * norm, so round through bf16 here too. */
+        sum = h3_bf16_to_f32(h3_f32_to_bf16(sum));
+        values[v] = sum;
+        sum_sq = fma(sum, sum, sum_sq);
+    }
+    float inverse = rsqrt(sum_sq / (float)d + 1e-5f);
+    size_t out_base = (size_t)token * heads * d + (size_t)head * d;
+    for (uint v = 0; v < d; v++) {
+        float g = h3_bf16_to_f32(gate + out_base + v);
+        float normalized = values[v] * inverse *
+            h3_bf16_to_f32(norm_weight + v);
+        h3_f32_to_bf16(out + out_base + v, normalized * g);
     }
 }

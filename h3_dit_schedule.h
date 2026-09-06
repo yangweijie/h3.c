@@ -16,16 +16,22 @@
 
 typedef struct h3_dit_schedule h3_dit_schedule;
 
+typedef struct h3_lora h3_lora;
+
 typedef void (*h3_dit_schedule_progress)(int completed_blocks,
                                          int total_blocks, void *opaque);
 
 /* Materialize every per-step AdaLN value. This intentionally submits one
  * projection at a time, so a 498 MiB block projection is released before the
- * next is loaded. */
+ * next is loaded. `loras` (optional, count up to 4) merge into the
+ * blocks.N.adaln_proj.linear / final norm_out.linear weights before the
+ * per-step projections are computed; adapters whose rank/input width does not
+ * match the checkpoint (e.g. a diffusers-shaped turbo LoRA over a pruned
+ * ConvRot base) are skipped with a warning. */
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
-    int audio_condition,
+    int audio_condition, h3_lora **loras, int lora_count,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size);
 void h3_dit_schedule_free(h3_dit_schedule *schedule);

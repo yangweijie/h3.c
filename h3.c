@@ -918,6 +918,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                 activation, &plan) == 0) {
             eff.ssd_streaming = plan.ssd_streaming;
             eff.use_int8_row_fc2 = plan.use_int8_row_fc2;
+            /* The planner suggests both independently; int8 row FC2 stays an
+             * M5-only resident-weights path and cannot ride on streaming. */
+            if (eff.ssd_streaming) eff.use_int8_row_fc2 = 0;
             eff.video_vae_streaming = plan.video_vae_streaming;
             eff.encoder_streaming = plan.encoder_streaming;
             if (plan.dit_layers > 0) eff.dit_layers = plan.dit_layers;
@@ -1574,6 +1577,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->token_reduction,
             params->ssd_streaming,
             params->lora_path,
+            params->linear_branch_path,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
@@ -1596,6 +1600,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->token_reduction,
             params->ssd_streaming,
             params->lora_path,
+            params->linear_branch_path,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
