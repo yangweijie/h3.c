@@ -80,12 +80,45 @@
 - [x] `load_convrot_scale_values()` 改接收显式 store（主模型行为不变）
 - [x] 端到端跑通；对调文件后复现出逐字节一致产物
 
-### Phase 9: 性能剖析与加速验证 — in_progress
+### Phase 9: 性能剖析与加速验证 — complete
 - [x] 步数对照：steps=2 为欠采样（**无 linear 同样糊**）→ 黄色与 linear/int8 无关
 - [x] 端到端计时：VDN **305s** vs 原版 **90s**（M4 / 256×256 / 1s / steps=4）→ **慢 3.4×**
 - [x] `H3_PROFILE` 流式剖析：79.35 vs 72.14 GiB；**unhidden wait 0.001s vs 23.3s**
 - [x] 结论：VDN 瓶颈是**计算**不是 I/O；`to_out_linear` 常驻省 0 秒却要 3.85 GB
-- [ ] 待定：VDN kernel 调度开销优化，或长序列/高分辨率下重测能否翻盘
+- [x] 高分辨率对照：512×384 下 VDN **1295s** vs 原版 **186s** → **慢 7.0×**；VDN 超线性缩放(4.25×)、原版亚线性(2.07×)，差距随尺度拉大
+- [x] 最终结论：VDN 是**叠加混合分支**(窗口 softmax + 线性分支都跑),任何尺度都不能加速
+- [x] 诊断：`h3_convrot_test` 在 M4 **通过** → 基础 GPU convrot kernel(`h3_gpu_weight_dequant_unrotate_int8`)可用；`H3_VDN_INT8` 崩溃原因 = NAX/tensor-ops(M5 专属),非 convrot kernel
+
+### Phase 10: Streaming GPU ConvRot 反量化 — 失败，已回退（保留记录以免重复踩坑）
+- [x] 新增 `h3_gpu_blocking_weight_dequant_unrotate_int8`(h3_gpu.h/.m)，沿用
+      `h3_gpu_blocking_linear_bf16` 模式：同一队列 + 独立命令缓冲 + commit/wait，不开 NAX
+- [x] 诊断（第一轮，结论**错误，已推翻**）：误判"layout=0 三个张量错误"。
+      实际是诊断代码自身 bug：`memcpy(&g,&gpu_vals[k],4)` 从 `uint16_t*` 拷 4 字节，
+      把两个 bf16 拼成一个 float。
+- [x] 诊断（第二轮，**正确**）：改用 `bits=(uint32_t)val<<16` 转换，跨矩阵多行比对，
+      idx 0–3 / 多行全部 `d=0.000000` → **kernel 与 CPU 蝶形逐位一致，kernel 无 bug**。
+- [x] 结论：失败在**集成层面**（GPU 写入对后续 kernel 的可见性 + blocking commit/wait 开销），
+      而非 kernel。性能 ❌（144s vs 90s）→ **回退**。
+- [x] 回退：`git checkout h3_dit.c` 恢复 CPU 反量化；验证 VDN int8 @4 产物 198461 字节一致，零报错。
+- [x] **fence/barrier 解决（第二轮）**：用 `MTLEvent` 跨 command buffer 同步
+      （dequant signal → requant wait），纯 GPU 写入版输出**正确**
+      （R=122.1/93.2/57.8/std=24.4 ≈ 基线），可见性问题已解决。
+- [x] **批量 dequant（第三轮）**：新增 `h3_gpu_stream_dequant_begin/encode/submit`，
+      4 个 source 编码进同一 command buffer、每 block 只提交一次（50 vs 200 次）。
+      输出正确，但 **182s vs 90s 更慢**。
+- [x] **最终根因（架构级）**：GPU dequant 与主线程计算**共享同一个 GPU**，
+      互相竞争，消除了 CPU 蝶形原本享有的"CPU-GPU 异构并行"优势。
+      **GPU dequant 方向从根本上不可行，即使修好 fence 也不会更快。**
+- [ ] 若日后重启：kernel 是正确的，不要修它。要解决的是 GPU 资源竞争
+      （需多命令队列真正并行，或接受此方向不可行）。
+
+### Phase 16: 端到端参数基准测试 — complete
+- [x] 编写 `benchmark.py` 工具链(参数扫描 + SSIM/PSNR/L2 评分 + HTML 报告)
+- [x] 发现模型 text_encoder 不完整(`.unfetch_state`),切换至用户工作模型
+- [x] 三轮测试(Round 1/2/3),共 22 个独特配置
+- [x] 按显存从低到高排序,所有测试 <13 GB(9.4–9.8 GB)
+- [x] 生成 HTML 报告 `/tmp/h3_benchmark/report.html`
+- [x] 结论:显存不是瓶颈;step=7 比 step=4 画质提升 54%;最佳权衡 s7-l50-r2(177s/SSIM=0.57)
 
 ## Decisions Made
 | Decision | Rationale |
@@ -119,4 +152,7 @@
 - `--linear-branch` 是 VDN 的**唯一入口**（main.c:308/409），不受任何环境变量影响；
   不传它则 `vdn=0`，线性分支的解析/加载/前向全部不执行（有效的"无 linear"对照）。
 - 性能基线（256×256 / 1s / steps=4 / seed 42 / `--ssd-streaming`）：VDN **305s** vs 原版 **90s**。
+- 跨尺度（256×256 → 512×384,像素 3×）：VDN 慢 **3.4× → 7.0×**；VDN 超线性缩放、原版亚线性。
+- **最终结论：VDN 是叠加混合分支(窗口 softmax + 线性分支都跑),在当前 h3.c 实现下任何尺度都不能加速。**
+  int8 线性分支接入是正确的,但它的定位是「质量特性」而非「加速特性」。
   详见 findings.md「INT8 线性分支 + 性能剖析 (2026-09-07)」。

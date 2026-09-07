@@ -232,3 +232,87 @@
 - int8 vs bf16（同 seed / 同 steps）：cos = **0.9904**，mean_abs_pixel_diff = **9.3 / 255**
 - 用户把两个文件对调（`model.safetensors`=int8，`model_bf32.safetensors`=bf16）后重跑：
   产物 **198461 字节，与之前逐字节一致** → 确定性未破坏，int8 接入正确
+
+## 跨尺度性能验证（"高分辨率能否翻盘"）
+- 测试:512×384 / 1s / steps=4 / seed 42 / --ssd-streaming（像素 = 256×256 的 **3.0×**）
+
+| 配置 | 256×256 | 512×384 | 耗时缩放 |
+|---|---|---|---|
+| VDN | 305 s | **1295 s** | **4.25×**(超线性)|
+| 无 VDN | 90 s | **186 s** | **2.07×**(亚线性)|
+| VDN 倍率 | 3.4× 慢 | **7.0× 慢** | 差距拉大 |
+
+- 结论:VDN **不能翻盘**,尺度越大越慢。
+  - 原版窗口 softmax 亚线性缩放(O(N·window),window 固定 15 帧)
+  - VDN 线性分支超线性 —— 大量 per-token kernel(features/stats/cholesky/scan/gather/readout/short_conv/gate)
+    随 token 数增长比窗口 softmax 更快
+- 根因:VDN 是**叠加混合分支**(h3_dit.c run_block:窗口 softmax 与线性分支**都跑**),
+  不是替代;线性分支的常数因子大,且随分辨率恶化更快
+- → int8 线性分支接入正确,但其定位是「质量特性」,在当前实现下**任何尺度都不能加速**
+
+## Streaming GPU ConvRot 反量化：失败根因（重要，避免重复踩坑）
+- 目标：把 streaming 线程的 CPU 蝶形反量化搬到 GPU，与主线程计算重叠，消除 23s unhidden wait。
+- 实现：新增 `h3_gpu_blocking_weight_dequant_unrotate_int8`（h3_gpu.h/.m），
+  沿用既有 `h3_gpu_blocking_linear_bf16` 模式——**同一 MTLCommandQueue + 独立命令缓冲 + commit + waitUntilCompleted**。
+  这个模式证明"后台线程可独立做 GPU 工作"是可行的（无需第二队列），但本项目未最终采用。
+- **两条实现路径都失败**：
+
+| 路径 | 耗时 | 输出 |
+|---|---|---|
+| dequant 放主线程（join 后，串行） | 151s | ❌ 白色 |
+| dequant 放 streaming 线程（blocking 独立命令缓冲） | 144s | ❌ 白色 |
+| 基线（CPU 蝶形，streaming 线程） | 90s | ✅ 正常 |
+
+- **更正（重要）：kernel 数值完全正确，上面"根因"是 debug 代码 bug 造成的假象**
+  - 最初的诊断代码写错了 bf16→f32 转换：
+    ```c
+    uint16_t gpu_vals[8];
+    memcpy(&g, &gpu_vals[k], 4);   /* ❌ 从 uint16_t* 拷 4 字节 */
+    ```
+    这会把相邻两个 bf16 拼成一个 float，算出 0.06–0.14 的"偏差"，
+    从而误判"layout=0 的 out/fc1/fc2 三个张量错误"。
+  - 正确转换是 `bits = (uint32_t)val << 16; memcpy(&f, &bits, 4);`。改正后重测：
+    **跨矩阵多行（row 0 / 1344 / 2688 / 4032 / 5376 / 10752 / 16128 / 21504）
+    全部 `d=0.000000`**，idx 0–3 全对 → GPU dequant 与 CPU 蝶形**逐位一致，kernel 无需修改**。
+  - 注：只比 row 0 是不够的（row 0 在 layout=0/1 下都映射到自身，无法暴露行置换错误），
+    必须跨多行采样。
+- 真正的失败点在**集成层面**，不是 kernel：
+  1. **可见性/同步**：GPU kernel 写入 `storageModeShared` buffer 后，后续 GPU kernel
+     （int8 requant）可能读不到该写入。诊断版因为 CPU `memcpy` 覆盖而"固化"了值所以正确，
+     纯 GPU 写入版则白色失真。
+  2. **性能**：blocking 模式每 source 一次 `commit` + `waitUntilCompleted`，
+     外加额外 GPU tensor 分配/释放，开销吃掉全部收益（144s vs 90s）。
+- 结论：该方向**即使修好可见性也大概率仍更慢**，已回退。回退后 VDN int8 @4 产物 198461 字节，与回退前一致。
+- 教训：**先确认测量工具本身正确，再追根因** —— 错误的一次 memcpy 让我追了两轮假根因。
+- **fence/barrier 解决 + 批量 dequant（后续两轮）**：
+  - 用 `MTLEvent` 跨 command buffer 同步（dequant signal → requant wait），
+    纯 GPU 写入版输出**正确**（R=122.1/93.2/57.8/std=24.4 ≈ 基线），可见性问题解决。
+  - 批量 dequant：4 个 source 编码进同一 command buffer、每 block 只提交一次
+    （50 次 vs 200 次）。输出正确，但 **182s vs 90s 更慢**。
+  - **最终根因（架构级）**：GPU dequant 与主线程计算**共享同一个 GPU**，互相竞争，
+    消除了 CPU 蝶形原本享有的"CPU-GPU 异构并行"优势。
+    CPU 蝶形在 CPU 上跑（∥ GPU 计算）→ 仅 23s 暴露；
+    GPU dequant 在 GPU 上跑（与 GPU 计算串行）→ 全部暴露。
+    **GPU dequant 方向从根本上不可行。**
+
+## 端到端参数基准测试(Phase 12)
+- 工具链:`benchmark.py` — 参数扫描 + 帧对比评分(SSIM/PSNR/L2,纯 numpy 实现) + 自包含 HTML 报告(内嵌 base64 帧图)
+- 测试矩阵按**预期峰值显存从低到高**排序,超过 13 GB 自动停止
+- 三轮共 22 个独特配置(去重后),覆盖 steps(4/7/10/20)、layers(40/45/50)、reuse(1/2/3)、core-reuse(2/4/6)、token-reduction、render-resolution(192/256)
+
+**核心结论**:
+
+| 发现 | 说明 |
+|---|---|
+| 显存不是瓶颈 | 所有测试 9.4–9.8 GB(<13 GB),`--ssd-streaming` 效果显著 |
+| step=7 vs step=4 | 同 layers=50/reuse=2:s7-l50-r2(SSIM=0.570) vs s4-l50-r2(SSIM=0.371),画质提升 54% |
+| --token-reduction | 省 ~12% 时间(s4-l40_cr4 96.1s → s4-l40_cr4-tr 84.8s) |
+| 最快 | s4-l40-cr4-tr-R192: 73s, SSIM=0.214(画质损失大) |
+| 最佳权衡 | s7-l50-r2: 177s, SSIM=0.570,效率最高(0.0032) |
+
+**推荐配置**:
+- 极速预览:`--steps 4 --layers 40 --core-reuse 4 --token-reduction --render-width 192 --render-height 192`(73s)
+- 最佳权衡:`--steps 7 --layers 50 --reuse 2`(177s)
+- 高质量:`--steps 10 --layers 45 --reuse 2`(235s)
+
+- 报告:`/tmp/h3_benchmark/report.html`

@@ -226,11 +226,75 @@
 | `H3_VDN_INT8=1` → `DiT stream begin failed: unknown Metal error` | 1 | M4 不支持（NAX 为 M5 路径），放弃该开关 |
 | 误判 steps=4 仍糊（只看统计量）| 1 | 用户肉眼确认有狐狸；统计指标不能判断语义正确性 |
 
+### 高分辨率对照（方向 ②）— complete
+- 512×384 / 1s / steps=4 / seed 42 / --ssd-streaming
+- VDN **1295 s** vs 原版 **186 s** → **7.0× 慢**
+- 对比 256×256(3.4× 慢):像素 3×,VDN 缩放 4.25×、原版缩放 2.07×
+- **VDN 超线性缩放,原版亚线性** → 尺度越大越不能翻盘
+
+### Phase 10: Streaming GPU ConvRot 反量化 — 失败，已回退
+- 方案：给 h3_gpu 新增 `h3_gpu_blocking_weight_dequant_unrotate_int8`
+  （沿用既有 `h3_gpu_blocking_linear_bf16` 模式：同一队列 + 独立命令缓冲 + commit/wait），
+  让 streaming 线程自己做 GPU dequant，与主线程计算重叠。
+- **更正：kernel 数值完全正确，第一轮"根因"是 debug 代码 bug 的假象**
+  - 首版诊断写错 bf16→f32：`uint16_t gpu_vals[8]; memcpy(&g,&gpu_vals[k],4);`
+    （从 uint16_t* 拷 4 字节，把相邻两个 bf16 拼成一个 float）→ 算出虚假的 0.06–0.14 偏差。
+  - 改用正确转换 `bits=(uint32_t)val<<16` 后，跨矩阵多行重测：
+    **idx 0–3、row 0/1344/2688/4032/5376/10752/16128/21504 全部 `d=0.000000`**
+    → GPU dequant 与 CPU 蝶形**逐位一致**。kernel 没有 bug。
+  - 只比 row 0 会漏掉行置换错误（row 0 在两种 layout 下都映射到自身）。
+- **真实的失败点在集成层面**：
+  1. 可见性/同步：GPU 写入 shared buffer 后，后续 GPU kernel（int8 requant）读不到；
+     诊断版因 CPU memcpy 覆盖而正确，纯 GPU 写入版白色失真。
+  2. 性能：blocking 每 source 一次 commit+waitUntilCompleted + 额外 tensor 分配/释放。
+- **结果**：白色失真（R=235/G=217/B=197, std=8.5），且 **144s vs 基线 90s（更慢）**。
+- **决策：回退**。`git checkout h3_dit.c` 恢复 CPU 反量化版本。
+  确认 HEAD 版本已含 VDN int8 修复（`prepare_vdn_stream_source` 的 I8 分支），功能完好。
+- 回退后验证：VDN int8 @4 产物 **198461 字节**，与回退前一致，零报错 → ✅ 功能完好。
+- **fence/barrier 解决（第二轮）**：用 `MTLEvent` 跨 command buffer 同步
+  （dequant signal → requant wait），纯 GPU 写入版输出**正确**
+  （R=122.1/93.2/57.8/std=24.4 ≈ 基线），证明可见性问题已解决。
+- **批量 dequant（第三轮）**：4 个 source 编码进同一 command buffer、
+  每 block 只提交一次（50 次 vs 之前 200 次）。输出正确，但 **182s vs 90s 更慢**。
+- **最终根因（架构级）**：GPU dequant 与主线程计算**共享同一个 GPU**，
+  互相竞争，消除了 CPU 蝶形原本享有的"CPU-GPU 异构并行"优势。
+  CPU 蝶形在 CPU 上跑（∥ GPU 计算）→ 仅 23s 暴露；
+  GPU dequant 在 GPU 上跑（与 GPU 计算串行）→ 全部暴露。
+  **结论：GPU dequant 方向从根本上不可行，即使修好 fence 也不会更快。**
+
+### Phase 16: 端到端参数基准测试 — complete
+- 工具链:编写 `benchmark.py`(参数扫描 + SSIM/PSNR/L2 评分 + HTML 报告)和 `fix_text_encoder.sh`
+- 发现模型 text_encoder 不完整(`.unfetch_state` 占位符),切换至用户工作模型 `/Users/jay/h3_sys/MiniMax-H3-Convrot`
+- 三轮测试(按显存从低到高排序,>13GB 停止):
+
+| 轮次 | 测试数 | 说明 |
+|---|---|---|
+| Round 1 | 7 | steps×layers×reuse 基础扫描 |
+| Round 2 | 6 | step=4, layer=40, core-reuse/token-reduction 组合 |
+| Round 3 | 11 | step=7 变体(追加到表格) |
+
+- 去重后共 **22 个独特配置**,所有测试均 <13 GB(9.4–9.8 GB)
+
+**关键结果**(按效率 SSIM/time 排序):
+
+| # | 配置 | 时间 | 显存 | SSIM | 效率 |
+|---|---|---|---|---|---|
+| 1 | s4-l40-cr4-tr-R192 | 73s | 9.52 | 0.214 | 0.0029 |
+| 20 | **s7-l50-r2** | **177s** | 9.75 | **0.570** | **0.0032** |
+| 17 | s4-l50-r2 | 144s | 9.77 | 0.371 | 0.0026 |
+
+- **关键发现**:
+  1. 显存不是瓶颈(所有测试 9.4–9.8 GB)
+  2. step=7 vs step=4 差异显著:s7-l50-r2(SSIM=0.570) vs s4-l50-r2(SSIM=0.371),同 layers/reuse 画质提升 54%
+  3. --token-reduction 省 ~12% 时间
+  4. 最快 73s(SSIM=0.214),最佳权衡 177s(SSIM=0.570)
+- 报告:`/tmp/h3_benchmark/report.html`(含嵌入帧对比图)
+
 ### 5-Question Reboot Check（更新至 2026-09-07 末）
 | Question | Answer |
 |---|---|
-| Where am I? | Phase 9 性能剖析完成（已证 VDN 慢 3.4× 且瓶颈为计算）；待用户决定下一步 |
-| Where am I going? | 二选一：① 深挖 VDN kernel 调度开销；② 长序列/高分辨率重测能否翻盘 |
-| What's the goal? | 让 linear 分支(int8)正确可用 + 验证其加速收益 |
-| What have I learned? | int8 接入正确（cos 0.9999/0.9904）；黄色是 steps=2 欠采样；VDN 在 1s/256² 是负优化；`H3_VDN_INT8` 在 M4 崩 |
-| What have I done? | 5 处代码改动 + 9 次对照运行 + H3_PROFILE 剖析 |
+| Where am I? | Phase 16 完成:22 个配置的端到端基准测试,含 HTML 报告 |
+| Where am I going? | 用户决定是否继续(如测试更高分辨率/更长视频) |
+| What's the goal? | 找到最佳速度/画质权衡参数 |
+| What have I learned? | 显存不是瓶颈;step=7 比 step=4 画质提升 54%;--token-reduction 有效;最佳权衡 s7-l50-r2(177s/SSIM=0.57) |
+| What have I done? | 编写 benchmark.py 工具链 + 三轮 22 次测试 + HTML 报告 |

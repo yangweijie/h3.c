@@ -785,6 +785,28 @@ int h3_gpu_blocking_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                                 const h3_gpu_tensor *weight,
                                 const h3_gpu_tensor *bias, uint32_t rows,
                                 uint32_t input_dim, uint32_t output_dim);
+/* ConvRot int8 dequant + Hadamard un-rotate on a private command buffer that the
+ * SSD streaming thread commits and waits independently. Same queue as the main
+ * thread (so execution is ordered) but a separate command buffer, so it never
+ * touches the main thread's open buffer. */
+int h3_gpu_blocking_weight_dequant_unrotate_int8(h3_gpu *gpu,
+    h3_gpu_tensor *output, const h3_gpu_tensor *weight,
+    const h3_gpu_tensor *scales, const h3_gpu_tensor *hadamard,
+    uint32_t rows, uint32_t columns, uint32_t layout, uint32_t heads,
+    uint32_t head_dim);
+/* Make the currently-open command buffer wait for every ConvRot dequant write
+ * already signalled on the streaming thread's private command buffer, so those
+ * shared-memory writes are guaranteed visible to the kernels that follow
+ * (notably the streamed-block int8 requantization). No-op when no dequant has
+ * been signalled yet. */
+int h3_gpu_encode_wait_stream_event(h3_gpu *gpu);
+/* Batched streaming ConvRot dequant: open, encode one source, commit+wait. */
+int h3_gpu_stream_dequant_begin(h3_gpu *gpu);
+int h3_gpu_stream_dequant_encode(h3_gpu *gpu, h3_gpu_tensor *output,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *scales,
+    const h3_gpu_tensor *hadamard, uint32_t rows, uint32_t columns,
+    uint32_t layout, uint32_t heads, uint32_t head_dim);
+int h3_gpu_stream_dequant_submit(h3_gpu *gpu);
 
 /* h3_gpu_linear_bf16 with an input element offset (buffer-relative), so a
  * contiguous row slab of a packed tensor can feed a projection without a

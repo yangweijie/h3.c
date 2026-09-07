@@ -125,6 +125,22 @@
 @property(nonatomic) double profileStartWall;
 @property(nonatomic) double profileMarkWall;
 @property(nonatomic) double commandStartWall;
+/* Cross-command-buffer visibility for SSD-streaming ConvRot dequant writes.
+ * The streaming thread dequantizes on a private command buffer; the requant
+ * kernels that consume those buffers run on the shared `command` buffer, so an
+ * event is used to order them. */
+@property(nonatomic, strong) id<MTLEvent> streamEvent;
+/* Batched streaming ConvRot dequant: the block's four sources are encoded
+ * into one command buffer and committed together, so a block costs one
+ * submit rather than four. NULL when no batch is open. */
+@property(atomic) id<MTLCommandBuffer> stream_batch;
+@property(atomic) int stream_batch_pending;
+@property(nonatomic) uint64_t streamEventValue;
+/* Batched streaming ConvRot dequant: the block's four sources are encoded
+ * into one command buffer and committed together, so a block costs one
+ * submit rather than four. NULL when no batch is open. */
+@property(atomic) id<MTLCommandBuffer> stream_batch;
+@property(atomic) int stream_batch_pending;
 @end
 @implementation H3GPU
 @end
@@ -337,6 +353,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         gpu.profileMarkWall = gpu.profileStartWall;
         gpu.device = MTLCreateSystemDefaultDevice();
         gpu.queue = [gpu.device newCommandQueue];
+        gpu.streamEvent = [gpu.device newEvent];
         gpu.reuseMPSCommandDefault = YES;
         gpu.inflightCommands = [NSMutableArray array];
         gpu.sdpaCache = [NSMutableDictionary dictionary];
@@ -5358,6 +5375,132 @@ int h3_gpu_blocking_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             return 0;
         }
     }
+    return 1;
+}
+
+int h3_gpu_blocking_weight_dequant_unrotate_int8(h3_gpu *opaque,
+    h3_gpu_tensor *output, const h3_gpu_tensor *weight,
+    const h3_gpu_tensor *scales, const h3_gpu_tensor *hadamard,
+    uint32_t rows, uint32_t columns, uint32_t layout, uint32_t heads,
+    uint32_t head_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_i8(gpu, weight, (size_t)rows * columns,
+                           @"convrot int8 weight") ||
+        !h3_gpu_require_f32(gpu, scales, rows, @"convrot int8 scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
+                             @"convrot unrotated weight") ||
+        !h3_gpu_require_bf16(gpu, hadamard, 256u * 256u,
+                             @"convrot hadamard")) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_weight_dequant_unrotate_int8");
+    if (!pipeline) return 0;
+    unrotate_args args = {rows, columns, heads, head_dim, layout};
+    @autoreleasepool {
+        id<MTLCommandBuffer> command = [gpu.queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(hadamard).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        uint64_t total = (uint64_t)rows * columns;
+        NSUInteger tpg = 256;
+        NSUInteger groups = (total + tpg - 1) / tpg;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [encoder endEncoding];
+        /* Publish these writes so the requant kernels queued afterwards on the
+         * shared command buffer observe them. */
+        gpu.streamEventValue += 1;
+        if (gpu.streamEvent)
+            [command encodeSignalEvent:gpu.streamEvent
+                                 value:gpu.streamEventValue];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status == MTLCommandBufferStatusError) {
+            h3_gpu_set_error(gpu, @"blocking ConvRot dequant failed: %@",
+                             command.error.localizedDescription);
+            return 0;
+        }
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_stream_dequant_begin(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !gpu.queue) return 0;
+    @autoreleasepool {
+        gpu.stream_batch = [gpu.queue commandBuffer];
+    }
+    gpu.stream_batch_pending = 0;
+    return gpu.stream_batch != nil;
+}
+
+int h3_gpu_stream_dequant_encode(h3_gpu *gpu_, h3_gpu_tensor *output,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *scales,
+    const h3_gpu_tensor *hadamard, uint32_t rows, uint32_t columns,
+    uint32_t layout, uint32_t heads, uint32_t head_dim) {
+    H3GPU *gpu = GPU(gpu_);
+    if (!gpu || !gpu.stream_batch) return 0;
+    if (!h3_gpu_require_i8(gpu, weight, (size_t)rows * columns,
+                           @"convrot int8 weight") ||
+        !h3_gpu_require_f32(gpu, scales, rows, @"convrot int8 scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
+                             @"convrot unrotated weight") ||
+        !h3_gpu_require_bf16(gpu, hadamard, 256u * 256u,
+                             @"convrot hadamard")) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_weight_dequant_unrotate_int8");
+    if (!pipeline) return 0;
+    unrotate_args args = {rows, columns, heads, head_dim, layout};
+    id<MTLComputeCommandEncoder> encoder =
+        [gpu.stream_batch computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:0];
+    [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:1];
+    [encoder setBuffer:TENSOR(hadamard).buffer offset:0 atIndex:2];
+    [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+    [encoder setBytes:&args length:sizeof(args) atIndex:4];
+    uint64_t total = (uint64_t)rows * columns;
+    NSUInteger tpg = 256;
+    NSUInteger groups = (total + tpg - 1) / tpg;
+    [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [encoder endEncoding];
+    gpu.stream_batch_pending = 1;
+    return 1;
+}
+
+int h3_gpu_stream_dequant_submit(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !gpu.stream_batch || !gpu.stream_batch_pending) return 1;
+    gpu.streamEventValue += 1;
+    if (gpu.streamEvent)
+        [gpu.stream_batch encodeSignalEvent:gpu.streamEvent
+                                      value:gpu.streamEventValue];
+    [gpu.stream_batch commit];
+    [gpu.stream_batch waitUntilCompleted];
+    if (gpu.stream_batch.status == MTLCommandBufferStatusError) {
+        h3_gpu_set_error(gpu, @"batched ConvRot dequant failed: %@",
+                         gpu.stream_batch.error.localizedDescription);
+        gpu.stream_batch = nil;
+        gpu.stream_batch_pending = 0;
+        return 0;
+    }
+    gpu.stream_batch = nil;
+    gpu.stream_batch_pending = 0;
+    return 1;
+}
+
+int h3_gpu_encode_wait_stream_event(h3_gpu *opaque) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !gpu.command) return 0;
+    if (!gpu.streamEvent || gpu.streamEventValue == 0) return 1; /* nothing signalled yet */
+    [gpu.command encodeWaitForEvent:gpu.streamEvent value:gpu.streamEventValue];
     return 1;
 }
 
