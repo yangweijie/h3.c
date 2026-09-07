@@ -116,6 +116,38 @@ h3_weight_store *h3_weight_store_open(const char *directory,
     return store;
 }
 
+h3_weight_store *h3_weight_store_open_file(const char *path,
+                                          char *error, size_t error_size) {
+    if (!path || !*path) {
+        fail(error, error_size, "weight file path is required");
+        return NULL;
+    }
+    if (access(path, R_OK) != 0) {
+        fail(error, error_size, "cannot open weight file: %s", path);
+        return NULL;
+    }
+    h3_weight_store *store = calloc(1, sizeof(*store));
+    if (!store) {
+        fail(error, error_size, "out of memory creating weight store");
+        return NULL;
+    }
+    store->headers = calloc(1, sizeof(*store->headers));
+    if (!store->headers) {
+        fail(error, error_size, "out of memory allocating weight header");
+        free(store);
+        return NULL;
+    }
+    char detail[384];
+    if (!h3_st_read_header(path, &store->headers[0], detail, sizeof(detail))) {
+        fail(error, error_size, "%s", detail);
+        free(store->headers);
+        free(store);
+        return NULL;
+    }
+    store->count = 1;
+    return store;
+}
+
 void h3_weight_store_free(h3_weight_store *store) {
     if (!store) return;
     for (size_t index = 0; index < store->count; index++) {

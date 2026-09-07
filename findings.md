@@ -152,3 +152,83 @@
   （绕过 planner → video_vae_streaming=0）则 exit 0 正常出片
 - 结论：崩溃点在 run_stream_tile 流式 VAE 解码路径，与本次 VDN 改动无关
 - 规避：运行 VDN 时显式加 --ssd-streaming（禁用 auto plan）
+
+# INT8 线性分支 + 性能剖析 (2026-09-07 session)
+
+## 线性分支 int8 权重文件事实
+- `model_int8_convrot_comfyui.safetensors` 2.30 GB vs bf16 `model.safetensors` 4.28 GB
+- 1100 张量 = 650 BF16 + 150 I8 + 150 F32 scale + 150 U8 comfy_quant
+- **每 block 仅 3 个张量被量化**（50×3 = 150）：
+  - `linear_attention.beta_proj.weight` [56, 5376]
+  - `linear_attention.output_gate.down.weight` [128, 5376]
+  - `to_out_linear.weight` [5376, 7168]
+  - 其余（alpha.* / norm / short_conv / gate up+bias / softmax_gate）保持 BF16
+- scale 命名 `{name}.weight_scale`，F32 [rows, 1]；另有 `{base}.comfy_quant` U8[72]（h3.c 不读取）
+- 该文件**自包含**（含全部非量化张量），可单独打开，不必与 bf16 文件合并
+
+## 反量化公式与判决性验证
+- `w = scale[row] × (1/16) × FWHT_256(i8)`（radix-4 蝴蝶，stride 1/4/16/64，输入维按 256 分块）
+- CPU 复现 vs bf16 真值：
+
+| 张量 | 形状 | convrot cos | 不做反旋转 cos |
+|---|---|---|---|
+| beta_proj.weight | [56, 5376] | 0.999954 | 0.065 |
+| output_gate.down.weight | [128, 5376] | 0.999954 | — |
+| to_out_linear.weight | [5376, 7168] | 0.999921 | — |
+
+- 三者列维均 `%256==0`，满足旋转块对齐；不做反旋转则完全不可用（cos 0.065）
+
+## h3.c 既有设施（故改动量极小）
+- `h3_weights.c::load_int8_dequantized`：I8 → BF16/F32，scale 名 `"%s_scale"`，含 convrot 反旋转（`H3_INT8_UNROTATE=0` 可关）
+- `h3_weight_load_bf16` → `load_tensor`：`tensor->dtype==I8 && 请求 BF16` 时**自动**走该路径
+- 主模型 `prepare_stream_source`（h3_dit.c:1120）已支持 I8 流式并填 `scale_path/offset/elements/name`
+
+## 代码改动（3 文件，VDN loader 本体零改动）
+1. `h3_weights.h/.c`：新增 `h3_weight_store_open_file()`（单文件 store）
+2. `h3_dit.c` VDN 打开：候选名单 `model_int8_convrot_comfyui.safetensors` → `model.safetensors` → 整个目录
+3. `h3_dit.c::prepare_vdn_stream_source`：接受 I8 并填 scale 字段（原先硬性要求 BF16）
+4. `h3_dit.c` 流式消费点：`field == STREAM_LIN_OUT` 时从 `dit->vdn_weights` 取 scale
+5. `h3_dit.c::load_convrot_scale_values`：改接收显式 `h3_weight_store *`（主模型传 `dit->weights`，行为不变）
+
+## 关键机制：linear 分支在流式模式下如何加载
+- `load_core`（h3_dit.c:2064）：ssd_streaming 分支**只**调 `load_block_norms` + `prepare_stream_layer`，不调 `load_vdn_block`
+- `load_block_norms`（1053-1063）：调 `load_vdn_block` 加载全部常驻分支权重后**主动释放** `lin_to_out`
+  ```c
+  /* to_out_linear is streamed; drop the resident copy the loader made. */
+  h3_gpu_tensor_free(block->lin_to_out); block->lin_to_out = NULL;
+  ```
+- 仅 **2 个 stream slot**（h3_dit.c:218）；每 block 每步从 slot 取 `lin_to_out`（3514-3530）
+  → `to_out_linear` **每 block 每步重流**
+
+## 性能实测（`H3_PROFILE`，256×256 / 1s / steps=4 / seed 42 / --ssd-streaming）
+| | 有 linear(VDN) | 无 linear(原版) |
+|---|---|---|
+| 总耗时 | **305 s** | **90 s** |
+| SSD 流式读取 | 79.350 GiB / 75.3 s | 72.136 GiB / 66.1 s |
+| 吞吐 | 1.053 GiB/s | 1.091 GiB/s |
+| **unhidden wait（未被计算掩盖的 I/O 等待）** | **0.001 s** | **23.332 s** |
+
+- 差值 7.214 GiB ÷ (4 步 × 50 block) = 36 MB/次 ≈ `to_out_linear` int8 体积（38.5 MB），精确对上
+- VDN 的 I/O **100% 被计算掩盖**（wait ≈ 0）→ 常驻 `to_out_linear` 省 **0 秒**、却要付 50×77MB = **3.85 GB**
+- I/O 仅多 9.2 s，总耗时却多 215 s → **VDN 的额外开销是计算（Metal kernel），不是 I/O**
+- 反向结论：原版 unhidden wait 23.3 s（占其 90 s 的 26%）→ **原版才是 I/O 受限**，砍流式字节只对原版有效
+
+## 步数结论（"一片黄色"的根因）
+- steps=2：VDN 与**无 VDN** 均为橙棕糊（R−B ≈ 52~55，std 18~23，grad ≈ 5）
+- steps=4：VDN（int8 与 bf16）与原版均出狐狸
+- → 黄色 = **steps=2 欠采样**，与 linear 分支、与 int8 **均无关**
+
+## 环境变量事实（重要）
+- `H3_NAX_FORCE`：`grep -rn` 全仓库无引用 → **空操作**（可从命令中删除）
+- `H3_NAX`（h3_gpu.m:366）：取值 0 / mlp / qkv-attn，控制 NAX tensor ops
+- `H3_VDN_INT8`（存在即生效）：
+  - h3_dit.c:2934 主 DiT 共享 QKV 走 int8 matmul
+  - h3_dit.c:3072 VDN `to_out_linear` 走 int8 matmul（运行时量化 `weight->lin_to_out`）
+  - h3_gpu.m:371 在非 M5 上开启 NAX tensor ops
+- **本机 Apple M4（非 M5）**：`wantsTensorOps = (m5 || H3_VDN_INT8) && H3_NAX!="0"` → 默认关闭；
+  设 `H3_VDN_INT8=1` 会 `cannot stream DiT block 1: unknown Metal error`（13 s 崩），**不可用**
+
+## 输出一致性证据
+- int8 vs bf16（同 seed / 同 steps）：cos = **0.9904**，mean_abs_pixel_diff = **9.3 / 255**
+- 用户把两个文件对调（`model.safetensors`=int8，`model_bf32.safetensors`=bf16）后重跑：
+  产物 **198461 字节，与之前逐字节一致** → 确定性未破坏，int8 接入正确

@@ -595,10 +595,10 @@ static float convrot_bf16_to_f32(uint16_t v) {
 /* Read a ConvRot per-output-row scale into a host float buffer, tolerating
  * F32 or BF16 storage and either a 1D [rows] or 2D [rows,1] layout (the
  * safetensors convention varies). Caller frees. */
-static float *load_convrot_scale_values(h3_dit *dit, const char *name,
+static float *load_convrot_scale_values(h3_weight_store *store, const char *name,
         uint64_t rows, char *error, size_t error_size) {
     const h3_st_header *header = NULL;
-    const h3_st_tensor *t = h3_weight_find(dit->weights, name, &header);
+    const h3_st_tensor *t = h3_weight_find(store, name, &header);
     if (!t) { fail(error, error_size, "required weight_scale absent: %s", name); return NULL; }
     uint64_t elems = h3_st_tensor_elements(t);
     if (elems != rows) {
@@ -633,7 +633,7 @@ static float *load_convrot_scale_values(h3_dit *dit, const char *name,
  * un-rotate kernel indexes by output row. */
 static h3_gpu_tensor *load_convrot_scale(h3_dit *dit, const char *name,
         uint64_t rows, char *error, size_t error_size) {
-    float *f = load_convrot_scale_values(dit, name, rows, error, error_size);
+    float *f = load_convrot_scale_values(dit->weights, name, rows, error, error_size);
     if (!f) return NULL;
     h3_gpu_tensor *out = h3_gpu_tensor_from_f32(dit->gpu, f, (size_t)rows);
     free(f);
@@ -1185,8 +1185,45 @@ static int prepare_vdn_stream_source(h3_dit *dit,
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = h3_weight_find(dit->vdn_weights, name,
                                                 &header);
-    if (!tensor || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
-        tensor->shape[0] != rows || tensor->shape[1] != columns) {
+    if (!tensor || tensor->ndim != 2 || tensor->shape[0] != rows ||
+        tensor->shape[1] != columns || rows > SIZE_MAX / columns) {
+        fail(error, error_size,
+             "VDN streaming weight is absent or has the wrong schema: %s",
+             name);
+        return 0;
+    }
+    source->rows = (uint32_t)rows;
+    source->columns = (uint32_t)columns;
+    source->field = field;
+    source->scale_path = NULL;
+    source->scale_offset = 0;
+    source->scale_elements = 0;
+    source->scale_name[0] = '\0';
+    if (tensor->dtype == H3_DTYPE_I8) {
+        /* ConvRot INT8: record the per-row scale so the streaming thread can
+         * dequantize + un-rotate on the fly (mirrors prepare_stream_source). */
+        source->path = header->path;
+        source->file_offset = tensor->file_offset;
+        source->elements = (size_t)(rows * columns);
+        char sname[256];
+        size_t nl = strlen(name);
+        snprintf(sname, sizeof(sname), "%.*s.weight_scale", (int)(nl - 7), name);
+        const h3_st_header *sheader = NULL;
+        const h3_st_tensor *st = h3_weight_find(dit->vdn_weights, sname,
+                                                &sheader);
+        if (!st || (st->dtype != H3_DTYPE_F32 && st->dtype != H3_DTYPE_BF16) ||
+            h3_st_tensor_elements(st) != rows) {
+            fail(error, error_size,
+                 "int8 VDN streaming scale absent/wrong: %s", sname);
+            return 0;
+        }
+        snprintf(source->scale_name, sizeof(source->scale_name), "%s", sname);
+        source->scale_path = sheader->path;
+        source->scale_offset = st->file_offset;
+        source->scale_elements = (size_t)rows;
+        return 1;
+    }
+    if (tensor->dtype != H3_DTYPE_BF16) {
         fail(error, error_size,
              "VDN streaming weight is absent or has the wrong schema: %s",
              name);
@@ -1195,13 +1232,6 @@ static int prepare_vdn_stream_source(h3_dit *dit,
     source->path = header->path;
     source->file_offset = tensor->file_offset;
     source->elements = (size_t)(rows * columns);
-    source->rows = (uint32_t)rows;
-    source->columns = (uint32_t)columns;
-    source->field = field;
-    source->scale_path = NULL;
-    source->scale_offset = 0;
-    source->scale_elements = 0;
-    source->scale_name[0] = '\0';
     return 1;
 }
 
@@ -1335,8 +1365,11 @@ static int read_stream_layer(h3_dit_stream_job *job) {
             /* CPU path: pread int8 + scale, fast Walsh-Hadamard un-rotate,
              * write the true BF16 weight straight into the shared-memory slot.
              * No GPU commands — the main thread owns the command buffer. */
-            float *scales = load_convrot_scale_values(dit, source->scale_name,
-                source->rows, job->error, sizeof(job->error));
+            h3_weight_store *scale_store = (source->field == STREAM_LIN_OUT)
+                ? dit->vdn_weights : dit->weights;
+            float *scales = load_convrot_scale_values(scale_store,
+                source->scale_name, source->rows, job->error,
+                sizeof(job->error));
             int8_t *raw = scales ? malloc(source->elements) : NULL;
             uint16_t *full = (raw && source->elements)
                 ? malloc((size_t)source->rows * source->columns *
@@ -2451,8 +2484,28 @@ static h3_dit *load_dit(const char *weight_directory,
         }
     }
     if (linear_branch_path && *linear_branch_path) {
-        dit->vdn_weights = h3_weight_store_open(linear_branch_path, error,
-                                                error_size);
+        /* Open ONE linear-branch checkpoint rather than merging every shard in
+         * the directory: the INT8 and BF16 exports ship side by side and share
+         * tensor names, so a merged store would resolve those duplicate names to
+         * whichever file happens to sort first. Preference order: the ConvRot
+         * INT8 export, then the conventional single-file name, then the whole
+         * directory (sharded checkpoints). */
+        static const char *const candidates[] = {
+            "model_int8_convrot_comfyui.safetensors",
+            "model.safetensors",
+        };
+        for (size_t index = 0; !dit->vdn_weights &&
+             index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+            char candidate[1024];
+            snprintf(candidate, sizeof(candidate), "%s/%s", linear_branch_path,
+                     candidates[index]);
+            if (access(candidate, R_OK) == 0)
+                dit->vdn_weights = h3_weight_store_open_file(candidate, error,
+                                                            error_size);
+        }
+        if (!dit->vdn_weights)
+            dit->vdn_weights = h3_weight_store_open(linear_branch_path, error,
+                                                    error_size);
         if (!dit->vdn_weights) goto failed;
         dit->vdn = 1;
     }

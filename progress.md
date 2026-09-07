@@ -180,3 +180,57 @@
   h3_lora_merge_blocking / h3_gpu_blocking_linear_bf16（私有命令缓冲，不碰主线程 open buffer）
 - 修复内存规划器同时建议 ssd_streaming+int8_row_fc2 的既有互斥冲突
 - 端到端跑通进入去噪循环（8 步 turbo，约 7-8 分钟/步，步骤 1/8 已完成）
+
+## Session: 2026-09-07 (INT8 线性分支接入 + 性能剖析)
+
+### Phase 8: INT8（ConvRot）线性分支接入 — complete
+- **判决性验证先行**：CPU 复现 convrot 反量化，3 个量化张量 vs bf16 真值
+  cos = 0.999954 / 0.999954 / 0.999921；不做反旋转仅 **0.065** → 确认必须走 convrot 路径
+- 改动 3 文件 5 处（`h3_weights.h/.c`、`h3_dit.c`），VDN loader 本体**零改动**
+- 首次运行即报错 `VDN streaming weight is absent or has the wrong schema:
+  transformer_blocks.0.attn.to_out_linear.weight` → 定位 `prepare_vdn_stream_source` 硬性要求 BF16
+- 二次报错（预判）：消费点按名从 `dit->weights` 找 scale 会失败 → 改为按 `field==STREAM_LIN_OUT` 选 store
+- 修复后跑通；int8 vs bf16 输出 **cos 0.9904 / mean_abs_diff 9.3**
+
+### Phase 9: 步数与性能剖析 — in_progress
+- 步数对照：steps=2 时 **VDN 与无 VDN 同样糊** → 黄色 = 欠采样，与 linear/int8 无关
+- 端到端计时：**VDN 305s vs 原版 90s（慢 3.4×）**
+- `H3_PROFILE` 剖析：79.35 vs 72.14 GiB；**unhidden wait 0.001s vs 23.332s**
+- 结论：VDN 瓶颈是**计算**；`to_out_linear` 常驻省 0 秒、需 3.85 GB → **不做**
+
+### 运行清单（本 session，均 256×256 / 1s / seed 42 / --ssd-streaming）
+| # | 配置 | 产物 | 结果 |
+|---|---|---|---|
+| 1 | VDN int8 @2 | /tmp/int8_test.mp4 | 橙棕糊（用户反馈"一片黄"）|
+| 2 | VDN int8 @4 | /tmp/int8_test_s4.mp4 | 有狐狸 |
+| 3 | VDN bf16 @4（`/tmp/lb_bf16` 符号链接）| /tmp/bf16_test_s4.mp4 | 有狐狸；与 #2 cos 0.9904 |
+| 4 | **无 VDN @2** | /tmp/novdn_s2.mp4 | **同样糊**（关键对照，证伪 linear/int8 嫌疑）|
+| 5 | VDN int8 @4（计时）| /tmp/linear_s4_timed.mp4 | **308 s** |
+| 6 | VDN + `H3_VDN_INT8=1` @4 | — | **崩溃** 13s，`unknown Metal error` |
+| 7 | 无 VDN @4（计时）| /tmp/novdn_s4_timed.mp4 | **90 s** |
+| 8 | `H3_PROFILE` ×2 | /tmp/prof_vdn.mp4、/tmp/prof_novdn.mp4 | 305s / 90s + 流式统计 |
+| 9 | 文件对调后重跑 VDN @4 | /tmp/linear_s4_timed.mp4 | **198461 B，与 #2 逐字节一致** |
+
+### 产物证据（帧统计，t=0.8s）
+| 样本 | R | G | B | R−B | std | grad |
+|---|---|---|---|---|---|---|
+| VDN+int8 @2 | 89.9 | 64.1 | 34.7 | 55.2 | 17.9 | 4.88 |
+| 无 VDN @2 | 85.8 | 61.7 | 33.5 | 52.4 | 22.7 | 5.10 |
+| VDN+int8 @4（有狐狸）| 127.3 | 98.9 | 64.9 | 62.4 | 23.5 | 5.51 |
+
+### Error Log（本 session）
+| Error | Attempt | Resolution |
+|---|---|---|
+| `VDN streaming weight is absent or has the wrong schema: to_out_linear.weight` | 1 | `prepare_vdn_stream_source` 改为接受 I8 并填 scale 字段 |
+| 预判：scale 按名从 `dit->weights` 找不到 | 1 | 消费点按 `field==STREAM_LIN_OUT` 选 `dit->vdn_weights` |
+| `H3_VDN_INT8=1` → `DiT stream begin failed: unknown Metal error` | 1 | M4 不支持（NAX 为 M5 路径），放弃该开关 |
+| 误判 steps=4 仍糊（只看统计量）| 1 | 用户肉眼确认有狐狸；统计指标不能判断语义正确性 |
+
+### 5-Question Reboot Check（更新至 2026-09-07 末）
+| Question | Answer |
+|---|---|
+| Where am I? | Phase 9 性能剖析完成（已证 VDN 慢 3.4× 且瓶颈为计算）；待用户决定下一步 |
+| Where am I going? | 二选一：① 深挖 VDN kernel 调度开销；② 长序列/高分辨率重测能否翻盘 |
+| What's the goal? | 让 linear 分支(int8)正确可用 + 验证其加速收益 |
+| What have I learned? | int8 接入正确（cos 0.9999/0.9904）；黄色是 steps=2 欠采样；VDN 在 1s/256² 是负优化；`H3_VDN_INT8` 在 M4 崩 |
+| What have I done? | 5 处代码改动 + 9 次对照运行 + H3_PROFILE 剖析 |

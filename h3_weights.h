@@ -13,6 +13,9 @@ typedef struct h3_weight_store h3_weight_store;
  * tensor payloads. */
 h3_weight_store *h3_weight_store_open(const char *directory,
                                       char *error, size_t error_size);
+/* Open a single safetensors file as a one-shard weight store. */
+h3_weight_store *h3_weight_store_open_file(const char *path,
+                                          char *error, size_t error_size);
 void h3_weight_store_free(h3_weight_store *store);
 size_t h3_weight_store_shards(const h3_weight_store *store);
 

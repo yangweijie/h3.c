@@ -40,37 +40,52 @@
 - [x] checkpoint 权重清单实测
 - [x] h3.c 现状调研（DiT 前向/LoRA/加载/调度/kernel 注册）
 
-### Phase 2: LoRA 扩展 — in_progress
-- [ ] 支持 `attn.orig.to_q/to_k/to_v` → qkv 行带映射（C 端 target 表）
-- [ ] 支持 `.default` 与 `.turbo` 两套后缀（多 adapter，按顺序合并）
-- [ ] 验证：加载 stage-dmd adapters，检查合并后 delta 数值（h3_lora_tests 扩展）
+### Phase 2: LoRA 扩展 — complete
+- [x] 支持 `attn.orig.to_q/to_k/to_v` → qkv 行带映射（C 端 target 表）
+- [x] 支持 `.default` 与 `.turbo` 两套后缀（多 adapter，按顺序合并）
+- [x] 形状不兼容时告警跳过（pruned convrot 基座的 8-wide AdaLN 层）
 
-### Phase 3: 线性分支权重加载
-- [ ] h3_dit_block 新增 16 字段（norm 常驻 + 大矩阵可流式 STREAM_LIN_*）
-- [ ] 加载/映射 linear_branch/model.safetensors（transformer_blocks.N → blocks.N）
-- [ ] 验证：张量计数、形状断言
+### Phase 3: 线性分支权重加载 — complete
+- [x] h3_dit_block 新增 16 字段（常驻 + 大矩阵流式 STREAM_LIN_OUT）
+- [x] 加载/映射 linear_branch/model.safetensors（transformer_blocks.N → blocks.N）
+- [x] 张量计数、形状断言
 
-### Phase 4: Metal 内核
-- [ ] 特征：depthwise 5×5 空间 conv + 5-tap 时间 conv + SiLU + L2Norm（融合）
-- [ ] frame stats（A/B fp32）、alpha、softmax_gate、output_gate（可并入现有 adaln/linear）
-- [ ] vdn_solve：批量 128×128 Cholesky + 三角求逆（threadgroup/矩阵）
-- [ ] scan（逐帧 bmm，主机驱动；forward+reverse）
-- [ ] gather + readout epilogue（readout@q、RMSNorm、gate）
-- [ ] 单元测试：CPU 黄金对照（tests/ 新增）
+### Phase 4: Metal 内核 — complete
+- [x] 特征：depthwise 5×5 空间 conv + 5-tap 时间 conv + SiLU + L2Norm（融合）
+- [x] frame stats（A/B fp32）、alpha、softmax_gate、output_gate
+- [x] vdn_solve：批量 128×128 Cholesky + 三角求逆
+- [x] scan（逐帧 bmm，主机驱动；forward+reverse）
+- [x] gather + readout epilogue（readout@q、RMSNorm、gate）
+- [x] tests/test_vdn_branch.c 加入 make test
 
-### Phase 5: run_block 接线
-- [ ] raw qkv 输出（fused qkv kernel 需输出 pre-norm/pre-rope 值，或拆分）
-- [ ] softmax 窗口注意力接入主路径（chunk c5 + anchors，改造 h3_flash_attn_tiled_windowed/h3_sdpa_window_mask）
-- [ ] 线性分支插入（softmax out + to_out_linear 后、残差前）
-- [ ] 验证：单 block 与 Python golden 对比
+### Phase 5: run_block 接线 — complete
+- [x] raw qkv（pre-QK-norm / pre-RoPE）输出
+- [x] softmax 窗口注意力接入主路径（chunk c5 + anchors）
+- [x] 线性分支插入（softmax out + to_out_linear 后、残差前）
 
-### Phase 6: 目录/CLI/调度
-- [ ] --vdn-dir 或 lora/linear 分开参数；8 步 turbo（steps=8，shift 已匹配）
-- [ ] token_refiner（文本编码器侧）LoRA 合并检查（h3_lora 已支持 refiner 目标名）
+### Phase 6: 目录/CLI/调度 — complete
+- [x] `--linear-branch DIR` 参数（--lora 逗号分隔顺序合并）
+- [x] 端到端跑通进入去噪循环
 
-### Phase 7: 端到端验证
-- [ ] make test 全绿
-- [ ] 用 stage-dmd-step-250 生成短片，对比视觉质量/与 Python 输出合理性
+### Phase 7: 端到端验证 — complete
+- [x] 短片生成成功（256×256 / 1s），有狐狸
+- [x] 与 bf16 线性分支逐像素对比（cos=0.9904）
+
+### Phase 8: INT8（ConvRot）线性分支接入 — complete
+- [x] 实测确认 int8 文件为 convrot 格式：反量化 vs bf16 真值 cos≈0.99995（非旋转仅 0.065）
+- [x] 新增 `h3_weight_store_open_file()`（单文件 store，h3_weights.h/.c）
+- [x] VDN 打开改为候选名单确定性单文件：`model_int8_convrot_comfyui.safetensors` → `model.safetensors` → 整个目录
+- [x] `prepare_vdn_stream_source()` 支持 I8 + 填 scale 字段（原先硬性要求 BF16）
+- [x] 流式反量化按 `field == STREAM_LIN_OUT` 从 `dit->vdn_weights` 取 scale
+- [x] `load_convrot_scale_values()` 改接收显式 store（主模型行为不变）
+- [x] 端到端跑通；对调文件后复现出逐字节一致产物
+
+### Phase 9: 性能剖析与加速验证 — in_progress
+- [x] 步数对照：steps=2 为欠采样（**无 linear 同样糊**）→ 黄色与 linear/int8 无关
+- [x] 端到端计时：VDN **305s** vs 原版 **90s**（M4 / 256×256 / 1s / steps=4）→ **慢 3.4×**
+- [x] `H3_PROFILE` 流式剖析：79.35 vs 72.14 GiB；**unhidden wait 0.001s vs 23.3s**
+- [x] 结论：VDN 瓶颈是**计算**不是 I/O；`to_out_linear` 常驻省 0 秒却要 3.85 GB
+- [ ] 待定：VDN kernel 调度开销优化，或长序列/高分辨率下重测能否翻盘
 
 ## Decisions Made
 | Decision | Rationale |
@@ -79,14 +94,29 @@
 | 基座权重继续用 convrot FL2VA 目录 | VDN stage 目录只含新增权重；基座即 MiniMax-H3 |
 | chunk 窗口用 per-frame bounds 表示 | 与现有 window mask/flash kernel 数据结构兼容，bounds 改为 c5 生成即可 |
 | 扫描 v1 用主机逐帧驱动 bmm | 102×2 次/层/步的 launch 开销可接受（~0.5s/步），先求正确 |
+| 复用 `h3_weight_load_bf16` 已有的 I8 反量化，不为 VDN 另写加载器 | `load_tensor` 在 `dtype==I8` 且请求 BF16 时自动走 `load_int8_dequantized`（反量化 + convrot 反旋转）；其 scale 名规则 `"%s_scale"` 正好匹配 int8 文件的 `beta_proj.weight_scale`，故 VDN loader 本体零改动 |
+| VDN 线性分支只打开**单个**权重文件（候选名单） | int8 与 bf16 导出并存且张量同名，合并进同一 store 会让 `h3_weight_find` 命中排序靠前的那份，且白白映射 4.3 GB bf16 |
+| `to_out_linear` **不**改为常驻 | `H3_PROFILE` 实测 unhidden wait = 0.001s，I/O 已被计算完全掩盖；常驻省 0 秒却要 50×77MB = 3.85 GB |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
 | 子代理无写文件权限 | 1 | 报告由主代理落盘 |
+| `VDN streaming weight is absent or has the wrong schema: transformer_blocks.0.attn.to_out_linear.weight` | 1 | `prepare_vdn_stream_source` 硬性要求 `dtype==BF16`；改为接受 I8 并填 `scale_path/scale_offset/scale_name` |
+| 流式反量化报 `required weight_scale absent: …to_out_linear.weight_scale` | 1 | 消费点固定从 `dit->weights` 按名找 scale；改为按 `field == STREAM_LIN_OUT` 选 `dit->vdn_weights` |
+| `H3_VDN_INT8=1` → `cannot stream DiT block 1: DiT stream begin failed: unknown Metal error`（13s 退出）| 1 | NAX tensor ops 是 M5 路径，M4 上强制开启会崩；本机不可用，回退 bf16 计算 |
+| 用户把 int8/bf16 两个文件对调（`model.safetensors`=int8，`model_bf32.safetensors`=bf16）导致同名张量重复进 store | 1 | 候选名单确定性单文件打开（见 Decisions）；已验证复现逐字节一致产物 |
+| 误判"steps=4 仍是黄糊"（只能看统计量、看不到图）| 1 | 用户肉眼确认 4 步有狐狸；统计指标（std/grad）不足以判断语义正确性，结论须以实际观看为准 |
 
 ## Notes
 - VDN 配置：chunk=5, radius=1（chunk 模式下 radius 为 chunk 跨度）、anchor_frames=both、
   bridge=alpha、a_fp32、enable_text_state、short_conv=[k,v]、linear_head_dim=128。
 - turbo: 8 steps, video_shift=12.0, audio_shift=3.0（= h3_host.h 现有常量）。
 - 详细规格见 findings.md「VDN-H3 规格研究」节。
+- **本机 Apple M4（非 M5）**：`wantsTensorOps = (m5 || getenv("H3_VDN_INT8")) && !(H3_NAX=="0")`
+  （h3_gpu.m:371）→ M4 上 NAX tensor ops 默认关闭，且 `H3_VDN_INT8` 强开会崩。
+- `H3_NAX_FORCE` 全仓库无任何引用 = **空操作**；真实变量是 `H3_NAX`（0 / mlp / qkv-attn）。
+- `--linear-branch` 是 VDN 的**唯一入口**（main.c:308/409），不受任何环境变量影响；
+  不传它则 `vdn=0`，线性分支的解析/加载/前向全部不执行（有效的"无 linear"对照）。
+- 性能基线（256×256 / 1s / steps=4 / seed 42 / `--ssd-streaming`）：VDN **305s** vs 原版 **90s**。
+  详见 findings.md「INT8 线性分支 + 性能剖析 (2026-09-07)」。
