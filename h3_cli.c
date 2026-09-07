@@ -505,6 +505,8 @@ static int generate(h3_cli_state *state, const char *prompt) {
     snprintf(state->last_output, sizeof(state->last_output), "%s", output);
     free(state->last_prompt);
     state->last_prompt = strdup(prompt);
+    if (!state->last_prompt)
+        fprintf(stderr, "h3: out of memory remembering prompt (repeat disabled)\n");
     printf("Done -> %s [%.2fs]\n", output, elapsed);
     if (state->open_output) open_video(output);
     return 1;
@@ -790,16 +792,22 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
             } else if (!strcasecmp(sub, "bin")) {
                 free(state->sr_bin);
                 state->sr_bin = *val ? strdup(val) : NULL;
+                if (*val && !state->sr_bin)
+                    fprintf(stderr, "h3: out of memory setting SR bin\n");
                 printf("SR bin: %s\n", state->sr_bin ? state->sr_bin : "none");
             } else if (!strcasecmp(sub, "model-dir")) {
                 free(state->sr_model_dir);
                 state->sr_model_dir = *val ? strdup(val) : NULL;
+                if (*val && !state->sr_model_dir)
+                    fprintf(stderr, "h3: out of memory setting SR model-dir\n");
                 printf("SR model-dir: %s\n",
                        state->sr_model_dir ? state->sr_model_dir : "none");
             } else if (!strcasecmp(sub, "model")) {
                 free(state->sr_model);
                 state->sr_model = *val ? strdup(val)
                                        : strdup("realesrgan-x4plus");
+                if (!state->sr_model)
+                    fprintf(stderr, "h3: out of memory setting SR model\n");
                 printf("SR model: %s\n", state->sr_model);
             } else if (!strcasecmp(sub, "target")) {
                 int w, h;
@@ -857,6 +865,7 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     if (initial->last_frame) state.last_frame = strdup(initial->last_frame);
     if ((initial->first_frame && !state.first_frame) ||
         (initial->last_frame && !state.last_frame) ||
+        !state.sr_model ||
         initial_reference_count > 12 ||
         (initial_reference_count && !initial_references)) {
         fprintf(stderr, "h3: cannot copy initial interactive inputs\n");
@@ -915,7 +924,8 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
                 break;
             }
             if (repeat) {
-                char *prompt = strdup(state.last_prompt);
+                char *prompt = state.last_prompt ?
+                    strdup(state.last_prompt) : NULL;
                 if (!prompt) fprintf(stderr, "h3: out of memory copying prompt\n");
                 else {
                     generate(&state, prompt);

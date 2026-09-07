@@ -121,7 +121,15 @@ static h3_gpu_tensor *weight_bf16_any(const h3_weight_store *store, h3_gpu *gpu,
                  name, dimension);
             return NULL;
         }
+        if (shape[dimension] && elements > UINT64_MAX / shape[dimension]) {
+            fail(error, error_size, "weight %s shape overflows", name);
+            return NULL;
+        }
         elements *= shape[dimension];
+    }
+    if (elements > SIZE_MAX / sizeof(float)) {
+        fail(error, error_size, "weight %s is too large to convert", name);
+        return NULL;
     }
     size_t raw_size = (size_t)elements *
         (tensor->dtype == H3_DTYPE_F16 ? sizeof(uint16_t) : sizeof(float));
@@ -230,11 +238,12 @@ static int prepare_rows(h3_dit_schedule *schedule,
             schedule->visual_condition_rows[step] = video >= 0.999f ?
                 schedule->video_rows[step] : visual_condition_row;
         if (audio_condition)
-            schedule->audio_condition_rows[step] = audio >= 1.0f ?
+            schedule->audio_condition_rows[step] = audio >= 0.999f ?
                 schedule->audio_rows[step] : audio_condition_row;
     }
     schedule->time_rows = count;
-    if (!count || count > UINT32_MAX / TIME_INPUT) {
+    if (!count || count > UINT32_MAX / TIME_INPUT ||
+        count > SIZE_MAX / feature_dim) {
         fail(error, error_size, "invalid number of timestep rows");
         return 0;
     }
@@ -525,6 +534,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             free_tensor(&weight);
             free_tensor(&bias);
             h3_gpu_tensor_free(time);
+            time = NULL;
             goto failed;
         }
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
@@ -544,6 +554,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         free_tensor(&bias);
         if (!ok) {
             h3_gpu_tensor_free(time);
+            time = NULL;
             goto failed;
         }
         if (block == 0 && getenv("H3_DEBUG_CONVROT")) {
@@ -589,16 +600,19 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         free_tensor(&final_w);
         free_tensor(&final_b);
         h3_gpu_tensor_free(time);
+        time = NULL;
         goto failed;
     }
     free_tensor(&final_w);
     free_tensor(&final_b);
     h3_gpu_tensor_free(time);
+    time = NULL;
     return schedule;
 
 failed:
     free(table);
     free(features);
+    h3_gpu_tensor_free(time);
     h3_dit_schedule_free(schedule);
     return NULL;
 }
@@ -652,36 +666,54 @@ const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
     return schedule && block < H3_DIT_BLOCKS ? schedule->blocks[block] : NULL;
 }
 
+int h3_dit_schedule_gate_scores(const h3_dit_schedule *schedule,
+                                unsigned first, unsigned count, double *out) {
+    if (!schedule || !out || !count) return 0;
+    if (first >= H3_DIT_BLOCKS || count > H3_DIT_BLOCKS - first) return 0;
+    size_t elements = (size_t)schedule->time_rows * BLOCK_OUTPUT;
+    if (!elements || elements > SIZE_MAX / sizeof(uint16_t)) return 0;
+    /* One readback buffer is reused for every block: ranking the whole stack
+     * would otherwise allocate (and free) a fresh buffer per block. */
+    uint16_t *values = malloc(elements * sizeof(*values));
+    if (!values) return 0;
+    int ok = 1;
+    for (unsigned index = 0; index < count; index++) {
+        unsigned block = first + index;
+        if (!schedule->blocks[block] ||
+            !h3_gpu_tensor_read_bf16(schedule->blocks[block], values,
+                                     elements)) {
+            ok = 0;
+            break;
+        }
+        double total = 0.0;
+        size_t samples = 0;
+        for (uint32_t row = 0; row < schedule->time_rows; row++)
+            for (uint32_t modality = 0; modality < H3_DIT_MODALITIES; modality++)
+                for (uint32_t slot = 2; slot <= 5; slot += 3) {
+                    size_t base = ((size_t)row * H3_DIT_MODALITIES *
+                                   H3_DIT_ADALN_SLOTS +
+                                   (size_t)modality * H3_DIT_ADALN_SLOTS + slot) *
+                                  H3_DIT_HIDDEN;
+                    for (uint32_t column = 0; column < H3_DIT_HIDDEN; column++) {
+                        uint32_t bits = (uint32_t)values[base + column] << 16;
+                        float value;
+                        memcpy(&value, &bits, sizeof(value));
+                        total += fabs((double)value);
+                    }
+                    samples += H3_DIT_HIDDEN;
+                }
+        out[index] = samples ? total / (double)samples : -1.0;
+    }
+    free(values);
+    return ok;
+}
+
 double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
                                   unsigned block) {
-    if (!schedule || block >= H3_DIT_BLOCKS || !schedule->blocks[block])
-        return -1.0;
-    size_t count = (size_t)schedule->time_rows * BLOCK_OUTPUT;
-    uint16_t *values = malloc(count * sizeof(*values));
-    if (!values || !h3_gpu_tensor_read_bf16(schedule->blocks[block], values,
-                                             count)) {
-        free(values);
-        return -1.0;
-    }
-    double total = 0.0;
-    size_t samples = 0;
-    for (uint32_t row = 0; row < schedule->time_rows; row++)
-        for (uint32_t modality = 0; modality < H3_DIT_MODALITIES; modality++)
-            for (uint32_t slot = 2; slot <= 5; slot += 3) {
-                size_t base = ((size_t)row * H3_DIT_MODALITIES *
-                               H3_DIT_ADALN_SLOTS +
-                               (size_t)modality * H3_DIT_ADALN_SLOTS + slot) *
-                              H3_DIT_HIDDEN;
-                for (uint32_t column = 0; column < H3_DIT_HIDDEN; column++) {
-                    uint32_t bits = (uint32_t)values[base + column] << 16;
-                    float value;
-                    memcpy(&value, &bits, sizeof(value));
-                    total += fabs((double)value);
-                }
-                samples += H3_DIT_HIDDEN;
-            }
-    free(values);
-    return samples ? total / (double)samples : -1.0;
+    double score = -1.0;
+    if (!schedule || block >= H3_DIT_BLOCKS) return -1.0;
+    if (!h3_dit_schedule_gate_scores(schedule, block, 1, &score)) return -1.0;
+    return score;
 }
 
 void h3_dit_schedule_prune(h3_dit_schedule *schedule,

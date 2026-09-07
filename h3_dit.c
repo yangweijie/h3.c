@@ -1351,11 +1351,10 @@ static int read_stream_layer(h3_dit_stream_job *job) {
      * int8 requantization below. */
     int gpu_work = dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out;
     (void)gpu_work;
-    /* ConvRot int8: batch-dequant + Hadamard un-rotate all four sources on the
-     * GPU, then commit once per block (stream_batch pattern). Plain BF16: pread
-     * straight in. The dequant writes become visible to the subsequent requant
-     * kernels via an MTLEvent waited on below. */
-    h3_gpu_stream_dequant_begin(dit->gpu);
+    /* ConvRot int8: dequantize + undo the block-Hadamard rotation into the BF16
+     * slot; plain BF16: pread straight in. Either way the slot ends up holding the
+     * true (unrotated) weight, and the existing int8 requantization below halves
+     * the resident footprint exactly as for the BF16 checkpoint. */
 
     for (unsigned index = 0; index < layer->source_count && job->ok;
          index++) {
@@ -1363,47 +1362,85 @@ static int read_stream_layer(h3_dit_stream_job *job) {
         h3_gpu_tensor *target = stream_slot_target(slot, source->field);
         if (!target) { job->ok = 0; break; }
         if (source->scale_path) {
-            /* GPU ConvRot dequant path: load int8 weight + per-row scale into
-             * GPU buffers, run the dequant + Hadamard un-rotate kernel on a
-             * private command buffer (blocking_* pattern). The kernel is
-             * numerically identical to convrot_unrotate_cpu (verified
-             * element-wise across the whole matrix, both layout 0 and 1). Its
-             * writes become visible to the subsequent requant kernels via an
-             * MTLEvent waited on in the requant path. */
-            if (!dit->convrot_hadamard &&
-                !build_convrot_hadamard(dit, job->error, sizeof(job->error))) {
-                job->ok = 0; break;
-            }
-            h3_gpu_tensor *w = h3_gpu_tensor_load_i8(dit->gpu, source->path,
-                source->file_offset, source->elements);
-            if (!w) {
-                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-                    "cannot load convrot int8 weight");
-                job->ok = 0; break;
-            }
+            /* CPU path: pread int8 + scale, fast Walsh-Hadamard un-rotate,
+             * write the true BF16 weight straight into the shared-memory slot.
+             * No GPU commands — the main thread owns the command buffer. */
             h3_weight_store *scale_store = (source->field == STREAM_LIN_OUT)
                 ? dit->vdn_weights : dit->weights;
             float *scales = load_convrot_scale_values(scale_store,
                 source->scale_name, source->rows, job->error,
                 sizeof(job->error));
-            h3_gpu_tensor *sc = scales ?
-                h3_gpu_tensor_from_f32(dit->gpu, scales, (size_t)source->rows) : NULL;
-            free(scales);
-            if (!sc) {
-                h3_gpu_tensor_free(w);
+            int8_t *raw = scales ? malloc(source->elements) : NULL;
+            uint16_t *full = (raw && source->elements)
+                ? malloc((size_t)source->rows * source->columns *
+                         sizeof(uint16_t)) : NULL;
+            if (!raw || !full) {
+                free(scales); free(raw); free(full);
                 if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-                    "cannot upload convrot scale");
+                    "cannot allocate ConvRot streaming buffers");
                 job->ok = 0; break;
             }
-            uint32_t layout = (source->field == STREAM_QKV) ? 1u : 0u;
-            int ok = h3_gpu_stream_dequant_encode(dit->gpu, target, w, sc,
-                dit->convrot_hadamard, source->rows, source->columns, layout,
-                HEADS, HEAD_DIM);
-            h3_gpu_tensor_free(w);
-            h3_gpu_tensor_free(sc);
-            if (!ok) {
+            if (!convrot_read_weight(source->path, raw, source->elements,
+                                     source->file_offset)) {
+                free(scales); free(raw); free(full);
                 if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-                    "convrot GPU dequant failed: %s", h3_gpu_error(dit->gpu));
+                    "cannot read convrot int8 weight");
+                job->ok = 0; break;
+            }
+            /* qkv_proj is stored q/k/v-interleaved; remap to separated layout
+             * (layout == 1) so the unrotated weight lands at its true row. */
+            uint32_t layout = (source->field == STREAM_QKV) ? 1u : 0u;
+            int write_ok = 1;
+            for (uint32_t start = 0; start < source->rows; start += 1024) {
+                uint32_t count = source->rows - start < 1024 ?
+                    source->rows - start : 1024;
+                convrot_unrotate_cpu(
+                    raw + (size_t)start * source->columns, scales + start,
+                    full, start, count, source->columns,
+                    layout, HEADS, HEAD_DIM);
+            }
+            if (!h3_gpu_tensor_write_bf16(target, full,
+                    (size_t)source->rows * source->columns))
+                write_ok = 0;
+            free(scales); free(raw); free(full);
+            if (write_ok && job->layer == 0 &&
+                source->field == STREAM_OUT && getenv("H3_DEBUG_CONVROT")) {
+                uint16_t probe[8];
+                if (h3_gpu_tensor_read_bf16_range(target, 0, probe, 8)) {
+                    fprintf(stderr, "convrot debug: out_proj[0][0..7] =");
+                    for (int k = 0; k < 8; k++) {
+                        uint32_t bits = (uint32_t)probe[k] << 16;
+                        float v;
+                        memcpy(&v, &bits, sizeof(v));
+                        fprintf(stderr, " %.6f", v);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+            if (write_ok && job->layer == 0 &&
+                source->field == STREAM_QKV && getenv("H3_DEBUG_CONVROT")) {
+                uint16_t probe[8];
+                uint32_t rows[3] = {0, 7168u, 14336u};
+                const char *labels[3] = {"q[0]", "k[0]", "v[0]"};
+                for (int r = 0; r < 3; r++) {
+                    if (h3_gpu_tensor_read_bf16_range(
+                            target, (size_t)rows[r], probe, 8)) {
+                        fprintf(stderr, "convrot debug: qkv %s[0..7] =",
+                                labels[r]);
+                        for (int k = 0; k < 8; k++) {
+                            uint32_t bits = (uint32_t)probe[k] << 16;
+                            float v;
+                            memcpy(&v, &bits, sizeof(v));
+                            fprintf(stderr, " %.4f", v);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+            if (!write_ok) {
+                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
+                    "cannot write convrot weight: %s",
+                    h3_gpu_error(dit->gpu));
                 job->ok = 0; break;
             }
             job->bytes += (uint64_t)source->elements;
@@ -1417,13 +1454,6 @@ static int read_stream_layer(h3_dit_stream_job *job) {
             }
             job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
         }
-    }
-    /* Commit the batched dequant for this block (one submit for all four
-     * sources) and signal the event the requant path waits on. */
-    if (job->ok && !h3_gpu_stream_dequant_submit(dit->gpu)) {
-        if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-            "convrot GPU dequant submit failed: %s", h3_gpu_error(dit->gpu));
-        job->ok = 0;
     }
     if (job->ok && dit->lora_count) {
         /* Merge the LoRA deltas into the freshly streamed BF16 matrices,
@@ -1439,13 +1469,6 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     if (job->ok && gpu_work && !h3_gpu_begin(dit->gpu)) {
         snprintf(job->error, sizeof(job->error),
                  "DiT stream begin failed: %s", h3_gpu_error(dit->gpu));
-        job->ok = 0;
-    }
-    /* Make the requant kernels observe the GPU dequant writes (signalled on the
-     * streaming thread's private command buffer) before they read them. */
-    if (job->ok && gpu_work && !h3_gpu_encode_wait_stream_event(dit->gpu)) {
-        snprintf(job->error, sizeof(job->error),
-                 "ConvRot stream event wait failed: %s", h3_gpu_error(dit->gpu));
         job->ok = 0;
     }
     if (job->ok && dit->int8_qkv &&
@@ -1473,6 +1496,8 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     job->seconds = stream_now() - started;
     return job->ok;
 }
+
+
 
 static void *read_stream_layer_thread(void *opaque) {
     read_stream_layer(opaque);
@@ -2001,12 +2026,17 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
      * Block 1 has a small gate but proved structurally essential in decoded
      * A/B renders, so magnitude ranking must not treat it as disposable. */
     block_score scores[H3_DIT_BLOCKS - 3];
+    unsigned count = H3_DIT_BLOCKS - 3;
+    /* Rank every candidate block with one shared readback buffer instead of
+     * allocating and freeing one per block. */
+    double magnitudes[H3_DIT_BLOCKS - 3];
+    if (!h3_dit_schedule_gate_scores(dit->schedule, 2, count, magnitudes))
+        return;
     for (unsigned block = 2; block + 1 < H3_DIT_BLOCKS; block++) {
-        double score = h3_dit_schedule_gate_score(dit->schedule, block);
+        double score = magnitudes[block - 2];
         if (score < 0.0) return;
         scores[block - 2] = (block_score){block, score};
     }
-    unsigned count = H3_DIT_BLOCKS - 3;
     for (unsigned left = 0; left < count; left++) {
         unsigned least = left;
         for (unsigned right = left + 1; right < count; right++)
@@ -2539,7 +2569,7 @@ static h3_dit *load_dit(const char *weight_directory,
         (getenv("H3_INT8_KEEP_BF16_QKV") ||
          getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
-    dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
+    dit->use_int8_row_fc2 = use_int8_row_fc2;
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||

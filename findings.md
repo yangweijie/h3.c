@@ -316,3 +316,237 @@
 - 高质量:`--steps 10 --layers 45 --reuse 2`(235s)
 
 - 报告:`/tmp/h3_benchmark/report.html`
+
+# 代码审查发现(2026-09-07)
+
+## h3_audio_vae.c
+
+| 类别 | 数量 | 关键项 |
+|---|---|---|
+| Bug/潜在 Bug | 3 | `hidden_elements` 溢出检查缺失、`add_scaled` 缺少类型转换、`output->values` 失败路径状态 |
+| 内存优化 | 2 | `run_stage` 5→3 tensor、qkv slicing |
+| 健壮性 | 3 | JSON 键匹配、`getenv` 缓存、`ftell` 错误处理 |
+| 设计观察 | 3 | 原地操作别名、无 logvar（预期行为）、双 LayerNorm |
+
+> 整体代码质量很高——错误处理一致、资源清理全面、溢出检查周到。主要的实际风险是 `hidden_elements` 溢出检查缺失和 `run_stage` 的峰值内存。
+
+## h3_cli.c
+
+| 类别 | 数量 | 关键项 |
+|---|---|---|
+| Bug | 4 | 路径截断静默、`!seconds` 过小值、`open_video` 跨平台、`!again` 失败静默 |
+| 安全 | 3 | TOCTOU 竞争、SR 可执行路径注入、错误缓冲区大小 |
+| 内存 | 2 | `strdup` 失败未检查（2 处） |
+| 设计 | 4 | 巨型 if-else 链、`INT32_MAX` 帧上限、进度比较优化、退出清理 |
+
+> 整体来说这是一个成熟的 CLI 实现——有行编辑历史、进度显示、引用管理、超分辨率后处理等功能。代码结构清晰，错误处理一致。上面列出的大部分是边界情况或可防御性编程的改进，没有严重的功能性缺陷。
+
+## h3_dit_schedule.c
+
+| 类别 | 数量 | 关键项 |
+|---|---|---|
+| Bug | 3 | 视觉/音频阈值不一致、`time` 张量生命周期管理脆弱、`count * feature_dim` 溢出检查缺失 |
+| 安全 | 2 | `gate_score` 大分配无检查、`weight_bf16_any` 32 位截断 |
+| 正确性 | 4 | LoRA 跳过静默、`row_map` 无错误信息、调试代码生产路径、浮点相等比较 |
+| 性能 | 2 | `gate_score` 每次重新读 GPU、`getenv` 热路径 |
+
+> 最严重的是第 1 点（视觉/音频阈值不一致）和第 2 点（`time` 张量生命周期），前者可能导致数值错误，后者在代码演进时容易引入 double-free 或 leak。其余是防御性编程和代码质量改进。
+
+## h3_dit.c 设计观察(非 bug,但值得注意)
+
+**两级决策顺序(流式开关 → DiT 深度裁剪)**:
+- 逻辑清晰,但 `free_after_stream` 的 < 4 GiB 检查发生在 `cache_budget_bytes` 计算**之后**
+- 如果 DiT 层被裁剪,激活预算也会缩小,可能释放更多缓存余量
+- 当前缓存预算未考虑 DiT 深度减少——可能是有意保守,但在极端设备上缓存可能略微不足
+
+**`dit_layers = 0` 哨兵值**:
+- 表示"使用默认/完整深度",是常见 C 习惯用法
+- 但与有效层数语义混合,`#define H3_DIT_LAYERS_DEFAULT 0` 能让调用点意图更清晰
+
+**整体评价**:
+- 逻辑扎实,渐进降级策略结构良好
+- 主要可操作项:溢出防护、误导性 `snprintf` 措辞、两个分支间 `use_int8_row_fc2` 不一致
+
+# 高优先级问题修复记录(Phase 18, 2026-09-08)
+
+审查发现的 5 项高优先级问题已全部修复。**共同特征:正常路径行为不变,是静默风险**
+(边界条件触发,或代码演进时引入 bug)。
+
+## 1. 视觉/音频阈值不一致 — `h3_dit_schedule.c:230-234`
+
+```c
+/* 修复前 */
+if (visual_condition)  … = video >= 0.999f ? … ;   /* 带容差 */
+if (audio_condition)   … = audio >= 1.0f   ? … ;   /* 要求精确相等 */
+
+/* 修复后 */
+if (audio_condition)   … = audio >= 0.999f ? … ;   /* 与 visual 一致 */
+```
+
+- 两者语义相同(判断 sigma 是否已归零 → 用真实行替代 condition 行),但阈值不同
+- audio 用 `>=1.0f` 要求浮点精确相等,visual 用 `>=0.999f` 留了容差
+- **风险**:浮点舍入下 audio 分支可能永不触发,导致两条 condition 路径行为不一致
+- 统一为 `0.999f`(带容差更稳健,可吸收浮点误差)
+
+## 2. `time` 张量生命周期脆弱 — `h3_dit_schedule.c`
+
+- 原代码在 4 个错误路径各写一次 `h3_gpu_tensor_free(time); goto failed;`
+- **风险**:新增任意 goto 若忘记 free → leak;若重复 free → double-free
+- 修复:
+  - 每处 free 后加 `time = NULL`(防 double-free)
+  - `failed:` 标签加统一 `h3_gpu_tensor_free(time)`(NULL 安全,防 leak)
+- 依据:`h3_gpu_tensor_free` 首行即 `if (!tensor) return;`(h3_gpu.m:852),NULL 安全
+
+## 3 & 4. 分配大小溢出检查缺失
+
+| 位置 | 表达式 | 修复 |
+|---|---|---|
+| `h3_dit_schedule.c:238` | `malloc(count * feature_dim * sizeof(*features))` | 加 `count > SIZE_MAX / feature_dim` |
+| `h3_audio_vae.c:612` | `hidden_elements = STEREO * length * 8` | 加 `length > SIZE_MAX / ((size_t)STEREO * 8)` |
+
+- 原检查用 `TIME_INPUT` 但实际分配用 `feature_dim`(不一致),且未防 `size_t` 回绕
+- 注意运算符优先级:`SIZE_MAX / STEREO * 8` 会算成 `(SIZE_MAX/STEREO)*8`,**必须写**
+  `SIZE_MAX / ((size_t)STEREO * 8)`
+
+## 5. `use_int8_row_fc2` 语义不一致 — `h3_dit.c:2567`
+
+```c
+/* 修复前:存储时被 int8_mlp 静默门控,调用方传 1 也可能不生效 */
+dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
+
+/* 修复后:存原始值,语义 = "调用方请求" */
+dit->use_int8_row_fc2 = use_int8_row_fc2;
+```
+
+- 门控由使用处外层 `if (dit->int8_mlp && …)`(h3_dit.c:3225)天然保证,无需重复
+- 效果:读取代码时不再误解该字段是否已含 int8_mlp 前提
+
+## 顺带清理:让仓库恢复可编译
+
+- **`h3_gpu.m` 重复属性**:`stream_batch` / `stream_batch_pending` 被声明两次
+  (HEAD 遗留,Phase 10 编辑残留)→ 编译直接失败。删除重复项。
+- **废弃 GPU dequant 函数块**:`h3_gpu_blocking_weight_dequant_unrotate_int8` /
+  `stream_dequant_begin|encode|submit` / `encode_wait_stream_event` —— Phase 10 已判定该方向
+  不可行(共享 GPU 导致更慢),`h3_dit.c` 早已回到 CPU 蝶形,这些是死代码。删除。
+  保留 `h3_gpu_linear_bf16_offset` 与 VDN 存根(VDN 路径需要)。
+
+## 验证
+
+| 项目 | 结果 |
+|---|---|
+| 编译 | ✅ 通过(binary 665184 bytes) |
+| 端到端(256×256/1s/steps=4/seed 42/`--ssd-streaming`) | ✅ 产物 **193579 字节,与基线逐字节一致**,102s,零报错 |
+
+→ 确认 5 项修复**无行为回归**。
+
+## 教训:大文件参数名重构不要用全局字符串替换
+
+中途试图用 `content.replace('h3_gpu *opaque,', 'h3_gpu *gpu,')` 修存根参数名,
+**误伤了 58 个正常函数签名**(与函数体内 `H3GPU *gpu = GPU(opaque)` 冲突)。
+最终改为 `git checkout` 干净重来 + 精确定位删除,一次通过。
+
+**另一教训**:`h3_gpu.m` 的 HEAD 版本本身不可编译。修复前先用 `git stash` 验证过
+「原始代码同样编译失败」,确认问题非本次引入 —— 仓库曾被提交在损坏状态,值得留意。
+
+# 中低优先级清理记录(Phase 18b, 2026-09-08)
+
+## `h3_cli.c`:`strdup` 失败未检查(审查记 2 处 → 实际 5 处)
+
+排查发现审查低估了数量。逐个核实后修复 5 处:
+
+| 行 | 变量 | 风险 | 修复 |
+|---|---|---|---|
+| 507 | `last_prompt` | **崩溃级**:失败后为 NULL,`repeat` 命令会 `strdup(NULL)` 未定义行为 | `strdup` 后加检查 + 警告 |
+| 918 | `repeat` 处 | 同上(消费端) | `state.last_prompt ? strdup(...) : NULL` 双保险 |
+| 852 | `sr_model`(初始化) | NULL 被后续 SR 逻辑使用 | 纳入启动失败检查条件 |
+| 792 / 796 / 801 | SR `bin`/`model-dir`/`model` | 静默失败,用户以为设置成功 | 失败时 `fprintf` 报错 |
+
+- 已有检查(无需改):276-281(引用拷贝)、349-352、400-403、856-859、918-919
+- 教训:**审查记录的数量可能低估**,修复前应自行全量 grep 核实
+
+## `h3_dit_schedule.c`:`weight_bf16_any()` 溢出防护
+
+```c
+/* 修复前:elements 累乘无溢出检查 */
+for (…) elements *= shape[dimension];
+
+/* 修复后 */
+for (…) {
+    if (shape[dimension] && elements > UINT64_MAX / shape[dimension]) {
+        fail(…, "weight %s shape overflows", name); return NULL;
+    }
+    elements *= shape[dimension];
+}
+if (elements > SIZE_MAX / sizeof(float)) { fail(…, "too large to convert"); return NULL; }
+```
+- 防 `uint64_t` 累乘回绕,以及后续 `(size_t)elements * sizeof(...)` 溢出
+
+## 已核实「无需修改」的项(避免无效改动)
+
+- **`h3_audio_vae.c` `run_stage` 的 `(uint32_t)elements`**:审查怀疑 32 位截断。
+  实际查看 533-538 行:
+  ```c
+  uint64_t elements64 = (uint64_t)STEREO * output_length * channels;
+  if (elements64 > UINT32_MAX || elements64 > SIZE_MAX) { fail(…); return 0; }
+  size_t elements = (size_t)elements64;
+  ```
+  **上游已保证 `elements <= UINT32_MAX`**,截断不可能发生 → 无需修改。
+  → 教训:审查结论要回到代码验证,不能照单全收。
+
+## 剩余未修(需重构或风险高于收益)
+> 以下项在 Phase 18c 中已处理:`run_stage` 5→3(经分析不可行,改务实峰值优化)、`gate_score` 批量读回。
+
+- `h3_cli.c`:巨型 if-else 链拆分、`INT32_MAX` 帧上限、退出清理(纯结构改进)
+- `h3_cli.c`:TOCTOU 竞争、SR 可执行文件路径注入(需改成受控执行,改动面较大)
+- `h3_audio_vae.c`:`run_stage` qkv slicing(收益极小:仅省 `attention_elements*3*sizeof(f32)`≈几百 KB,且需新增 GPU weight-offset 线性支持)
+- `h3_dit.c`:`dit_layers = 0` 哨兵值语义、缓存预算顺序(设计澄清)
+
+## 验证
+
+| 项目 | 结果 |
+|---|---|
+| 编译 | ✅ 通过(665184 bytes) |
+| 端到端(256×256/1s/steps=4/seed 42/`--ssd-streaming`) | ✅ **193579 字节,与基线逐字节一致**,113s,零报错 |
+
+→ 中低优先级清理同样**无行为回归**。
+
+# 内存优化记录(Phase 18c, 2026-09-08)
+
+## `h3_audio_vae.c`:`run_stage()` 峰值内存(`5→3` 不可行的务实改法)
+
+审查建议「5→3 tensor」。逐项分析 5 个 tensor 的生命周期后确认**不可行**:
+- `upsampled`:在 3 个 block 各被 copy 一次(作为 block 1/2 的 weight 重置源),必须保留到 block 2
+- `sum`:block 0 的 target + 后续累加器
+- `work`:block 1/2 的 target(承载 `U + Rk` 后并入 sum)
+- `activated` / `branch`:残差计算的乒乓缓冲,算法需要
+
+但发现**真实的峰值浪费**:上一层 `audio->hidden` 在 upsample 之后即不再需要,原代码却保留到块循环结束,
+使峰值 = 5 个 stage tensor + 上一层 hidden = **6 份**。
+
+**修复**:上采样后**立即 `h3_gpu_submit` 并 `free_tensor(&audio->hidden)`**,再分配块循环所需的
+`sum`/`work`/`activated`/`branch`。峰值从 ~6 份降到 5 份(省一份与 stage tensor 等大的上一层 hidden),
+多一次 GPU submit(微秒级),命令序列与数学完全等价。
+
+## `h3_dit_schedule.c` + `h3_dit.c`:`gate_score` 批量读回
+
+原 `h3_dit_schedule_gate_score()` 每调用一次都 `malloc` + GPU readback + `free`。
+排序路径(`configure_gate_ranked_blocks`,仅在非 uniform policy 且 active block 数 < 总数时触发)
+对 47 个 block 各调一次 → **47 次 malloc/free**。
+
+**修复**:新增 `h3_dit_schedule_gate_scores(schedule, first, count, out)`,内部**复用单个读回缓冲**,
+排序路径一次性算出全部分数(47 次 malloc → 1 次)。单次版改为委托批量版,消除重复计算逻辑。
+
+```c
+int h3_dit_schedule_gate_scores(const h3_dit_schedule *schedule,
+                                unsigned first, unsigned count, double *out);
+/* 复用单一读回缓冲;ranking 全栈从「每 block 一次 malloc/free」降为「一次性分配」 */
+```
+
+## 验证
+
+| 项目 | 结果 |
+|---|---|
+| 编译 | ✅ 通过(665232 bytes) |
+| 端到端(256×256/1s/steps=4/seed 42/`--ssd-streaming`) | ✅ **193579 字节,与基线逐字节一致**,105s,零报错 |
+
+→ 内存优化**无行为回归**。

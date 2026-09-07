@@ -290,11 +290,84 @@
   4. 最快 73s(SSIM=0.214),最佳权衡 177s(SSIM=0.570)
 - 报告:`/tmp/h3_benchmark/report.html`(含嵌入帧对比图)
 
-### 5-Question Reboot Check（更新至 2026-09-07 末）
+### Phase 17: 代码审查 — complete
+- 审查范围:`h3_audio_vae.c` / `h3_cli.c` / `h3_dit_schedule.c` / `h3_dit.c`(设计观察)
+- 发现统计:Bug 10 项、安全 5 项、内存 4 项、正确性 4 项、性能 2 项、设计 7 项 + h3_dit.c 设计观察 3 项
+- 最严重问题:
+  - `h3_dit_schedule.c`:视觉/音频阈值不一致(可能导致数值错误)、`time` 张量生命周期脆弱(易引入 double-free/leak)
+  - `h3_audio_vae.c`:`hidden_elements` 溢出检查缺失、`run_stage` 峰值内存
+  - `h3_cli.c`:TOCTOU 竞争、SR 可执行路径注入
+- h3_dit.c 设计观察(非 bug):
+  - 两级决策顺序:缓存预算在 DiT 深度裁剪**之前**计算,极端设备可能缓存略不足
+  - `dit_layers = 0` 哨兵值语义混合,建议 `#define H3_DIT_LAYERS_DEFAULT 0`
+  - 两个分支间 `use_int8_row_fc2` 不一致
+- 整体评价:代码质量高,错误处理一致,资源清理全面。主要是边界情况和防御性编程改进,无严重功能性缺陷。
+- 详细发现已记录在 findings.md「代码审查发现」节。
+
+### Phase 18: 修复代码审查高优先级问题 — complete
+
+**已修复 5 项**(均为静默风险:正常路径行为不变,但边界/演进下可能出错):
+
+| # | 文件:行 | 问题 | 修复 |
+|---|---|---|---|
+| 1 | `h3_dit_schedule.c:233` | 视觉/音频阈值不一致(visual `>=0.999f` vs audio `>=1.0f`)→ 可能导致数值行为不一致 | audio 改 `>= 0.999f` |
+| 2 | `h3_dit_schedule.c`(4 处 + `failed:`) | `time` 张量在多个错误路径 free,新增 goto 易漏(leak)或重复 free | 每处 free 后 `time = NULL`;`failed:` 标签加统一 `h3_gpu_tensor_free(time)`(NULL 安全) |
+| 3 | `h3_dit_schedule.c:238` | `count * feature_dim` 分配无溢出检查 → 极端 rows 可堆溢出 | 加 `count > SIZE_MAX / feature_dim` |
+| 4 | `h3_audio_vae.c:612` | `hidden_elements = STEREO * length * 8` 无溢出检查 | 加 `length > SIZE_MAX / ((size_t)STEREO * 8)` |
+| 5 | `h3_dit.c:2567` | `dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2` 静默吞掉调用方请求,语义不一致 | 存原始值;门控交给使用处外层 `if (dit->int8_mlp && …)`(已天然保证) |
+
+**顺带清理(使代码可编译)**:
+- `h3_gpu.m` 有重复 `stream_batch` / `stream_batch_pending` 属性声明(HEAD 遗留)→ 编译失败。删除重复项。
+- 删除已废弃 GPU dequant 函数块(`blocking_weight_dequant_unrotate_int8` /
+  `stream_dequant_begin|encode|submit` / `encode_wait_stream_event`)—— Phase 10 已判定该方向
+  不可行,`h3_dit.c` 早已回到 CPU 蝶形。保留 `h3_gpu_linear_bf16_offset` 与 VDN 存根。
+
+**过程中的重要教训**:
+- 试图用全局字符串替换修 `h3_gpu.m` 的 `opaque`/`gpu` 参数名,误伤了 58 个正常函数签名
+  (把 `h3_gpu *opaque` 改成 `h3_gpu *gpu`,与函数体内 `H3GPU *gpu = GPU(opaque)` 冲突)。
+  **最终改为 `git checkout` 干净重来 + 精确删除**,一次编译通过。
+  → 原则:大文件参数名重构不要用全局字符串替换;宁可 checkout 重来。
+- `h3_gpu.m` 的 HEAD 版本本身不可编译(重复属性),说明仓库曾被提交在损坏状态;
+  修复前先 `git stash` 验证过「原始代码同样编译失败」,确认非本次引入。
+
+**验证**:
+- 编译通过(binary 665184 bytes)
+- 端到端:256×256 / 1s / steps=4 / seed 42 / `--ssd-streaming`
+  → 产物 **193579 字节,与基线逐字节一致**,耗时 102s,零报错 ✅ 无回归
+
+### Phase 18b: 清理中低优先级问题 — complete
+
+**修复**:
+- `h3_cli.c` 5 处 `strdup` 失败未检查(审查记 2 处,实际 5 处):
+  - `last_prompt`(507)→ 失败后 NULL 会让 `repeat` 命令 `strdup(NULL)` **崩溃**,加检查;
+    另在 918 行加 NULL 保护双保险
+  - `sr_model` 初始化(852)→ 纳入启动失败检查
+  - SR `bin`/`model-dir`/`model`(792/796/801)→ 静默失败改为 `fprintf` 报错
+- `h3_dit_schedule.c` `weight_bf16_any()`:`elements` 累乘 + 转换缓冲区加溢出检查
+
+**核实后判定「无需修改」**(避免无效改动):
+- `h3_audio_vae.c` `run_stage` 的 `(uint32_t)elements`:上游 533-538 行已有
+  `elements64 > UINT32_MAX` 检查,截断不可能发生 → 审查结论需回代码验证
+
+**验证**:编译通过;端到端产物 **193579 字节,与基线逐字节一致**,113s,零报错 ✅
+
+**剩余未修**(本轮已清理 run_stage / gate_score 两项,余下需重构或收益低于风险):
+- `h3_cli.c` 巨型 if-else 拆分 / TOCTOU 竞争 / SR 可执行文件路径注入(需重构)
+- `h3_dit.c` `dit_layers = 0` 哨兵值语义、缓存预算顺序(设计澄清)
+
+### Phase 18c: 清理内存优化项（run_stage / gate_score）— complete
+- `h3_audio_vae.c` `run_stage()`:审查建议「5→3 tensor」经逐项生命周期分析**不可行**(每个 tensor 必需);
+  但发现真实峰值浪费——上一层 `audio->hidden` 在 upsample 后即不用却保留到块循环结束(峰值 6 份)。
+  改为上采样后立即 submit 并释放,再分配块循环张量,**峰值 6→5 份**,命令序列与数学等价。
+- `h3_dit_schedule.c/.h` + `h3_dit.c`:新增 `h3_dit_schedule_gate_scores()` 复用单个读回缓冲,
+  排序路径 47 次 malloc → 1 次;单次版委托批量版,消除重复逻辑。
+- 验证:端到端产物 **193579 字节,与基线逐字节一致**,105s,零报错 ✅
+
+### 5-Question Reboot Check（更新至 Phase 18c 末）
 | Question | Answer |
 |---|---|
-| Where am I? | Phase 16 完成:22 个配置的端到端基准测试,含 HTML 报告 |
-| Where am I going? | 用户决定是否继续(如测试更高分辨率/更长视频) |
-| What's the goal? | 找到最佳速度/画质权衡参数 |
-| What have I learned? | 显存不是瓶颈;step=7 比 step=4 画质提升 54%;--token-reduction 有效;最佳权衡 s7-l50-r2(177s/SSIM=0.57) |
-| What have I done? | 编写 benchmark.py 工具链 + 三轮 22 次测试 + HTML 报告 |
+| Where am I? | Phase 18 + 18b + 18c 完成:5 项高优先级 + 中低优先级(strdup/溢出) + 内存优化(run_stage 峰值 / gate_score 批量)全部修复验证通过 |
+| Where am I going? | 剩余仅 h3_cli.c 需重构项(TOCTOU/路径注入/if-else 拆分)与 h3_dit.c 设计澄清(哨兵值/预算顺序),建议暂停 |
+| What's the goal? | 识别并修复潜在 bug,提升代码健壮性 |
+| What have I learned? | 修复后产物逐字节一致 → 确认全部无回归;审查的「5→3 tensor」需回代码验证生命周期,不可照单全收;大文件全局字符串替换风险高(曾误伤 58 个签名) |
+| What have I done? | 审查 3 文件 + 记录 30+ 发现 + 修复 5 项高优先级 + 清理 5 处 strdup + 溢出防护 + run_stage 峰值 + gate_score 批量 + 清理编译阻塞 + 三轮端到端验证 |

@@ -48,6 +48,12 @@ const h3_gpu_tensor *h3_dit_schedule_block(const h3_dit_schedule *schedule,
                                            unsigned block);
 double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
                                   unsigned block);
+/* Batched variant: fills out[0..count-1] with the gate scores of blocks
+ * first..first+count-1 while reusing a single readback buffer, so ranking every
+ * block costs one allocation instead of one per block. Returns 0 on any failure
+ * (out is then only partially written). */
+int h3_dit_schedule_gate_scores(const h3_dit_schedule *schedule,
+                                unsigned first, unsigned count, double *out);
 void h3_dit_schedule_prune(h3_dit_schedule *schedule,
                            const uint8_t *active_blocks, size_t count);
 const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule);
