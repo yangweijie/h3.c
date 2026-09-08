@@ -550,3 +550,68 @@ int h3_dit_schedule_gate_scores(const h3_dit_schedule *schedule,
 | 端到端(256×256/1s/steps=4/seed 42/`--ssd-streaming`) | ✅ **193579 字节,与基线逐字节一致**,105s,零报错 |
 
 → 内存优化**无行为回归**。
+
+# 审查后修复记录(Phase 18d, 2026-09-08)
+
+对前一轮设计/普通/性能审查发现的问题执行修复,并在 B3 清理过程中发现一个新的真实并发缺陷。
+
+## 已修复
+
+### B1(高·休眠 → 拔除):VAE 异步预取崩溃地雷
+`h3_video_vae.c` 的 `vae_prefetch_thread` 在共享 `vae->gpu` 上 `load_block` 分配张量,而主线程此时持有 open 命令缓冲解码 block N。代码注释明确承认会
+"races and crashes (objc_retain of a dangling pointer)"。仅 `H3_VAE_PREFETCH=1` 可触发,默认关闭。
+**修复**:删除 `vae_prefetch_thread` / `vae_prefetch_enabled` / `vae_prefetch_job` 及循环内双缓冲预取逻辑,
+改为串行 `load→run→free` 每块的循环。因原串行分支循环内本无 `load_block`(块加载依赖预取线程),
+故在循环内改回串行加载,确保每块都被加载。一并移除已无引用的 `#include <pthread.h>`。
+**附带消除 B2**:原预取失败路径 `if (job.ok) free_block(...)` 在失败时泄漏 `vae->blocks[next]`,随预取代码整体删除而消除。
+
+### D9(中):删除未实现且误导的 GPU 属性
+`h3_gpu.m` 的 `stream_batch` / `stream_batch_pending` / `streamEventValue` 属性全程无函数体引用,
+其上方「Batched streaming ConvRot dequant … 一次 submit rather than four」注释描述了一个 Phase 10 已回退、
+从未实现的机制。`streamEvent` 保留(在 init 中仍有 `newEvent` 分配)。
+
+### B3(中):修正 `read_stream_layer` 误导性注释
+原注释称「no GPU commands from this thread」「GPU work here is only the M5 … requantization below」,
+且 `int gpu_work = …; (void)gpu_work;`。**核实发现 `gpu_work` 并非死变量**:它在 `h3_dit.c:1467`
+(`h3_gpu_begin`)与 `:1483` (`h3_gpu_submit`) 被使用,中间 `:1472-1482` 多次 `h3_gpu_quantize_weight_int8`。
+即 int8 启用时流式线程**确实在共享 `dit->gpu` 上发命令**。修正注释以准确反映该行为,并移除无意义的 `(void)gpu_work`。
+
+## 新并发缺陷(高·条件触发):DiT 流式线程竞态共享 `dit->gpu` 命令缓冲
+
+在 B3 清理中发现的真实问题,推翻了前一轮「子代理误报」的结论:
+
+- **位置**:`h3_dit.c` 主线程序环 `:3519-3596`(创建流式线程 → `run_block(block)` → `h3_gpu_submit` → `pthread_join`)
+  与流式线程 `read_stream_layer` 的 int8 requant 段 `:1467-1483`。
+- **机制**:当 `gpu_work = int8_mlp || int8_qkv || int8_attention_out` 为真时,流式线程在共享 `dit->gpu` 上
+  调用 `h3_gpu_begin`(设 `gpu.command`)、`h3_gpu_quantize_weight_int8`(编码到 `gpu.command`)、`h3_gpu_submit`
+  (提交 `gpu.command`)。而主线程**并发**在 `run_block` 中使用同一 `dit->gpu` 的命令缓冲。
+- **后果**:`h3_gpu_begin`(h3_gpu.m:943)在 `gpu.command != nil` 时直接 `return 0` → 流式线程或主线程的
+  begin 失败;或两者交替写同一 `MTLCommandBuffer` / 递增 `gpu.stats`(非原子),造成静默损坏或崩溃。
+- **触发条件**:int8 流式 requant 启用时(本机 M4 上 `int8_mlp` 等可能因内存规划 `use_int8_row_fc2` 等独立
+  于 NAX 被开启)。默认 bf16 路径 `gpu_work=0`,不触发。
+- **根因与历史**:D9 删除的 `stream_batch` 私有命令缓冲**正是为隔离该竞态预留的**,但从未实现 —— 流式线程
+  因此一直复用调用方的 `command` 缓冲。
+- **建议修复(后续)**:
+  1. 给流式线程一个**独立私有命令缓冲**(重建 `stream_batch` 机制,MPS/compute 各自 begin/commit,用
+     `MTLEvent` 排序 requant 结果对主线程的可见性);或
+  2. 将 int8 requant 从流式线程**移到主线程 join 之后**执行(牺牲少量重叠,换取绝对正确);
+  3. 至少将 `gpu.stats` 改为原子累加 + 给 `h3_gpu_begin/submit` 加可重入锁作为兜底。
+- **修复(Phase 18e, 2026-09-08)**:采用方案 2 —— 将 int8 requant 从流式线程**移到主线程 `pthread_join` 之后**,彻底消除共享命令缓冲竞态。
+  - 新增 `requant_stream_slot(dit, slot, error, error_size)`:在主线程对刚流式加载的 slot 做
+    `h3_gpu_begin` + 3×`h3_gpu_quantize_weight_int8` + `h3_gpu_submit`,使用主线程独占的命令缓冲。
+  - `read_stream_layer`(流式线程)删除全部 GPU requant 代码(原 1467-1487)与 `gpu_work` 局部变量;
+    现在流式线程**只做 CPU 反量化 + LoRA 合并**,完全不触碰 `dit->gpu`。
+  - 主循环在 `if (!stream_job.ok) { ... }` 之后、`dit->stream_ready_slot` 更新之前调用
+    `requant_stream_slot(dit, &dit->stream_slots[stream_job.slot], ...)`;此时主线程已 `h3_gpu_submit`
+    且流式线程已 join → 无并发,requant 与后续 `run_block` 完全串行。
+  - **运行时验证**:`fused_mlp=1`(默认)、`use_slower_bf16_mlp=0`(默认)、M4 `tensorOpsEnabled=true`
+    → `int8_mlp=1` → 该路径在 M4 默认测试(`--ssd-streaming`)中**实际运行**;修复前后产物均 **193579 字节一致**,
+    证明主线程串行 requant 产出正确且一致输出。
+- **当前状态**:**已修复并运行时验证**(非"未实现")。原竞态(两线程并发编码同一 `MTLCommandBuffer`)已彻底消除。
+
+## 验证
+
+| 项目 | 结果 |
+|---|---|
+| 编译 | ✅ 通过(严格 `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` 无警告,binary 664672 bytes) |
+| 端到端(256×256/1s/steps=4/seed 42/`--ssd-streaming`) | ✅ **193579 字节,与基线逐字节一致**,120s(串行 VAE 解码仅轻微变慢),零报错/崩溃 |

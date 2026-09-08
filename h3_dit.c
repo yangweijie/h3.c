@@ -1338,6 +1338,44 @@ typedef struct {
     char error[512];
 } h3_dit_stream_job;
 
+/* Requantize a freshly streamed slot's int8 weights on the MAIN thread's command
+ * buffer. Intentionally called on the main thread (never from read_stream_layer /
+ * the stream worker): the worker shares dit->gpu with the main thread, so encoding
+ * into the shared command buffer from two threads is a data race — Metal command
+ * buffers and their encoders are not thread-safe. Called once after pthread_join,
+ * while the main thread owns dit->gpu and no worker is running, so the requant is
+ * fully serialized with the rest of the forward pass. */
+static int requant_stream_slot(h3_dit *dit, h3_dit_block *slot,
+                               char *error, size_t error_size) {
+    if (!dit->int8_qkv && !dit->int8_attention_out && !dit->int8_mlp)
+        return 1;
+    if (!gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                "begin streamed int8 requant"))
+        return 0;
+    if (dit->int8_qkv &&
+        !gpu_op(dit, h3_gpu_quantize_weight_int8(dit->gpu, slot->qkv_int8,
+                  slot->qkv_scales, slot->qkv, INNER * 3, HIDDEN),
+                error, error_size, "requant streamed qkv int8"))
+        return 0;
+    if (dit->int8_attention_out &&
+        !gpu_op(dit, h3_gpu_quantize_weight_int8(dit->gpu, slot->out_int8,
+                  slot->out_scales, slot->out, HIDDEN, INNER),
+                error, error_size, "requant streamed out int8"))
+        return 0;
+    if (dit->int8_mlp &&
+        (!gpu_op(dit, h3_gpu_quantize_weight_int8(dit->gpu, slot->fc1_int8,
+                   slot->fc1_scales, slot->fc1, FFN * 2, HIDDEN),
+                 error, error_size, "requant streamed fc1 int8") ||
+         !gpu_op(dit, h3_gpu_quantize_weight_int8(dit->gpu, slot->fc2_int8,
+                   slot->fc2_scales, slot->fc2, HIDDEN, FFN),
+                 error, error_size, "requant streamed fc2 int8")))
+        return 0;
+    if (!gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                "submit streamed int8 requant"))
+        return 0;
+    return 1;
+}
+
 static int read_stream_layer(h3_dit_stream_job *job) {
     h3_dit_stream_layer *layer = &job->dit->stream_layers[job->layer];
     h3_dit_block *slot = &job->dit->stream_slots[job->slot];
@@ -1346,15 +1384,14 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     job->bytes = 0;
     job->error[0] = '\0';
     h3_dit *dit = job->dit;
-    /* ConvRot int8 weights are dequantized and un-rotated on the CPU (no GPU
-     * commands from this thread); GPU work here is only the M5 streamed-block
-     * int8 requantization below. */
-    int gpu_work = dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out;
-    (void)gpu_work;
-    /* ConvRot int8: dequantize + undo the block-Hadamard rotation into the BF16
-     * slot; plain BF16: pread straight in. Either way the slot ends up holding the
-     * true (unrotated) weight, and the existing int8 requantization below halves
-     * the resident footprint exactly as for the BF16 checkpoint. */
+    /* ConvRot int8 weights are dequantized and un-rotated on the CPU (the
+     * Walsh-Hadamard un-rotate below); the slot tensors are only read by the main
+     * thread after it joins this worker. The int8 streaming requantization (GPU
+     * h3_gpu_quantize_weight_int8) is intentionally NOT done here: this worker
+     * shares dit->gpu with the main thread, and encoding into the shared command
+     * buffer from two threads is a data race (Metal command buffers are not
+     * thread-safe). The main thread requantizes the slot after pthread_join — see
+     * requant_stream_slot(). */
 
     for (unsigned index = 0; index < layer->source_count && job->ok;
          index++) {
@@ -1466,27 +1503,7 @@ static int read_stream_layer(h3_dit_stream_job *job) {
                                sizeof(job->error)))
             job->ok = 0;
     }
-    if (job->ok && gpu_work && !h3_gpu_begin(dit->gpu)) {
-        snprintf(job->error, sizeof(job->error),
-                 "DiT stream begin failed: %s", h3_gpu_error(dit->gpu));
-        job->ok = 0;
-    }
-    if (job->ok && dit->int8_qkv &&
-        !h3_gpu_quantize_weight_int8(dit->gpu, slot->qkv_int8,
-            slot->qkv_scales, slot->qkv, INNER * 3, HIDDEN)) job->ok = 0;
-    if (job->ok && dit->int8_attention_out &&
-        !h3_gpu_quantize_weight_int8(dit->gpu, slot->out_int8,
-            slot->out_scales, slot->out, HIDDEN, INNER)) job->ok = 0;
-    if (job->ok && dit->int8_mlp &&
-        (!h3_gpu_quantize_weight_int8(dit->gpu, slot->fc1_int8,
-             slot->fc1_scales, slot->fc1, FFN * 2, HIDDEN) ||
-         !h3_gpu_quantize_weight_int8(dit->gpu, slot->fc2_int8,
-             slot->fc2_scales, slot->fc2, HIDDEN, FFN))) job->ok = 0;
-    if (gpu_work && job->ok && !h3_gpu_submit(dit->gpu)) {
-        if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-            "DiT SSD stream submit failed");
-        job->ok = 0;
-    }
+
     /* Preserve a specific upstream error (BF16 read/open failure, invalid
      * request) instead of masking it with a generic int8 message. */
     if (!job->ok && !job->error[0])
@@ -3608,6 +3625,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                          stream_job.layer, stream_job.error);
                     return 0;
                 }
+                if (!requant_stream_slot(dit,
+                                         &dit->stream_slots[stream_job.slot],
+                                         error, error_size))
+                    return 0;
                 dit->stream_ready_layer = stream_job.layer;
                 dit->stream_ready_slot = stream_job.slot;
                 OP(h3_gpu_begin(dit->gpu),

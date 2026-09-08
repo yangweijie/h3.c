@@ -175,6 +175,39 @@
 - [x] 验证:编译通过;端到端(256×256/1s/steps=4/seed 42/`--ssd-streaming`)产物
       **193579 字节,与基线逐字节一致**,耗时 105s,零报错 → 无回归
 
+### Phase 18d: 审查后修复(B1 崩溃地雷 / D9 死属性 / B3 注释 + 新并发缺陷) — complete
+- [x] **B1(高·休眠 → 拔除)**:`h3_video_vae.c` 删除异步 VAE 预取线程(`vae_prefetch_thread` /
+      `vae_prefetch_enabled` / `vae_prefetch_job` 及循环中的双缓冲预取逻辑),改为串行
+      `load→run→free`。该线程在共享 `vae->gpu` 上分配张量、主线程同时持有 open 命令缓冲,
+      并发 ObjC/Metal 访问会崩溃(objc_retain of a dangling pointer),仅 `H3_VAE_PREFETCH=1`
+      可触发。一并移除已无引用的 `#include <pthread.h>`。**B2(禁用路径泄漏)随之消除**。
+- [x] **D9(中)**:`h3_gpu.m` 删除未实现且误导的 `stream_batch` / `stream_batch_pending` /
+      `streamEventValue` 属性及「批量 dequant 一次 submit」注释(`streamEvent` 保留,仍有分配)。
+- [x] **B3(中)**:`h3_dit.c` 修正 `read_stream_layer` 误导性注释(原称「无 GPU 命令」实为错误)——
+      经核实 `gpu_work` **并非死变量**,它在 `h3_dit.c:1467` / `:1483` 被使用:int8 启用时流式线程
+      在共享 `dit->gpu` 上执行 `h3_gpu_begin` / `h3_gpu_quantize_weight_int8` / `h3_gpu_submit`。
+- [x] **新发现(高·条件触发)**:DiT 流式线程在 int8 启用时与主线程**竞态共享 `dit->gpu` 命令缓冲**
+      (流式线程 `h3_dit.c:1467-1483` 与主线程序行 `run_block` 同时写 `gpu.command` / `gpu.stats`)。
+      `h3_gpu_begin` 在 `gpu.command` 非空时直接返回 0 → 任一线程失败或缓冲损坏。D9 移除的
+      `stream_batch` 私有命令缓冲本是为解决此问题预留(从未实现)。详见 findings.md「新并发缺陷」。
+- [x] 验证:编译通过(严格 `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` 无警告);端到端
+      (256×256/1s/steps=4/seed 42/`--ssd-streaming`)产物 **193579 字节,与基线逐字节一致**,
+      120s(串行 VAE 解码仅轻微变慢),零报错。
+
+### Phase 18e: 修复 DiT int8 流式线程竞态(高·条件触发) — complete
+- [x] **根因**:`read_stream_layer`(流式线程)当 `gpu_work = int8_mlp || int8_qkv || int8_attention_out` 为真时,
+      在共享 `dit->gpu` 上执行 `h3_gpu_begin`(:1467) + 3×`h3_gpu_quantize_weight_int8`(:1472-1482) +
+      `h3_gpu_submit`(:1483),而主线程序发 `run_block`(:3571)与 `h3_gpu_submit`(:3588)使用同一命令缓冲。
+      两线程并发编码同一 `MTLCommandBuffer`(Metal 明确禁止)→ 数据竞争/崩溃。
+      `h3_gpu_begin`(h3_gpu.m:943)在 `gpu.command` 非空时直接 `return 0`,使流式线程复用主线已开缓冲并发编码。
+- [x] **修复**:采用「移到主线程」方案 —— 新增 `requant_stream_slot(dit, slot, error, error_size)` 在主线程
+      对刚流式加载的 slot 做 `h3_gpu_begin`+3×`h3_gpu_quantize_weight_int8`+`h3_gpu_submit`;`read_stream_layer`
+      删除全部 GPU requant 代码与 `gpu_work` 变量(现在流式线程只做 CPU 反量化 + LoRA 合并);主循环在
+      `pthread_join` 后、`stream_ready_slot` 更新前调用它(此时主线程独占 `dit->gpu`,无并发)。
+- [x] **运行时验证**:`fused_mlp=1`(默认)/`use_slower_bf16_mlp=0`(默认)/M4 `tensorOpsEnabled=true` → `int8_mlp=1`,
+      该路径在 M4 默认测试(`--ssd-streaming`)中实际运行;修复前后产物均 **193579 字节一致** → 串行 requant 正确。
+- [x] 编译:通过(严格 `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` 无警告);端到端 193579 字节,122s,零报错。
+
 ## Decisions Made
 | Decision | Rationale |
 |---|---|

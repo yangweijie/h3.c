@@ -125,17 +125,13 @@
 @property(nonatomic) double profileStartWall;
 @property(nonatomic) double profileMarkWall;
 @property(nonatomic) double commandStartWall;
-/* Cross-command-buffer visibility for SSD-streaming ConvRot dequant writes.
- * The streaming thread dequantizes on a private command buffer; the requant
- * kernels that consume those buffers run on the shared `command` buffer, so an
- * event is used to order them. */
+/* streamEvent is allocated (in h3_gpu init) for potential cross-command-buffer
+ * ordering of streamed weights; the streaming worker currently does only
+ * CPU-side weight dequant, so it is unused. The stream_batch /
+ * stream_batch_pending / streamEventValue properties were removed: they
+ * described a batched-stream dequant path that was never implemented (the
+ * worker shares the caller's command buffer instead). */
 @property(nonatomic, strong) id<MTLEvent> streamEvent;
-/* Batched streaming ConvRot dequant: the block's four sources are encoded
- * into one command buffer and committed together, so a block costs one
- * submit rather than four. NULL when no batch is open. */
-@property(atomic) id<MTLCommandBuffer> stream_batch;
-@property(atomic) int stream_batch_pending;
-@property(nonatomic) uint64_t streamEventValue;
 @end
 @implementation H3GPU
 @end

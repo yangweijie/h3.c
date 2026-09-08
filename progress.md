@@ -363,7 +363,22 @@
   排序路径 47 次 malloc → 1 次;单次版委托批量版,消除重复逻辑。
 - 验证:端到端产物 **193579 字节,与基线逐字节一致**,105s,零报错 ✅
 
-### 5-Question Reboot Check（更新至 Phase 18c 末）
+### Phase 18d: 审查后修复(B1 / D9 / B3 + 新并发缺陷) — complete
+- `h3_video_vae.c`:删除异步 VAE 预取线程(崩溃地雷,env 可触发)→ 串行 `load→run→free`;`B2` 禁用路径泄漏随之消除
+- `h3_gpu.m`:删除未实现且误导的 `stream_batch`/`stream_batch_pending`/`streamEventValue` 属性
+- `h3_dit.c`:修正 `read_stream_layer` 注释(`gpu_work` 非死变量,在 `:1467/1483` 用于 int8 流式 requant)
+- **新发现**:DiT 流式线程在 int8 启用时竞态共享 `dit->gpu` 命令缓冲(高·条件触发),`stream_batch` 私有缓冲本是其预留解但未实现
+- 验证:端到端产物 **193579 字节一致**,120s,零报错
+
+### Phase 18e: 修复 DiT int8 流式线程竞态(高·条件触发) — complete
+- `h3_dit.c`:新增 `requant_stream_slot()` 在主线程对刚流式加载的 slot 做 int8 GPU requant;`read_stream_layer`
+  (流式线程)删除全部 GPU requant 代码与 `gpu_work` 变量 → 流式线程完全不触碰共享 `dit->gpu`
+- 主循环在 `pthread_join` 后调用 `requant_stream_slot`,消除两线程并发编码同一 `MTLCommandBuffer` 的竞态
+- **运行时验证**:M4 上 `int8_mlp=1`(fused_mlp 默认开 + tensorOpsEnabled),`--ssd-streaming` 默认测试实际走该路径;
+  修复前后产物均 **193579 字节一致** → 修复正确且已验证
+- 编译通过(严格标志无警告);端到端 122s,零报错
+
+### 5-Question Reboot Check（更新至 Phase 18e 末）
 | Question | Answer |
 |---|---|
 | Where am I? | Phase 18 + 18b + 18c 完成:5 项高优先级 + 中低优先级(strdup/溢出) + 内存优化(run_stage 峰值 / gate_score 批量)全部修复验证通过 |
