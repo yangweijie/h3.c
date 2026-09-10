@@ -538,6 +538,9 @@ static int run_stage(audio_context *audio, audio_stage *stage, int index,
     size_t elements = (size_t)elements64;
     h3_gpu_tensor *upsampled = h3_gpu_tensor_new_f32(audio->gpu, elements);
     h3_gpu_tensor *sum = NULL, *work = NULL, *activated = NULL, *branch = NULL;
+    /* Declared before the failure branch: the `goto done` below skips the
+     * assignment further down, so `ok` must already be defined at the label. */
+    int ok = 0;
     if (!upsampled) {
         fail(error, error_size, "cannot allocate AudioVAE stage activations: %s",
              h3_gpu_error(audio->gpu));
@@ -547,12 +550,12 @@ static int run_stage(audio_context *audio, audio_stage *stage, int index,
      * allocating the block-loop tensors: the upsampled result is the loop's only
      * input from this stage, so keeping the (large) previous hidden state alive
      * alongside all five stage tensors would needlessly raise peak memory. */
-    int ok = gpu_op(audio, h3_gpu_begin(audio->gpu), error, error_size,
-                    "begin AudioVAE upsample") &&
-             run_conv(audio, upsampled, audio->hidden, &stage->upsample,
-                      input_length, error, error_size) &&
-             gpu_op(audio, h3_gpu_submit(audio->gpu), error, error_size,
-                    "submit AudioVAE upsample");
+    ok = gpu_op(audio, h3_gpu_begin(audio->gpu), error, error_size,
+                "begin AudioVAE upsample") &&
+         run_conv(audio, upsampled, audio->hidden, &stage->upsample,
+                  input_length, error, error_size) &&
+         gpu_op(audio, h3_gpu_submit(audio->gpu), error, error_size,
+                "submit AudioVAE upsample");
     if (ok) free_tensor(&audio->hidden);
     if (ok) {
         sum = h3_gpu_tensor_new_f32(audio->gpu, elements);
@@ -624,12 +627,17 @@ static int decode_output(audio_context *audio, h3_audio_waveform *output,
     audio_activation activation = {0};
     audio_conv post = {0};
     h3_gpu_tensor *activated = NULL, *waveform = NULL;
-    size_t hidden_elements = (size_t)STEREO * audio->length * 8;
-    size_t waveform_elements = (size_t)STEREO * audio->length;
-    if (audio->length > SIZE_MAX / ((size_t)STEREO * 8)) {
+    /* Compute in 64 bits first: `audio->length` is a uint32_t, so comparing it
+     * against SIZE_MAX / (STEREO * 8) was vacuously false on 64-bit targets and
+     * guarded nothing. */
+    uint64_t hidden_elements64 = (uint64_t)STEREO * audio->length * 8;
+    uint64_t waveform_elements64 = (uint64_t)STEREO * audio->length;
+    if (hidden_elements64 > SIZE_MAX) {
         fail(error, error_size, "audio length overflow");
         return 0;
     }
+    size_t hidden_elements = (size_t)hidden_elements64;
+    size_t waveform_elements = (size_t)waveform_elements64;
     int ok = load_activation(audio, &activation, "decoder.activation_post", 8,
                              error, error_size) &&
              load_normalized_conv(audio, &post, "decoder.conv_post", 8, 1, 7,

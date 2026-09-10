@@ -208,6 +208,55 @@
       该路径在 M4 默认测试(`--ssd-streaming`)中实际运行;修复前后产物均 **193579 字节一致** → 串行 requant 正确。
 - [x] 编译:通过(严格 `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` 无警告);端到端 193579 字节,122s,零报错。
 
+### Phase 19: 分支新代码审查 + 修复 6 项 — complete
+审查对象:`feature/lora-merge` 相对 `origin/main`(merge-base `92a932c`)的新增 C 代码,
+优先覆盖此前未审的 LoRA 合并链路与新的 `h3_superres`。
+- [x] 🔴 `h3_lora.c` 适配器名三入口不一致 → `h3_lora_apply` 硬编码 `"default"`,
+      而 `h3_lora_matches` / `h3_lora_merge_blocking` 用文件解析出的 adapter。
+      turbo-only 适配器被**静默跳过**;且常驻(`blocking=0`)与流式(`blocking=1`)路径结果不同。
+      修复:`h3_lora_apply` 改传 NULL 统一语义 + 头注释同步。
+- [x] 🔴 `h3_lora.c` 非阻塞分支 `h3_gpu_begin` 开的命令缓冲从未提交(GEAM 自建私有缓冲并等待),
+      失败时 `gpu.command` 永久非空 → 之后所有 GPU 阶段失败(全库无 `h3_gpu_discard`)。
+      修复:删除该 begin/submit 包装。
+- [x] 🟡 `h3_gpu.m`:`h3_gpu_lora_geam_bf16` 与 `..._blocking_...` 函数体逐行等价 → 改为转发,头注释合并。
+- [x] 🟡 `h3_lora.c`:分配前加 `SIZE_MAX` 溢出防护(含 `in_dim/rows == 0` 除零防护)。
+- [x] 🟡 `h3_lora.c`:`rank` 改为在 `dtype/ndim` 校验之后读取,并拒绝 `rank == 0`。
+- [x] 🟡 `h3_ffmpeg.c::h3_superres`:新增 `remove_tree()`(`/bin/rm` 绝对路径 + 失败告警)替换 5 处静默清理;
+      `waitpid` 非 EINTR 失败时 SIGKILL + 回收;`bin/mbin/mpar` 加 `snprintf` 截断检查。
+- [x] 核实为**非缺陷**(避免无效改动):`target_height % inner_h` 除零不可达
+      (`h3_ffprobe_visual_size` 已保证 ≥1);`enc_argv[40]` 实际最多用 31 项。
+- [x] 验证:`make -j8 h3 h3_lora_tests` 零新增警告;`h3_tests` 1768 checks、
+      `h3_lora_tests`(rel-L2 0.002844 与修复前一致)、`h3_audio_gpu_tests` 全绿。
+
+### Phase 20: 修复既有缺陷(编译警告暴露) — complete
+- [x] `h3_audio_vae.c::run_stage`:`int ok = …` 位于 `goto done` 之后 → 分配失败路径
+      `return` 未初始化值(`-Wsometimes-uninitialized`)。修复:`int ok = 0;` 提前到失败分支之前。
+- [x] `h3_audio_vae.c::decode_output`:`audio->length` 是 `uint32_t`,与 `SIZE_MAX/(STEREO*8)`
+      比较在 64 位下**恒为假**(该溢出检查实际无效)。修复:先按 `uint64_t` 计算再校验转 `size_t`。
+- [x] `tests/test_lora.c`:删除未使用的 `gpu` 形参(+4 处调用点)、删除格式不匹配且恒打印 0 的调试 `printf`。
+- [x] 验证:全量 `make -j8 all test` **0 warnings / 0 errors**;三个套件全绿,数值不变。
+
+### Phase 21: AudioVAE 端到端验证(官方权重)+ 失效断言修复 — complete
+- [x] 确认 `models/minimax-h3/FL2VA/*` 为符号链接;`audio_vae/model.safetensors` **1087 张量全 F32**
+      (非 int8/convrot 变体)
+- [x] 临时 harness 直连 `libh3.a`,用合成 latent 跑真实权重:2ch/29600/@32kHz、全 finite、
+      两次解码逐字节一致、136 convs、边界 latent 1→800 / 2→1600
+- [x] **发现失效断言**:`tests/test_real_audio_vae.c` 期望 `submissions == 16`,实跑 **23**。
+      推导:16 = 1 input + 7 stage-norm + 7 stage + 1 output;Phase 18c 的「上采样后立即 submit
+      并释放上一层 hidden」每 stage +1 → 7+16 = 23。→ 已修正断言并写明推导
+- [x] 未验证:与参考 oracle 的波形数值 parity(`misc/fixtures/h3_real_audio_vae_37.safetensors` 缺失);
+      刻意**未**用 native 输出反造 fixture(会使测试退化为自证)
+
+### Phase 22: 新增不依赖 fixture 的 AudioVAE 端到端测试 — complete
+- [x] 新增 `tests/test_real_audio_vae_e2e.c`:断言输出几何、全 finite、确定性(两次逐字节)、
+      分发结构(136 convs / 23 submissions,含推导注释)、最短合法 latent(1/2 帧)
+- [x] `Makefile`:新目标 `h3_real_audio_vae_e2e_test`、新变量 `AUDIO_VAE_MODEL ?= MiniMax-H3`,
+      接入 `make test`(仅需权重)、加入 `clean`
+- [x] `AGENTS.md` 登记该入口
+- [x] 验证:负例(错误模型路径)exit=1;默认 `make test` skip;
+      `make test AUDIO_VAE_MODEL=models/minimax-h3` 实际执行并通过
+- [ ] 待办(可选):把 `make test` 里 `h3_real_audio_vae_test` 的守卫路径也参数化到 `AUDIO_VAE_MODEL`
+
 ## Decisions Made
 | Decision | Rationale |
 |---|---|
@@ -218,6 +267,11 @@
 | 复用 `h3_weight_load_bf16` 已有的 I8 反量化，不为 VDN 另写加载器 | `load_tensor` 在 `dtype==I8` 且请求 BF16 时自动走 `load_int8_dequantized`（反量化 + convrot 反旋转）；其 scale 名规则 `"%s_scale"` 正好匹配 int8 文件的 `beta_proj.weight_scale`，故 VDN loader 本体零改动 |
 | VDN 线性分支只打开**单个**权重文件（候选名单） | int8 与 bf16 导出并存且张量同名，合并进同一 store 会让 `h3_weight_find` 命中排序靠前的那份，且白白映射 4.3 GB bf16 |
 | `to_out_linear` **不**改为常驻 | `H3_PROFILE` 实测 unhidden wait = 0.001s，I/O 已被计算完全掩盖；常驻省 0 秒却要 50×77MB = 3.85 GB |
+| LoRA 适配器名统一为「文件自带 adapter」 | 三个入口(`matches` / `merge_blocking` / `apply`)必须同源，否则 turbo-only 适配器被静默跳过；显式指定仍走 `h3_lora_apply_named` |
+| 删除 `lora_merge` 非阻塞分支的 `h3_gpu_begin/submit` | GEAM 已自建私有缓冲并等待；保留只会多一个失败点，并在失败时泄漏未提交的 `gpu.command`（全库无 discard API） |
+| `h3_gpu_lora_geam_bf16` 改为转发到 `..._blocking_...` | 两者函数体逐行等价，保留双份实现只会让修复必须改两处 |
+| AudioVAE 提交数断言取 **23** 而非 16 | 16 是 Phase 18c 之前的基线；每 stage 多一次「上采样后立即 submit」→ +7。结构变更时两处同时更新 |
+| 端到端测试做成**不依赖 fixture** 的版本 | fixture(MLX oracle)在本机缺失，导致整条 AudioVAE 断言长期 skip；新测试只依赖权重，改由几何/确定性/结构/边界兜底 |
 
 ## Errors Encountered
 | Error | Attempt | Resolution |
@@ -228,6 +282,9 @@
 | `H3_VDN_INT8=1` → `cannot stream DiT block 1: DiT stream begin failed: unknown Metal error`（13s 退出）| 1 | NAX tensor ops 是 M5 路径，M4 上强制开启会崩；本机不可用，回退 bf16 计算 |
 | 用户把 int8/bf16 两个文件对调（`model.safetensors`=int8，`model_bf32.safetensors`=bf16）导致同名张量重复进 store | 1 | 候选名单确定性单文件打开（见 Decisions）；已验证复现逐字节一致产物 |
 | 误判"steps=4 仍是黄糊"（只能看统计量、看不到图）| 1 | 用户肉眼确认 4 步有狐狸；统计指标（std/grad）不足以判断语义正确性，结论须以实际观看为准 |
+| 临时 harness 自加 `(void)next_value;`（误判为未使用参数，实际在用）| 1 | 直接重写该文件而非局部打补丁；临时程序也要编译告警零容忍 |
+| harness 断言 `submissions == 16` 失败 | 1 | 不是我的改动导致的：逐项推导出 16 + 7(STAGES) = 23，根因是 `tests/test_real_audio_vae.c` 的断言在 Phase 18c 后未同步 → 修正测试 |
+| AudioVAE 真实权重测试在 `make test` 中一直 skip | 1 | 守卫查 `MiniMax-H3/…`，实际权重在 `models/minimax-h3/…`；新增 `AUDIO_VAE_MODEL` 变量并让新测试可用它 |
 
 ## Notes
 - VDN 配置：chunk=5, radius=1（chunk 模式下 radius 为 chunk 跨度）、anchor_frames=both、
@@ -244,3 +301,11 @@
 - **最终结论：VDN 是叠加混合分支(窗口 softmax + 线性分支都跑),在当前 h3.c 实现下任何尺度都不能加速。**
   int8 线性分支接入是正确的,但它的定位是「质量特性」而非「加速特性」。
   详见 findings.md「INT8 线性分支 + 性能剖析 (2026-09-07)」。
+- **本机权重布局**：`models/minimax-h3/FL2VA/*` 是指向 `/Users/jay/h3_sys/MiniMax-H3-Convrot/…`、
+  `/Volumes/data/.lmstudio/models/…` 的符号链接；`audio_vae/model.safetensors` 为 577 MB / 1087 张量全 F32。
+- **AudioVAE 验证入口**：`./h3_real_audio_vae_e2e_test models/minimax-h3`（单跑）或
+  `make test AUDIO_VAE_MODEL=models/minimax-h3`（随套件）。不依赖 `misc/fixtures`；
+  与参考 oracle 的数值 parity 仍需 `misc/fixtures/h3_real_audio_vae_37.safetensors`。
+- **提交数/分发结构不变量**：AudioVAE 解码 = 136 MPS conv + 23 submissions
+  （23 = 1 input + 7 stage-norm + 7 stage + 1 output + 7 早提交，STAGES=7）。
+- 详细审查发现与推导见 findings.md「代码审查与修复 + AudioVAE 端到端验证 (2026-09-11 session)」。

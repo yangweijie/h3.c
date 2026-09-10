@@ -59,15 +59,17 @@ int h3_lora_matches(h3_lora *lora, const char *lora_prefix,
  * (q/k/v) can share one storage tensor (qkv_proj).
  *
  * The band is replaced by its old value plus the LoRA delta computed on the
- * GPU: delta = scale * (lora_B @ lora_A). Returns 0 on failure. */
+ * GPU: delta = scale * (lora_B @ lora_A). Merges whichever PEFT adapter name
+ * this file carries (see h3_lora_open), the same one h3_lora_matches() and
+ * h3_lora_merge_blocking() use. Returns 0 on failure. */
 int h3_lora_apply(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
                   const char *lora_prefix, const char *target,
                   size_t row0, size_t rows, size_t in_dim,
                   char *error, size_t error_size);
 
 /* Same merge with an explicit PEFT adapter name in the factor keys
- * ("...lora_A.<adapter>.weight"). "default" matches h3_lora_apply. VDN turbo
- * adapters store their factors under ".turbo". */
+ * ("...lora_A.<adapter>.weight"). VDN turbo adapters store their factors
+ * under ".turbo". */
 int h3_lora_apply_named(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
                         const char *lora_prefix, const char *target,
                         const char *adapter,

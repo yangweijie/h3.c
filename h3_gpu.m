@@ -5281,30 +5281,16 @@ static int require_lora_geam(H3GPU *gpu, h3_gpu_tensor *weight, size_t row0,
 int h3_gpu_lora_geam_bf16(h3_gpu *opaque, h3_gpu_tensor *weight, size_t row0,
                           const h3_gpu_tensor *a, const h3_gpu_tensor *bt,
                           uint32_t rows, uint32_t inner, uint32_t columns) {
-    H3GPU *gpu = GPU(opaque);
-    if (!gpu) return 0;
-    if (!require_lora_geam(gpu, weight, row0, a, bt, rows, inner, columns))
-        return 0;
-    /* Encode on a private command buffer. Using gpu.command here would race
-     * with an encoder the caller may already have open in the same buffer
-     * (e.g. the prime block during denoise), which fails Metal validation on
-     * commit. A dedicated buffer + wait matches the original begin/submit
-     * semantics with no performance regression. */
-    @autoreleasepool {
-        id<MTLCommandBuffer> command = [gpu.queue commandBuffer];
-        if (!encode_lora_geam(gpu, [command computeCommandEncoder], weight,
-                              row0, a, bt, rows, inner, columns)) return 0;
-        [command commit];
-        [command waitUntilCompleted];
-        if (command.status == MTLCommandBufferStatusError) {
-            h3_gpu_set_error(gpu, @"LoRA merge failed: %@",
-                             command.error.localizedDescription);
-            return 0;
-        }
-    }
-    return 1;
+    return h3_gpu_blocking_lora_geam_bf16(opaque, weight, row0, a, bt, rows,
+                                          inner, columns);
 }
 
+/* Both LoRA GEAM entry points share this implementation: the merge always runs
+ * on a private, immediately-waited command buffer. Using gpu.command here would
+ * race with an encoder the caller may already have open in the same buffer
+ * (e.g. the prime block during denoise), which fails Metal validation on
+ * commit. A dedicated buffer + wait matches the original begin/submit
+ * semantics with no performance regression. */
 int h3_gpu_blocking_lora_geam_bf16(h3_gpu *opaque, h3_gpu_tensor *weight,
                                    size_t row0, const h3_gpu_tensor *a,
                                    const h3_gpu_tensor *bt, uint32_t rows,

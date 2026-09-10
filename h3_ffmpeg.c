@@ -770,8 +770,12 @@ static int run_command(char *const argv[], char *error, size_t error_size) {
     int status = 0;
     while (waitpid(child, &status, 0) < 0) {
         if (errno == EINTR) continue;
+        int wait_error = errno;
+        /* Never leave the child unreaped on an unexpected waitpid failure. */
+        kill(child, SIGKILL);
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
         fail(error, error_size, "cannot wait for %s: %s", argv[0],
-             strerror(errno));
+             strerror(wait_error));
         return -1;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -780,6 +784,15 @@ static int run_command(char *const argv[], char *error, size_t error_size) {
         return -1;
     }
     return 0;
+}
+
+/* Best-effort removal of the super-resolution scratch tree. It can hold tens of
+ * gigabytes of PNG frames, so a failure is reported instead of being silently
+ * dropped; the caller's error buffer is left untouched. */
+static void remove_tree(const char *path) {
+    char *const argv[] = {"/bin/rm", "-rf", (char *)path, NULL};
+    if (run_command(argv, NULL, 0) != 0)
+        fprintf(stderr, "warning: cannot remove SR work dir %s\n", path);
 }
 
 int h3_superres(const char *input_path, const char *output_path,
@@ -798,15 +811,24 @@ int h3_superres(const char *input_path, const char *output_path,
     if (scale > 4) scale = 4;
 
     char bin[PATH_MAX];
-    snprintf(bin, sizeof(bin), "%s/realesrgan-ncnn-vulkan", sr_bin_dir);
+    if (snprintf(bin, sizeof(bin), "%s/realesrgan-ncnn-vulkan", sr_bin_dir) >=
+        (int)sizeof(bin)) {
+        fail(error, error_size, "super-resolution binary directory is too long");
+        return 0;
+    }
     if (access(bin, X_OK) != 0) {
         fail(error, error_size, "realesrgan binary not executable: %s (%s)",
              bin, strerror(errno));
         return 0;
     }
     char mbin[PATH_MAX], mpar[PATH_MAX];
-    snprintf(mbin, sizeof(mbin), "%s/%s.bin", sr_model_dir, sr_model_name);
-    snprintf(mpar, sizeof(mpar), "%s/%s.param", sr_model_dir, sr_model_name);
+    if (snprintf(mbin, sizeof(mbin), "%s/%s.bin", sr_model_dir, sr_model_name) >=
+            (int)sizeof(mbin) ||
+        snprintf(mpar, sizeof(mpar), "%s/%s.param", sr_model_dir,
+                 sr_model_name) >= (int)sizeof(mpar)) {
+        fail(error, error_size, "super-resolution model directory is too long");
+        return 0;
+    }
     if (access(mbin, R_OK) != 0 || access(mpar, R_OK) != 0) {
         fail(error, error_size, "realesrgan model missing: %s / %s", mbin, mpar);
         return 0;
@@ -844,7 +866,7 @@ int h3_superres(const char *input_path, const char *output_path,
     snprintf(outdir, sizeof(outdir), "%s/out", tmp);
     if (mkdir(indir, 0755) != 0 || mkdir(outdir, 0755) != 0) {
         fail(error, error_size, "cannot create SR work dirs: %s", strerror(errno));
-        run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+        remove_tree(tmp);
         return 0;
     }
 
@@ -856,7 +878,7 @@ int h3_superres(const char *input_path, const char *output_path,
         frame_pattern, NULL
     };
     if (run_command(extract_argv, error, error_size) != 0) {
-        run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+        remove_tree(tmp);
         return 0;
     }
 
@@ -867,7 +889,7 @@ int h3_superres(const char *input_path, const char *output_path,
         "-s", scale_buf, "-m", (char *)sr_model_dir, "-j", "1:2:2", NULL
     };
     if (run_command(sr_argv, error, error_size) != 0) {
-        run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+        remove_tree(tmp);
         return 0;
     }
 
@@ -888,7 +910,7 @@ int h3_superres(const char *input_path, const char *output_path,
             "-i", out_pattern, "-vf", scale_filter, resize_pattern, NULL
         };
         if (run_command(resize_argv, error, error_size) != 0) {
-            run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+            remove_tree(tmp);
             return 0;
         }
         frames_for_encode = resize_pattern;
@@ -914,6 +936,6 @@ int h3_superres(const char *input_path, const char *output_path,
     enc_argv[next++] = (char *)output_path;
     enc_argv[next] = NULL;
     int ok = run_command(enc_argv, error, error_size) == 0;
-    run_command((char *[]){"rm", "-rf", tmp, NULL}, NULL, 0);
+    remove_tree(tmp);
     return ok;
 }

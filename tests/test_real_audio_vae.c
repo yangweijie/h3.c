@@ -75,8 +75,12 @@ int main(int argc, char **argv) {
            (unsigned long long)got.gpu_stats.submissions);
     if (maximum >= 1e-3 || relative_l2 >= 0.05)
         die("native AudioVAE exceeds MLX parity bound");
+    /* 16 baseline submissions = 1 input + 7 stage-normalization + 7 stage +
+     * 1 output. run_stage additionally submits right after the upsample (and
+     * drops the previous hidden state there) to lower peak memory, which adds
+     * one submission per stage: 7 + 16 = 23. */
     if (got.gpu_stats.mps_conv_dispatches != 136 ||
-        got.gpu_stats.submissions != 16)
+        got.gpu_stats.submissions != 23)
         die("native AudioVAE dispatch structure changed unexpectedly");
 
     h3_audio_waveform_free(&got);

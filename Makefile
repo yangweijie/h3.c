@@ -20,6 +20,9 @@ QWEN4B ?= /Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct
 PROJ    ?= /Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3
 CLIPPROJ_MODEL ?= /Volumes/data/.lmstudio/models/MiniMax-H3
 CLIPPROJ_PROMPT ?= A red fox walking through snow
+# Released model root for the weights-only AudioVAE end-to-end test. Point this
+# at the checkpoint tree, e.g. `make test AUDIO_VAE_MODEL=models/minimax-h3`.
+AUDIO_VAE_MODEL ?= MiniMax-H3
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
@@ -58,6 +61,9 @@ h3_convrot_test: tests/test_convrot_unrotate.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_audio_vae_e2e_test: tests/test_real_audio_vae_e2e.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_encoder_test: tests/test_real_audio_encoder.o $(LIB_OBJ)
@@ -128,7 +134,8 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
-	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_vae_e2e_test \
+	h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test \
@@ -160,6 +167,11 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		./h3_real_audio_vae_test; \
 	else \
 		echo "skip: released AudioVAE weights/fixture are not installed"; \
+	fi
+	@if test -f $(AUDIO_VAE_MODEL)/FL2VA/audio_vae/model.safetensors; then \
+		./h3_real_audio_vae_e2e_test $(AUDIO_VAE_MODEL); \
+	else \
+		echo "skip: released AudioVAE weights are not installed"; \
 	fi
 	@if test -f MiniMax-H3/FL2VA/audio_vae/model.safetensors && \
 	         test -f misc/fixtures/h3_real_audio_encoder_64000.safetensors; then \
@@ -241,7 +253,8 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
-		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+		h3_audio_gpu_tests h3_real_audio_vae_test \
+		h3_real_audio_vae_e2e_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \

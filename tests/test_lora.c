@@ -53,7 +53,7 @@ static float bf16_to_f32(uint16_t value) {
     return result;
 }
 
-static int compare(const char *tag, h3_gpu *gpu, h3_gpu_tensor *weight,
+static int compare(const char *tag, h3_gpu_tensor *weight,
                    const char *expected_path, size_t rows, size_t columns) {
     size_t elements = rows * columns;
     uint16_t *expected = read_bin(expected_path, NULL);
@@ -101,8 +101,7 @@ int main(void) {
                                  error, sizeof(error));
     check(lora != NULL, "open synthetic LoRA");
     if (!lora) return 1;
-    printf("lora rank=%zu scale=%.4f\n", lora ? 0 : 0, 0.0);
-    /* (rank/scale are private; the merge result proves them.) */
+    /* rank/scale are private; the merge result below proves them. */
 
     /* qkv: three row bands from to_q/to_k/to_v. */
     {
@@ -121,7 +120,7 @@ int main(void) {
                             "attn.to_v", 2 * INNER, INNER, columns,
                             error, sizeof(error)),
               "apply qkv LoRA bands");
-        compare("qkv", gpu, weight, "tmp_lora_test/w_qkv_expected.bin",
+        compare("qkv", weight, "tmp_lora_test/w_qkv_expected.bin",
                 rows, columns);
         h3_gpu_tensor_free(weight);
         free(init);
@@ -136,7 +135,7 @@ int main(void) {
                             "attn.to_out.0", 0, rows, columns,
                             error, sizeof(error)),
               "apply out_proj LoRA");
-        compare("out", gpu, weight, "tmp_lora_test/w_out_expected.bin",
+        compare("out", weight, "tmp_lora_test/w_out_expected.bin",
                 rows, columns);
         h3_gpu_tensor_free(weight);
         free(init);
@@ -150,7 +149,7 @@ int main(void) {
                             "ff.net.0.proj", 0, rows, columns,
                             error, sizeof(error)),
               "apply fc1 LoRA");
-        compare("fc1", gpu, weight, "tmp_lora_test/w_fc1_expected.bin",
+        compare("fc1", weight, "tmp_lora_test/w_fc1_expected.bin",
                 rows, columns);
         h3_gpu_tensor_free(weight);
         free(init);
@@ -164,7 +163,7 @@ int main(void) {
                             "ff.net.2", 0, rows, columns,
                             error, sizeof(error)),
               "apply fc2 LoRA");
-        compare("fc2", gpu, weight, "tmp_lora_test/w_fc2_expected.bin",
+        compare("fc2", weight, "tmp_lora_test/w_fc2_expected.bin",
                 rows, columns);
         h3_gpu_tensor_free(weight);
         free(init);

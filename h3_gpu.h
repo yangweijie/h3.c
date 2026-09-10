@@ -771,7 +771,10 @@ int h3_gpu_vdn_alpha(h3_gpu *gpu, h3_gpu_tensor *alpha,
 /* Run a BF16 linear on a private, immediately-committed command buffer.
  * Background threads (SSD prefetch) use this so they never touch the main
  * thread's open command buffer. */
-/* Fused LoRA delta merge: C[row0 + r, c] += sum_k A[r,k] * BT[c,k]. */
+/* Fused LoRA delta merge: C[row0 + r, c] += sum_k A[r,k] * BT[c,k].
+ * Both entry points share one implementation: the merge runs on a private,
+ * immediately-waited command buffer, so a background (SSD prefetch) caller
+ * never touches the main thread's open command buffer. */
 int h3_gpu_lora_geam_bf16(h3_gpu *gpu, h3_gpu_tensor *weight, size_t row0,
                           const h3_gpu_tensor *a, const h3_gpu_tensor *bt,
                           uint32_t rows, uint32_t inner, uint32_t columns);

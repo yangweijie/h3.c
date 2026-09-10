@@ -615,3 +615,92 @@ int h3_dit_schedule_gate_scores(const h3_dit_schedule *schedule,
 |---|---|
 | 编译 | ✅ 通过(严格 `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` 无警告,binary 664672 bytes) |
 | 端到端(256×256/1s/steps=4/seed 42/`--ssd-streaming`) | ✅ **193579 字节,与基线逐字节一致**,120s(串行 VAE 解码仅轻微变慢),零报错/崩溃 |
+
+# 分支新代码审查 + AudioVAE 端到端验证 (2026-09-11 session)
+
+审查对象:`feature/lora-merge` 相对 `origin/main`(merge-base `92a932c`)的新增 C 代码,
+优先覆盖此前未审的 LoRA 合并链路(`h3_lora.c` / `h3_gpu.m` 的 LoRA GEAM / 调用点)与新的 `h3_superres`。
+
+## LoRA 合并链路
+
+### 适配器名三入口不一致 → turbo 适配器静默跳过(🔴,已修)
+- `h3_lora_matches()` 用文件解析出的 `lora->adapter`;`h3_lora_merge_blocking()` 传 `NULL` 回落
+  `lora->adapter`;而 `h3_lora_apply()` **硬编码 `"default"`**。
+- `lora_merge()` 在因子缺失时 `return 1` 是**合法 no-op**(VDN 的 6 个 target 里 `attn.to_q` 与
+  `attn.orig.to_q` 必然只有一个存在),所以「找不到」是**静默**的。
+- 后果链(真实可触发):turbo LoRA 的键是 `...lora_A.turbo.weight`;
+  `merge_adaln_loras()`(`h3_dit_schedule.c:429-437`)先用 `matches`(turbo 命中 → 通过并 **无告警**),
+  再用 `apply`(查 `default` → 查不到 → `return 1`)→ **turbo 的 AdaLN/final-layer 适配被丢弃且无提示**。
+- 另有路径分叉:常驻加载 `h3_dit.c:885` 传 `blocking=0`(走 `h3_lora_apply`),流式 `h3_dit.c:1501`
+  传 `blocking=1`(走 `h3_lora_merge_blocking`)→ 同一份 LoRA 在 `--ssd-streaming` 与非流式下**权重不同**。
+- 修法:`h3_lora_apply` 改传 `NULL`(与另两入口统一);显式指定 adapter 仍用 `h3_lora_apply_named`。
+- 教训:同一语义若有多个人口,解析规则必须**同源**;「静默 no-op」与「条件跳过」不能共用一个返回值。
+
+### `h3_gpu_begin` 命令缓冲泄漏(🔴,已修)
+- `h3_lora.c` 非阻塞分支:`h3_gpu_begin` → `h3_gpu_lora_geam_bf16` → `h3_gpu_submit`,
+  但该 GEAM **自建私有 command buffer 并 `waitUntilCompleted`**,根本不使用 `gpu.command`。
+- 失败时跳过 `h3_gpu_submit` → `gpu.command` 永不置空;而 `h3_gpu_begin`(h3_gpu.m:939)首行
+  `if (!gpu || gpu.command || gpu.inflightCommands.count) return 0;` → 之后**所有** GPU 阶段失败,
+  真实根因被 「cannot create Metal command buffer」掩盖。全库确认**没有** `h3_gpu_discard/abort` API
+  可用于放弃已开缓冲。
+- 且 `h3_gpu_begin` 本身可能失败(调用方已持有 open 编码器,如 denoise prime block)——正是该函数注释
+  自己描述的场景 → 把本可成功的 LoRA 合并误报为失败。
+- 修法:删除该 begin/submit 包装(GEAM 自带等待语义)。
+
+### 重复实现(🟡,已修)
+- `h3_gpu_lora_geam_bf16` 与 `h3_gpu_blocking_lora_geam_bf16` 函数体**逐行等价**(仅错误串不同),
+  但头文件把它们描述成两种语义 → `h3_lora.c` 的 `blocking` 开关实际没有区别,且任何修复要改两处。
+- 修法:后者保留为实现,前者改为转发;注释合并到保留实现上。
+
+### 防护性补充(🟡,已修)
+- `h3_lora.c`:`rank*in_dim` / `rows*rank` / `in_dim*rank` 三个分配大小加 `SIZE_MAX` 防护
+  (并先排除 `in_dim/rows == 0` 以防止新增检查自身除零);`rank` 改为在 `dtype/ndim` 校验之后读取并拒绝 `rank==0`。
+- `h3_ffmpeg.c::h3_superres`:新增 `remove_tree()`(`/bin/rm` 绝对路径 + 失败 `fprintf` 告警)替换
+  5 处静默 `rm -rf`(临时目录可含数十 GB PNG 帧);`waitpid` 非 EINTR 失败时 SIGKILL + 回收(避免孤儿);
+  `bin/mbin/mpar` 三处 `snprintf` 加截断检查(`indir/outdir` 由 `mkdtemp` 生成、长度有界 → 未加,避免死代码)。
+
+### 核实为「非缺陷」(避免无效改动)
+- `h3_superres` 的 `target_height % inner_h` 看似可能除零 **不可达**:
+  `h3_ffprobe_visual_size` 成功返回前强制 `parsed_width >= 1 && parsed_height >= 1`(h3_ffmpeg.c:144-148)。
+- `h3_ffmpeg.c` 的 `enc_argv[40]` 最多用 31 项(含 NULL),无数组越界。
+- `lora_merge` 的三条失败路径与成功路径都正确释放 host 缓冲与两个 GPU 张量 →
+  **无泄漏 / 无 double-free**;`h3_lora_geam_bf16` 内核的 tile 装载、`fma` 索引与两处 barrier 均正确
+  (无早退,`row/column` 边界齐备)。
+
+## AudioVAE:submissions 计数推导(解释一条失效断言)
+- `tests/test_real_audio_vae.c` 原断言 `submissions != 16`;用官方权重实跑得 **23**。
+- 推导:`16 = 1`(`submit AudioVAE input`)+ `7`(`submit AudioVAE stage normalization`,STAGES=7)
+  + `7`(`submit AudioVAE stage`)+ `1`(`submit AudioVAE output`);
+  Phase 18c 的内存优化在上采样后**立即 submit 并释放上一层 hidden**(h3_audio_vae.c:557)
+  → 每 stage +1 → **16 + 7 = 23**。MPS conv 数 **136 不变**。
+- 结论:`+7` 是**有意**优化,断言未同步 → 已改为 23 并把推导写进注释。
+- 教训:断言里的魔法数字必须可推导(注释写清来源),否则一次内存优化就会让它失效;
+  而该测试因 fixture 缺失长期 skip,失效很久未被发现。
+
+## 本地权重与验证入口事实
+- `models/minimax-h3/FL2VA/*` 是指向 `/Users/jay/h3_sys/MiniMax-H3-Convrot/…`、`/Volumes/data/.lmstudio/models/…` 的**符号链接**。
+- `audio_vae/model.safetensors`(577 MB)**1087 个张量全 F32**,不是 int8/convrot 变体
+  → 解码不会引入额外反量化提交(已排除"23 来自反量化"的假设)。
+- 仍缺 `misc/fixtures/h3_real_audio_vae_37.safetensors`(MLX oracle)→ **数值 parity 未验证**;
+  刻意**未**用 native 输出反造 fixture(那会让测试退化为只验确定性 = 自证)。
+- `make test` 的守卫查 `MiniMax-H3/…`,与实际 `models/minimax-h3/…` 不符 → 相关条目默认 skip;
+  新测试改用 `AUDIO_VAE_MODEL ?= MiniMax-H3` 变量(`make test AUDIO_VAE_MODEL=models/minimax-h3`)。
+
+## 实测数据(AudioVAE e2e,合成 latent,官方权重)
+| 项 | 值 |
+|---|---|
+| 形状 | 2ch / 29600 samples @ 32000 Hz(latent 37)|
+| 统计 | peak 0.333697,rms 0.0532564,全 finite |
+| 资源 | 0.543 GiB,0.053 GPU s |
+| 结构 | 136 MPS conv,23 submissions |
+| 确定性 | 两次解码**逐字节一致** |
+| 边界 | latent 1 → 800 samples、latent 2 → 1600 samples(覆盖 `input_length-1==0`)|
+
+## 既有缺陷(编译警告暴露,已修)
+- `h3_audio_vae.c::run_stage`:`int ok = …` 位于 `goto done` **之后** → 分配失败时 `return` 未初始化值
+  (`-Wsometimes-uninitialized`)。修法:`int ok = 0;` 提到失败分支之前。
+- `h3_audio_vae.c::decode_output`:`audio->length` 是 `uint32_t`,与 `SIZE_MAX/(STEREO*8)` 比较在 64 位下
+  **恒为假** → 该溢出检查**实际无效**(Phase 18 的修复选错了比较对象)。
+  修法:先按 `uint64_t` 计算 `hidden_elements64` 再校验 `> SIZE_MAX` 后转 `size_t`(与 `run_stage` 既有写法一致)。
+  → 再次印证:修复溢出检查时要选**与被乘数实际宽度匹配**的上界,否则只是"看起来有检查"。
+- `tests/test_lora.c`:未使用的 `gpu` 形参 + `printf("%zu", lora ? 0 : 0)` 格式不匹配且恒打印 0(已删)。

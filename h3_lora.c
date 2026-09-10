@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -170,8 +171,11 @@ int h3_lora_apply(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
                   const char *lora_prefix, const char *target,
                   size_t row0, size_t rows, size_t in_dim,
                   char *error, size_t error_size) {
-    return h3_lora_apply_named(gpu, lora, weight, lora_prefix, target,
-                               "default", row0, rows, in_dim, error, error_size);
+    /* NULL falls back to the adapter name this file actually carries, matching
+     * h3_lora_matches() and h3_lora_merge_blocking(). A hard-coded "default"
+     * silently skipped turbo-only adapters (whose keys end in .turbo). */
+    return lora_merge(gpu, lora, weight, lora_prefix, target, NULL, row0,
+                      rows, in_dim, 0, error, error_size);
 }
 
 int h3_lora_apply_named(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
@@ -217,10 +221,13 @@ static int lora_merge(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
     const h3_st_tensor *a = h3_st_find(&lora->header, key_a);
     const h3_st_tensor *b = h3_st_find(&lora->header, key_b);
     if (!a || !b) return 1;   /* target not covered by this LoRA */
-    size_t rank = (size_t)a->shape[0];
     if (a->dtype != H3_DTYPE_BF16 || b->dtype != H3_DTYPE_BF16 ||
-        a->ndim != 2 || b->ndim != 2 ||
-        (size_t)a->shape[1] != in_dim ||
+        a->ndim != 2 || b->ndim != 2) {
+        fail(error, error_size, "LoRA %s is not a 2-D BF16 factor pair", key_a);
+        return 0;
+    }
+    size_t rank = (size_t)a->shape[0];
+    if (!rank || (size_t)a->shape[1] != in_dim ||
         (size_t)b->shape[0] != rows || (size_t)b->shape[1] != rank) {
         fail(error, error_size,
              "LoRA %s shape mismatch: A=[%llu,%llu] B=[%llu,%llu], "
@@ -232,6 +239,14 @@ static int lora_merge(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
         return 0;
     }
     char detail[512];
+    /* rank/in_dim/rows come from the file's declared shapes: reject any product
+     * whose BF16 byte count would wrap size_t before allocating. */
+    if (!in_dim || !rows ||
+        rank > (SIZE_MAX / sizeof(uint16_t)) / in_dim ||
+        rank > (SIZE_MAX / sizeof(uint16_t)) / rows) {
+        fail(error, error_size, "LoRA factor dimensions overflow");
+        return 0;
+    }
     uint16_t *a_bf16 = malloc(rank * in_dim * sizeof(uint16_t));
     uint16_t *b_bf16 = malloc(rows * rank * sizeof(uint16_t));
     uint16_t *at_bf16 = malloc(in_dim * rank * sizeof(uint16_t));
@@ -272,11 +287,14 @@ static int lora_merge(h3_gpu *gpu, h3_lora *lora, h3_gpu_tensor *weight,
                                             (uint32_t)rows, (uint32_t)rank,
                                             (uint32_t)in_dim);
     } else if (ok) {
-        ok = h3_gpu_begin(gpu);
-        if (ok) ok = h3_gpu_lora_geam_bf16(gpu, weight, row0, b_t, at_t,
-                                           (uint32_t)rows, (uint32_t)rank,
-                                           (uint32_t)in_dim);
-        if (ok) ok = h3_gpu_submit(gpu);
+        /* Both GEAM entry points own a private, immediately-waited command
+         * buffer, so opening the caller's buffer here would only add a failure
+         * mode (h3_gpu_begin fails when an encoder is already open) and, on
+         * failure, leak an unsubmitted gpu.command that breaks every later GPU
+         * stage. */
+        ok = h3_gpu_lora_geam_bf16(gpu, weight, row0, b_t, at_t,
+                                   (uint32_t)rows, (uint32_t)rank,
+                                   (uint32_t)in_dim);
     }
     h3_gpu_tensor_free(b_t);
     h3_gpu_tensor_free(at_t);
