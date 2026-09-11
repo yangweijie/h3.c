@@ -621,6 +621,40 @@ interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
 
+#### Streamed DiT weight prefetch (opt-in)
+
+The `--ssd-streaming` reader is a single thread that preads a block's int8
+weights and then runs the ConvRot Walsh-Hadamard un-rotate on the CPU. Those two
+phases used to run back to back, so their costs simply added up: at 256x256 the
+read took 17.6 s and the un-rotate 16.0 s out of a 33.6 s stream, and the main
+thread spent 19.9 s of a 33.2 s denoise blocked on the join. Setting
+`H3_DIT_STREAM_WORKERS=2` splits each block into 1024-row chunks, spreads them
+over two workers, and runs each worker's reader thread against its un-rotator.
+`H3_DIT_STREAM_PIPELINE` overrides just the overlap (`0` keeps the split
+without the reader thread, `1` gives the pipeline without the split).
+
+It is opt-in because it only pays while this prefetch is on the critical path.
+Measured against the previous binary on the same M4/16 GB machine, same seed,
+byte-identical output:
+
+| canvas | previous binary | `H3_DIT_STREAM_WORKERS=2` |
+| --- | --- | --- |
+| 256x256 | 33.1 s | **19.8 s (1.67x)** |
+| 384x384 | 33.9 s | **26.7 s (1.27x)** |
+| 512x512 | 47.7 s | 47.5 s |
+| 864x480 | 78.9 s | 77.6 s |
+
+With the variables unset the engine reproduces the previous binary exactly: the
+512x512 pair measured 47.588 s against 47.653 s back to back (inside run
+variance), and every comparison above produced byte-identical output.
+
+From 512x512 up the reported unhidden wait is already 0.001 s: the GPU hides the
+whole prefetch, so the extra threads only compete for memory bandwidth and the
+split becomes a wash. Note that the engine's own defaults (864x480, 56 frames,
+20 steps) sit in that region. The crossover moves with the machine's
+GPU-to-disk ratio -- a faster GPU or a slower SSD pushes it lower, and a machine
+that can keep the model resident never streams at all.
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and

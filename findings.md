@@ -861,3 +861,265 @@ ComfyUI 跑 `H3_BinaryT2V` 产出的视频与提示词毫无关系，画面像�
 - ComfyUI 会给 `seed` 自动追加 `control_after_generate` 控件（中文界面显示「生成后控制」，
   值 `randomize/fixed/…`），**不是**自定义节点定义的控件，勿据此误判节点版本。
 - 「引擎参数校验非空」拦不住此类错误：prompt 非空（是 info 文本），故生成照常进行。
+
+# Metal 编译缓存调研 (2026-09-12)
+
+## h3.c 现状（源码级确认）
+- `h3_gpu_create()`（`h3_gpu.m:338-550`）流程：读 `h3_shaders.metal` → 构造
+  `MTLCompileOptions`（`mathMode = MTLMathModeSafe`，可选宏 `H3_METAL_HAS_TENSOR`）→
+  `newLibraryWithSource` → 逐个 `newFunctionWithName` + `newComputePipelineStateWithFunction`
+  建 ~63 个 pipeline。TensorOps 编译失败会**回退重编一次**（不带宏）。
+- **无任何持久化**：全库无 `MTLBinaryArchive` / `newLibraryWithFile` / `metallib` /
+  `newDefaultLibrary`。`gpu.pipelines` 是普通 `NSDictionary`，每次 create 全量重建。
+- **同进程重复编译 7 处**：`h3_dit.c:2556`、`h3_text_encoder.c:520/1064`、
+  `h3_video_vae.c:1029/1174/1334`、`h3_audio_vae.c:708/1322`、`h3_video_encoder.c:768`。
+- **唯一查询入口**是 `h3_gpu_pipeline(gpu, name)`（`h3_gpu.m:249`）→ 所有 dispatch 都经它，
+  因此 lazy 化只需改这一个函数（外加 create 里的 eager 循环）。
+- **线程安全隐含约束**：LoRA 流式合并在 SSD 预读线程上跑
+  （`h3_gpu_blocking_lora_geam_bf16`），所以 `h3_gpu_pipeline` 可能被后台线程调用 →
+  lazy 缓存必须加锁（不能沿用「建好后只读」的无锁假设）。
+- `h3_gpu_free`（`h3_gpu.m:552`）会把 `library` / `pipelines` 逐个置 nil →
+  共享模块必须自己持有 library 所有权，不能依赖 H3GPU 实例存活。
+- 调用点 7 处但**实际一次典型 T2VA 跑几次**需实测（DiT 1 + 文本编码器 1~2 + video VAE 1 +
+  audio VAE 1，video encoder 仅 Ref2VA 用）。
+
+## DeepJIT 可借鉴点
+- cache key = 源码 + 追踪的 include 树 + 编译器版本 + 有效编译选项 + 应用提供的依赖签名
+- 两级缓存（进程内 + 磁盘）；lazy init 延迟设备/编译器发现
+- 磁盘条目用「唯一临时目录 + fsync + 原子 rename」发布，支持多用户/多进程共享同一 cache
+→ h3 对应物：源码内容 hash、macOS 版本 + `device.name`（registryID）、`H3_METAL_HAS_TENSOR` 宏状态。
+→ Metal 侧实现路径：进程内静态模块缓存（改动 1）+ `MTLBinaryArchive`（改动 2）。
+
+## 预期与风险（待实测修正）
+- 改动 1 收益明确（消除 N-1 次源码编译），风险低。
+- 改动 2 需实测：`MTLBinaryArchive` 主要省 **pipeline 链接/后端编译**，
+  **未必省 `newLibraryWithSource` 的 front-end 源码编译** → 若实测无收益则弃用并记录。
+- 改动 3 若 pipeline 构建本身耗时小，收益有限；反之可考虑提升为进程级共享。
+
+## 实测结果（判决性）：假设被推翻
+
+### 微基准 `./h3_metal_bench`（同进程连续建上下文）
+| 场景 | library（源码→MTLLibrary） | pipelines（86 个） | 单次合计 |
+|---|---|---|---|
+| 暖缓存（既有源码） | 0.001–0.003 s | 0.001–0.005 s | **~5 ms** |
+| **冷缓存**（`cp` 到 /tmp 后追加一行注释 → 内容变化） | **0.226 s** | 0.002 s | ~0.23 s |
+| 对同一份「冷」源码**再跑一次** | 0.001 s | 0.002 s | ~3 ms |
+| 进程内第 0 个上下文（含设备初始化） | — | — | 31–51 ms（一次性，与源码无关） |
+
+**机制确认**：Metal 有**系统级、按源码内容命中**的 shader 缓存
+（`/private/var/folders/f8/…/C/com.apple.metal`）。同内容第二次编译 0.226 s → 0.001 s。
+「86 个 pipeline 只要 2 ms」也说明后端编译被驱动延后/缓存，不是我们在付钱。
+
+### 真实引擎跑（`H3_PROFILE=1 ./h3 -d models/minimax-h3 -p "…" --width 256 --height 256 --seconds 0.5 --steps 2`）
+```
+count=4   # 一次 T2V 只创建 4 个 Metal 上下文
+shader-build  wall=0.013s library=0.005s pipelines=0.007s kernels=86   # 第 1 个
+shader-build  wall=0.005s library=0.003s pipelines=0.002s kernels=86
+shader-build  wall=0.003s library=0.001s pipelines=0.002s kernels=86
+shader-build  wall=0.002s library=0.001s pipelines=0.001s kernels=86
+合计 = 23 ms   而同一个 run 的 H3 DiT total wall = 34.680s
+```
+
+### 结论
+- 三项改动（共享 MTLLibrary / MTLBinaryArchive / lazy pipeline）上限收益 **≈10–15 ms 每次运行（0.04%）**，
+  整机冷缓存时也只有一次性 ~0.9 s。**全部不做。**
+- **DeepJIT 的磁盘缓存不可移植到 Metal**：CUDA 没有系统级 shader 缓存，Metal 有。
+  自己再实现一层 `MTLBinaryArchive` 只是重复 OS 已有机制。
+- 该结论**仅在 macOS + Metal 成立**；若将来出现非 Apple 后端（如 CUDA/Vulkan），可重新评估。
+- 顺带观察（本次 profile，M4 / 256×256 / 2 steps）：DiT `wait=13.244s`、`root-gpu=2.992s`、
+  `encode=0.132s` → **GPU 实际计算只占 3s**，而 wall 34.7s 里大半是 I/O 等待与主机侧编排。
+  真正值得优化的是这里，不是 shader 编译。
+
+# 新目标：DiT 去噪的流式权重管线 (2026-09-12)
+
+## 实测 breakdown（M4 / 256×256 / 0.5s / steps=2 / 自动内存规划 → SSD 流式）
+```
+Euler denoise wall = 33.189 s
+  wait (GPU)       = 13.178 s
+  root-gpu         =  2.909 s   ← GPU 实际计算只占 8.8%
+  encode           =  0.064 s
+BF16 SSD stream 36.248 GiB in 33.569 s (1.080 GiB/s)
+  unhidden wait    = 19.945 s   ← 主线程阻塞在 pthread_join(prefetch)，占去噪 60%
+  pread            = 17.568 s   (52%)
+  cpu-unrotate     = 16.000 s   (48%)
+```
+**17.568 + 16.000 = 33.568 s == `stream_read_seconds`** → 单线程内「读盘 → CPU 反旋转」**严格串行**，
+零重叠。这就是全部问题。
+
+## 结构事实（源码级）
+- `read_stream_layer`（`h3_dit.c:1379`）每 block 处理 ~4 个 source（qkv/out/fc1/fc2），逐个：
+  `load_convrot_scale_values` → `convrot_read_weight`（**每次 open+pread+close**）
+  → `convrot_unrotate_cpu`（WHT 蝶形，1024 行/块）→ `h3_gpu_tensor_write_bf16`（写 2× 字节进共享 slot）。
+- **每 block 起一个线程**（`h3_dit.c:3607` 附近 `pthread_create(&stream_thread, …, read_stream_layer_thread, …)`），
+  主线程 `h3_gpu_submit` 后 `pthread_join`。`sample` 在 10.16s 窗口内抓到 **~37 个
+  `read_stream_layer_thread`**，每个存活 ~300 ms → 串行、无跨 block 流水。
+- 权重文件 `minimax_h3_fastvideo_4step.safetensors` = **21.33 GiB，其中 I8 占 19.74 GiB**
+  （250 个 I8 + 250 个 U8 comfy_quant + F32 scale；BF16 仅 1.49 GiB）→ 已经在走 convrot int8 路径，
+  **I/O 字节数已经是最小可用形态**（没有可换的 fp8/int4 导出）。
+- 权重在**内置盘** `/dev/disk3s5`（`/Users/jay/h3_sys/…`），非外接盘。该卷用 `disk_speed` 实测顺读
+  **2158 MiB/s**（64 MiB 块）；引擎 pread 段实测 36.248/17.568 = **2.06 GiB/s** → **读盘已贴着磁盘上限**。
+
+## 判断与解法
+- **可达上限**：把 17.568 s 的读盘与 16.000 s 的 CPU 重叠 → prefetch ≈ max = **17.6 s**，
+  去噪 wall 33.2 s → **≈18–19 s（约 1.75×）**。输出应**逐字节一致**（反旋转算法、顺序、结果全不变，
+  只是换了执行线程）。
+- **地板**：磁盘 2.06 GiB/s × 36.248 GiB = 17.6 s。想再快必须**少读字节**，
+  即跨 step 常驻部分权重（8 GiB 缓存预算 ≈ 少读 40% → ~12 s），属内存规划器的范围，另议。
+- **不选 GPU 反旋转**：项目已有 `h3_gpu_weight_dequant_unrotate_int8` 且 `h3_convrot_test` 在 M4 通过，
+  但 Phase 10 已判定「GPU dequant 与主线程计算争抢同一 GPU，净亏」；
+  且此路径要求 GPU 在 61% 空闲时间里接手 16 s 的工作，收益不确定。先用纯 CPU 侧的流水重叠。
+
+## 实现与结果（2026-09-12）
+
+### 做法：按 source 分片并行（不是流水线）
+`read_stream_layer` 拆成 `read_stream_sources(job, indices, count)`（纯工作）+ 编排器。
+编排器默认起 **2 个 worker**（连续索引区间）+ `H3_DIT_STREAM_WORKERS` 旋钮（1 = 原串行）。
+
+**正确性依据**：块的 4 个 source 各写**不同**的 slot 张量（`stream_slot_target`:
+qkv / out / fc1 / fc2 / lin_to_out），并发写域不相交；每个 worker 持有自己的
+`h3_dit_stream_job`（含 512B error 缓冲与 bytes/pread/dequant 计数器），无共享可变状态。
+LoRA 合并在所有 worker join 之后由编排器执行，`job->seconds` 也只在末尾写。
+
+### A/B 实测（同机，256×256 / 0.5s / steps=2，产物均**逐字节一致**）
+| 量 | W=1（原串行 = 基线） | W=2（默认） | 变化 |
+|---|---|---|---|
+| Euler denoise wall | 33.296 s | **22.686 s** | **−31.9%（1.47×）** |
+| unhidden wait | 20.201 s | 9.223 s | −54% |
+| pread（线程累计） | 17.826 s | 25.587 s | 并发读提升到 1.58 GiB/s |
+| cpu-unrotate（累计） | 15.866 s | 17.229 s | ~持平 |
+| 有效吞吐 | 1.076 GiB/s | 1.577 GiB/s | +47% |
+
+### 两个被实测否决的想法（避免重复试）
+1. **按字节 LPT 均衡分片**（154.1M vs 231.2M → 192.7M vs 192.6M）：实测 denoise **23.15s，无收益**。
+   原因推断：均衡打乱了文件顺序局部性——`prepare_stream_layer` 已 `qsort` 按
+   (path, file_offset) 排序，**连续索引区间 = 顺序读**，对 2 GiB/s 的盘有价值。→ 回退连续区间。
+2. **4 个 worker**（每 source 一个）：denoise **25.19s，更慢**；pread 累计从 25.05s 涨到 52.05s
+   （并发读过多使该 SSD 退化）。**2 个是甜点。**
+
+### 余下瓶颈（Phase 33 时定位）
+`unhidden wait` 仍有 9.2s。用测得的量建模：
+`pread 25.59/2 ≈ 12.5s wall` + `cpu 17.23/2 ≈ 8.6s wall` = **21.1s** ≈ 实测 22.7s
+→ 说明**每个 worker 内部仍是 read→dequant 串行**，两者没有互相填充。
+
+## Phase 35 实现与结果：worker 内 SPSC 两级流水（2026-09-12）
+
+### 做法
+每个 worker 内部拆成两个线程，用 **2 槽 SPSC ring** 解耦：
+- reader 线程：`stream_fill_slot()` — pread int8 + scale 到 staging slot
+- dequantizer（worker 自己的线程）：`stream_consume_slot()` — WHT 反旋转 + 写 slot
+
+槽位下标恒为 `position % H3_STREAM_RING`，握手靠 `filled` 标志，**无需 producer/consumer 游标**。
+`H3_DIT_STREAM_PIPELINE=0` 时两阶段在本线程背靠背运行（同一份代码，无重复实现）。
+
+### 2×2 对照矩阵（同一 binary，256×256 / 0.5s / steps=2，产物全部**逐字节一致**）
+| 配置 | denoise wall | unhidden wait | 说明 |
+|---|---|---|---|
+| W=1, P=0 | 35.131 s | 22.101 s | 原始串行参考 |
+| W=1, P=1 | 25.189 s | 11.546 s | 只流水、不切片 |
+| W=2, P=0 | 23.586 s | 10.239 s | Phase 33（只切片） |
+| **W=2, P=1（默认）** | **21.339 s** | **7.957 s** | 切片 + 流水 |
+
+关键派生量（每 block）：串行 337ms → **217ms**；有效吞吐 1.08 → **1.67 GiB/s**。
+
+### 为什么流水只多给 ~10%（而不是预期的 2×）
+1. **每个 worker 只有 2 个 source**，2 槽 ring 最多领先 1 个 source。理论模型
+   `wall = R₁ + Σmax(Rₖ,Dₖ₋₁) + D_N` 在 R≈D 时给出 `(N+1)/2N` 的效率：
+   N=2 → 75%（即最多省 25%），N→∞ → 50%。实测省 ~10%，与 N=2 的量级吻合。
+   **瓶颈是 stage 粒度太粗，不是 ring 深度**（推导：ring≥2 时加深 ring 不改善该公式）。
+2. **并发读会拖慢 CPU 反旋转**：`cpu-unrotate` 线程累计从 17.2s（P=0）升到 19.0–19.6s（P=1）
+   —— reader 以 2.4 GiB/s 读写内存时与 WHT 蝶形抢带宽。
+3. 磁盘并发读一多就退化（4 个 reader 时 pread 累计 25→52s），所以**不能靠加 reader 数量解决**。
+
+### 计算出的地板与剩余空间
+每 block：read 阶段 ≈ 159ms（2 reader 合计 318ms，约 2.42 GiB/s）、dequant 阶段 ≈ 98ms。
+理想 `max(159, 98) = 159ms` → prefetch ≈ 15.9s → 去噪 ≈ 16s。**当前 217ms，差 58ms（27%）**。
+按 stage 粒度模型，把 source 再切成 N 段后：N=4→199ms、N=8→179ms、N=16→169ms（收敛到 159ms）。
+→ 收益有限（21.3s → ~19.5s），而改动量不小。**更值得做的是加快 CPU 蝶形本身**
+（dequant 已是关键路径的一半；蝶形快 2× 可让去噪落到 ~17s）。
+
+### 实现缺陷记录
+`H3_DIT_STREAM_PIPELINE=0` 首版错误地把 `&& pipelined` 加到了 **worker 线程的创建条件**上，
+导致关闭流水时连 worker 并行一起关掉（量出 35.0s 的"全串行"，误判为 Phase 33 的 22.7s）。
+修正：`pipelined` 只决定每个 worker 是否 spawn 自己的 reader 线程，与 worker 之间是否并发无关。
+
+## Phase 36：继续压（直写 slot / NEON / 分块），2026-09-12
+
+### 36a 反旋转直接写 slot 张量 —— 保留
+`convrot_unrotate_cpu` 原先把结果写进一个每 source `malloc` 的 `full` 缓冲，再
+`h3_gpu_tensor_write_bf16` 整块 memcpy 进 slot。新增
+`h3_gpu_tensor_bf16_storage()`（`h3_gpu.h/.m`）拿到共享存储指针后**直接写 slot**，
+去掉一个 ~230MB 暂存、一次全量拷贝，以及每 source 一次的 mmap/munmap 首次触碰缺页。
+- 实测 `cpu-unrotate` 19.568s → **16.962s（−13%）**，denoise 21.339 → **21.060s（−1.3%）**
+- 产物逐字节一致。**保留**（同时是内存卫生改善：不再有 230MB/次 的瞬时分配）
+
+### 36b NEON 重写反旋转 —— **实测否决，未进仓库**
+在 `/tmp/convrot_bench.c` 独立基准里写了 NEON 版（`vld4q_f32`/`vst4q_f32` 处理 stride-1 段，
+`vld1q_f32` 处理 stride 4/16/64，SIMD 位运算复刻 bf16 的 round-half-up）。
+- 先排查出一处真 bug：`vcgeq_u32` 返回的是 **全 1 掩码 0xFFFFFFFF** 而非 1，
+  `hi + mask` 变成 `hi - 1`，恰好让 bf16 位模式差 2（与观测的 off-by-2 完全吻合）。
+  修法是 `vandq_u32(mask, vdupq_n_u32(1u))`（用 2M 随机样本验证 0 处不一致）。
+- 修好后 `ALL BIT-IDENTICAL`，但**性能是 0.84×（更慢）**：
+  scalar 8259 MB/s vs neon 6973 MB/s（`out_proj`/`fc2`/`fc1`/`qkv`/`beta_proj` 全部一致）。
+- **根因**：`-O3` 已经把标量版自动向量化了。该函数实测 2.75 G 元素/s ≈ 8.3 GB/s 的
+  「3 字节/元素」流量，折算约 14 ops/cycle —— 单发射标量做不到，所以编译器显然已经 SIMD 化，
+  且比手写 intrinsics 调度得更好（手写的多了 4 路解交错 shuffle 开销）。
+- **结论：这个蝴蝶已经是编译器的最优解，别手写 SIMD。** 该负结果避免了后人重复投入。
+
+### 36c 流水 stage 粒度降到 1024 行 —— 保留
+模型 `wall = R + D/M`（M = 流水级数）说明 M=2 时末尾的 drain 占总 wall 的 20%。把 ring 的
+工作单元从「整个矩阵」改成「1024 行的 chunk」（与反旋转自身的粒度一致，M 从 2 升到 ~30-60）。
+- 附带收益：staging 内存从 115MB/worker 降到 **5.5MB/worker**
+- 实测 denoise 21.060 → **19.962s**，`unhidden wait` 7.696 → **6.594s**，逐字节一致
+- 同时加了 per-source 的 scale 缓存（否则每个 chunk 都重读整个 scale 张量，
+  每 block 每 worker ~30 次）。该缓存**实测中性**（20.17 vs 19.96，噪声内），
+  保留的理由是避免 `O(chunks × rows)` 的潜在退化，而不是性能
+
+### 最终累计（256×256 / 0.5s / steps=2，全部逐字节一致）
+| 阶段 | denoise wall | 累计加速 |
+|---|---|---|
+| 原始基线 | 33.296 s | 1.00× |
+| + 按 source 分片并行（Phase 33） | 23.586 s | 1.41× |
+| + worker 内两级流水（Phase 35） | 21.339 s | 1.56× |
+| + 反旋转直写 slot（Phase 36a） | 21.060 s | 1.58× |
+| + 1024 行分块（Phase 36c） | **19.962 s** | **1.67×** |
+
+### 终点：已贴磁盘地板
+每 block 每 worker：read ≈ **173.5ms**（2 reader 合计 347ms ≈ 2.22 GB/s，已等于该卷实测上限
+2.16 GiB/s），dequant ≈ 87ms。理想 `max(173.5, 87) = 173.5ms` → 去噪 ≈ **17.4s**。
+当前 199.6ms，**只差 15%**，且剩余部分已分散到 condvar 交接延迟与内存带宽争抢，
+不再有单一主导项。想再跌破 17.4s 只能**少读字节**（跨 step 常驻部分权重），属内存规划器范畴。
+
+## ⚠️ 决定性 A/B：收益只在低分辨率存在（2026-09-12）
+
+用 `git stash` 回原始源码单独编一个二进制，与优化版在同一机器上逐分辨率对照
+（256×256 / 384×384 / 512×512 / 864×480，均 `--seconds 0.5 --steps 2`，产物**逐字节一致**）：
+
+| 分辨率 | 原始 denoise | 优化 denoise | 加速 | 原始 `unhidden wait` | 优化 `unhidden wait` |
+|---|---|---|---|---|---|
+| 256×256 | 33.296 s | 19.962 s | **1.67×** | 19.945 s | 6.594 s |
+| 384×384 | 33.922 s | 26.746 s | **1.27×** | 7.561 s | 0.009 s |
+| 512×512 | 46.441 s | 47.454 s | **0.98×（噪声内，略慢）** | **0.001 s** | 0.001 s |
+| 864×480 | 78.869 s | 77.579 s | **1.02×（噪声内）** | **0.001 s** | 0.001 s |
+
+**流式耗时本身与分辨率完全无关（这正是优化的设计目标）**：
+
+| | 384×384 | 512×512 | 864×480 |
+|---|---|---|---|
+| 原始 stream wall | 34.084 s | 35.034 s | 35.337 s |
+| 优化 stream wall | 20.032 s | 19.900 s | 20.332 s |
+| 降幅 | −41% | −43% | −42% |
+
+### 结论
+- 优化**按设计工作**：流式耗时稳定腰斩（35s → 20s），且与分辨率/时长无关
+- **但 ≥512×512 时流式在原始代码里就已经被完全隐藏**（`unhidden wait 0.001s`），
+  所以整条优化链收益为 **0**（噪声带 ±2%，512 那次甚至略慢——多线程与 GPU 争抢内存带宽）
+- **交叉点落在 384×384 与 512×512 之间**（≈448），取决于 GPU 算力 / 磁盘带宽之比：
+  GPU 越快或盘越慢，交叉点越低（越值得开）；模型能常驻的机器则该路径根本不执行
+- **注意引擎默认就是 864×480 / 56 帧 / 20 步** —— 即默认配置下这套优化**完全没有收益**
+  （56 帧比上表的 12 帧更偏 GPU 主导，只会更极端）
+
+### 因此
+保留/回退是个产品决策，不是技术决策：
+- 常跑 ≤384 小画布（预览、低分辨率快出）→ 值 1.27–1.67×，值得留
+- 按默认 864×480 跑 → 白给约 500 行并发代码，建议默认关闭（`H3_DIT_STREAM_WORKERS=1
+  H3_DIT_STREAM_PIPELINE=0` 即回到原始行为）或整体回退

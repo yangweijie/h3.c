@@ -480,3 +480,182 @@ LoRA 合并链路与新的 `h3_superres`。`findings.md` 已记录的项(如 DiT
 | What's the goal? | 收敛分支新增代码的正确性/资源管理风险,并让 AudioVAE 在没有 oracle fixture 的机器上也能被验证 |
 | What have I learned? | 同一 API 的多入口必须同源解析(adapter 三处不一致导致静默跳过);断言里的魔法数字必须给出推导,否则优化后必然失效(16→23);审查怀疑项要回代码验证(`target_height % inner_h` 不可达、`enc_argv` 无越界) |
 | What have I done? | 审查并修复 6+2 项 + 官方权重端到端实跑 + 修正失效断言 + 新增 `tests/test_real_audio_vae_e2e.c` 与 Makefile/AGENTS 接线(全量 0 警告) |
+
+## Session: 2026-09-12 (Metal 上下文编译缓存 — DeepJIT 启发)
+
+### Phase 27: 基线测量 + 计时插桩 — complete
+- [x] 调研落盘：见 findings.md「Metal 编译缓存调研」
+- [x] `h3_gpu_create` 加 `H3_PROFILE` 计时：`library=`（源码→MTLLibrary）+ `pipelines=`（86 个构建耗时）
+- [x] 新增 `tests/bench_metal_context.c` + `make h3_metal_bench` 目标
+- [x] 记录基线数字：
+
+| 场景 | library | pipelines | 单次合计 |
+|---|---|---|---|
+| 暖缓存 | 0.001–0.003 s | 0.001–0.005 s | **~5 ms** |
+| 冷缓存（源码内容改动） | **0.226 s** | 0.002 s | ~0.23 s |
+| 同「冷」源码再跑 | 0.001 s | 0.002 s | ~3 ms |
+
+- [x] 判决性对照：`cp h3_shaders.metal /tmp/… && 追加一行注释` 制造缓存 miss →
+  证明暖缓存的 3 ms 来自**系统 shader 缓存**（`/private/var/folders/*/C/com.apple.metal`）
+
+### Phase 28–30: 三项改动 — **全部取消（有实测依据）**
+- [x] 真实引擎跑（`H3_PROFILE=1`，256×256 / 0.5s / steps 2）：一次 T2V 只建 **4 个上下文**，
+      shader-build 合计 **23 ms**；同 run 的 DiT 主体 wall = **34.680 s**
+- [x] 判断：上限收益 ≈10–15 ms/次（0.04%）→ **不写任何缓存代码**
+- [x] 根因：Metal 有系统级按内容命中的 shader 缓存；DeepJIT 的磁盘缓存经验来自 CUDA
+      （无此机制），**不可移植**
+
+### Phase 31: 汇总收益 + 收尾 — complete（结论为「不做」）
+- [x] 保留 `H3_PROFILE` 的 shader-build 计时（诊断工具，零风险）
+- [x] 保留 `tests/bench_metal_context.c` + `h3_metal_bench`（可复测）
+- [ ] 待确认：是否把该结论写进 README 的 performance notes（避免后人重复踩坑）
+
+### 运行清单（本 session）
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `make -j8 h3_metal_bench` | 0 warning / 0 error |
+| 2 | `H3_PROFILE=1 ./h3_metal_bench 5` | 5 个上下文，合计 0.077 s |
+| 3 | 同上，换成内容改动的 `/tmp/h3_shaders_cold.metal` | 首个 library **0.226 s**（缓存 miss） |
+| 4 | 再跑同一冷源码 | 0.001 s → 确认系统缓存按内容命中 |
+| 5 | `H3_PROFILE=1 ./h3 -d models/minimax-h3 -p "…" 256×256/0.5s/2steps` | 4 个上下文，shader-build 合计 23 ms |
+
+### Error Log（本 session）
+| Error | Attempt | Resolution |
+|---|---|---|
+| 首次真实引擎探针跑成交互模式（日志仅 `Goodbye.`） | 1 | `nohup ./h3 -d …` 漏 `-p`；补提示词后正常 |
+| 初始假设「编译 280KB/180 kernel 需数秒」 | — | 被实测推翻（暖 3 ms / 冷 226 ms）。教训：先确认测量对象 |
+
+## Session: 2026-09-12 (换目标：DiT 流式权重管线读/算重叠)
+
+### Phase 32: 相位计时插桩 — complete
+- [x] `h3_dit.c`：`h3_dit` 加 `stream_pread_seconds` / `stream_dequant_seconds`；
+      `read_stream_layer` 分别累加「文件读（含 scale）」与「CPU 反旋转 + 写 slot」
+- [x] teardown 打印扩展为 `..., unhidden wait %.3fs, pread %.3fs, cpu-unrotate %.3fs`
+- [x] 基线实测（256×256 / 0.5s / steps=2，自动规划走 SSD 流式）：
+
+| 量 | 值 |
+|---|---|
+| Euler denoise wall | **33.189 s** |
+| wait (GPU) | 13.178 s |
+| root-gpu | 2.909 s |
+| encode | 0.064 s |
+| **unhidden wait** | **19.945 s**（60% 的 wall） |
+| stream pread | 17.568 s |
+| stream cpu-unrotate | 16.000 s |
+
+- [x] **关键等式**：`17.568 + 16.000 = 33.568 s == 该线程总忙碌时间` → 读盘与 CPU **零重叠**
+
+### 支撑证据（本次调研）
+- `sample` 抓取：主线程 61% 在 `pthread_join`、39% 在 `waitUntilCompleted`；
+  流式线程 ~46% 在 `pread`、~46% 在 `read_stream_layer`（内联的 WHT 蝶形）、~6% `memmove`
+- 10.16s 采样窗口内抓到 **~37 个 `read_stream_layer_thread`** → 每 block 起一个线程、串行 join
+- 权重文件 `minimax_h3_fastvideo_4step.safetensors` = 21.33 GiB，其中 **I8 19.74 GiB**
+  （250×I8 + 250×U8 comfy_quant + F32 scale）→ 已是 convrot int8，"减字节"这条路没有现成空间
+- 权重在内置盘 `/dev/disk3s5`；`disk_speed` 实测该卷顺读 **2158 MiB/s**，
+  引擎 pread 段 2.06 GiB/s → **读盘已贴上限**
+
+### Phase 33–34: 按 source 分片并行 + 验证 — complete
+- [x] `h3_dit.c`：`read_stream_layer` 拆为 `read_stream_sources(job, indices, count)` + 编排器；
+      新增 `h3_dit_stream_worker`（自带 job 计数器 + source 索引表）
+- [x] 默认 2 个 worker 并发（连续索引区间）；`H3_DIT_STREAM_WORKERS=1` 回到原串行参考路径
+- [x] 并发安全性：每个 source 写不同 slot 张量，写域不相交；每 worker 独立 job，无共享可变状态；
+      LoRA 合并与 `job->seconds` 留在 join 之后的编排器里
+- [x] **A/B 结果（产物均逐字节一致）**：
+
+| 量 | W=1（串行 = 基线） | W=2（默认） | 变化 |
+|---|---|---|---|
+| Euler denoise wall | 33.296 s | **22.686 s** | **−31.9%（1.47×）** |
+| unhidden wait | 20.201 s | 9.223 s | −54% |
+| 有效吞吐 | 1.076 GiB/s | 1.577 GiB/s | +47% |
+
+- [x] `make -j8 test AUDIO_VAE_MODEL=models/minimax-h3` → exit 0，可跑套件全绿；构建 0 警告
+- [x] 被实测否决并回退：按字节 LPT 均衡（23.15s，无收益，破坏顺序局部性）、4 workers（25.19s，更慢）
+
+### Phase 35: worker 内 SPSC 两级流水 — complete
+- [x] `h3_dit.c`：新增 `h3_stream_ring`（2 槽 SPSC，槽位 = `position % 2`，握手靠 `filled` 标志）；
+      `stream_fill_slot()`（reader 线程：pread int8 + scale）/ `stream_consume_slot()`
+      （dequantizer：WHT 反旋转 + 写 slot）/ `run_stream_pipeline(worker, pipelined)`
+- [x] 旋钮 `H3_DIT_STREAM_PIPELINE=0`：两阶段在同一线程背靠背跑（复用同一份代码，无重复实现）
+- [x] **2×2 对照（同一 binary，产物全部逐字节一致）**：
+
+| 配置 | denoise wall | unhidden wait |
+|---|---|---|
+| W=1, P=0（原始串行参考） | 35.131 s | 22.101 s |
+| W=1, P=1 | 25.189 s | 11.546 s |
+| W=2, P=0（Phase 33） | 23.586 s | 10.239 s |
+| **W=2, P=1（默认）** | **21.339 s** | **7.957 s** |
+
+- [x] 相对最初基线（33.296 s）累计 **1.56×**；每 block 337ms → 217ms；吞吐 1.08 → 1.67 GiB/s
+- [x] `make -j8 test AUDIO_VAE_MODEL=models/minimax-h3` → exit 0；构建 0 警告
+
+### Phase 36: 继续压（直写 slot / NEON / 分块）— complete
+- [x] **36a 反旋转直写 slot 张量**（新增 `h3_gpu_tensor_bf16_storage()`）：
+      `cpu-unrotate` 19.57 → 16.96s；denoise 21.339 → **21.060s**；逐字节一致；顺带去掉 230MB/次瞬时分配
+- [x] **36b NEON 重写反旋转 → 实测 0.84×（更慢），否决，未进仓库**
+      - 过程中修掉真 bug：`vcgeq_u32` 返回全 1 掩码而非 1 → `hi+mask` = `hi-1` → bf16 差 2
+      - 修正后 `ALL BIT-IDENTICAL`，但 scalar 8259 MB/s vs neon 6973 MB/s
+      - 根因：`-O3` 已把标量版自动向量化（实测 ~14 ops/cycle），手写 intrinsics 多付解交错 shuffle
+- [x] **36c 流水 stage 粒度 矩阵 → 1024 行 chunk**：denoise 21.060 → **19.962s**；
+      staging 115MB → 5.5MB/worker；逐字节一致
+- [x] per-source scale 缓存（避免每 chunk 重读整个 scale 张量）；**实测中性**，按潜在退化防护保留
+- [x] 验收：`make test` exit 0；`PIPELINE=0` 不挂死、逐字节一致（22.55s）
+
+### 本任务累计结果（256×256 / 0.5s / steps=2，全部逐字节一致）
+| 阶段 | denoise wall | 累计 |
+|---|---|---|
+| 原始基线 | 33.296 s | 1.00× |
+| + 按 source 分片并行 | 23.586 s | 1.41× |
+| + worker 内两级流水 | 21.339 s | 1.56× |
+| + 反旋转直写 slot | 21.060 s | 1.58× |
+| **+ 1024 行分块（最终默认）** | **19.962 s** | **1.67×** |
+
+### Phase 37: 终点 — 已贴磁盘地板
+每 block 每 worker：read 173.5ms（2 reader 合计 2.22 GB/s ≈ 该卷实测上限 2.16 GiB/s）、
+dequant 87ms → 理想 173.5ms → 去噪 ≈17.4s；当前 199.6ms，差 15% 且已分散（condvar 交接 +
+内存带宽争抢），无单一主导项。**再快只能少读字节**（跨 step 常驻权重），属内存规划器范畴。
+
+### Phase 38: 逐分辨率 A/B（`git stash` 原始二进制对照）— complete
+**结论：优化只在低分辨率有效；引擎默认配置（864×480）收益为 0。**
+
+| 分辨率 | 原始 denoise | 优化 denoise | 加速 | 原始 unhidden wait |
+|---|---|---|---|---|
+| 256×256 | 33.296 s | 19.962 s | **1.67×** | 19.945 s |
+| 384×384 | 33.922 s | 26.746 s | **1.27×** | 7.561 s |
+| 512×512 | 46.441 s | 47.454 s | **0.98×** | **0.001 s** |
+| 864×480 | 78.869 s | 77.579 s | **1.02×** | **0.001 s** |
+
+- 流式耗时与分辨率无关：原始 34.084/35.034/35.337 s → 优化 20.032/19.900/20.332 s（稳定 −42%）
+- **≥512×512 时流式在原始代码里就已被完全隐藏**（unhidden wait 0.001s）→ 整链收益 0
+- 三档产物均**逐字节一致**；交叉点 ≈448×448
+- 方法论：`cp h3 /tmp/h3_opt` → `git stash push -- <4 文件>` → 编原始 → `cp /tmp/h3_orig`
+  → `git stash pop` → 干净重建。**注意**：stash 期间编出的 `h3_gpu.o` 在 pop 后会变成
+  陈旧对象（缺新符号）导致链接失败，需 `make clean` 全量重建
+
+### Phase 39: 决策 = A（保留 + 默认关闭）— complete
+用户选择 A：保留代码、默认关闭、并给出环境变量与 ComfyUI 一键开关。
+
+- [x] `h3_dit.c` 翻转默认：`workers=1`、`pipelined = workers>1`。
+      **`H3_DIT_STREAM_WORKERS=2` 一个变量开启整条快路径**；`H3_DIT_STREAM_PIPELINE`
+      单独覆盖读/算重叠（=0 保留分片去掉 reader 线程，=1 只开流水）
+- [x] **把「分块」和「反旋转直写 slot」也挂到同一开关**（原先漏挂，导致默认态仍非原始）：
+      - 分块：256 时 −16.5%，512 时 **+3.7%**（只多 syscall）→ 默认改为「整矩阵一块」
+      - 直写：256 时 −13% CPU，512 时 **+1.2~2.8%**（QKV 乱序行写共享内存 vs
+        私有页顺序写 + memcpy）→ 默认改回暂存缓冲 + 全量拷贝
+- [x] 默认态验证 = 原始：512×512 背靠背 **47.588s vs 原始 47.653s（−0.1%）**，逐字节一致
+- [x] 快路径验证：`H3_DIT_STREAM_WORKERS=2` @256×256 = **19.760s（1.70×）**，逐字节一致
+- [x] ComfyUI 节点 `comfyui_nodes/h3_binary.py`：新增 `fast_stream` BOOLEAN（默认关），
+      经 `_engine_env()` 注入 `H3_DIT_STREAM_WORKERS=2`；并在 ≤384×384 且 ≤1.0s 时
+      自动提示可开启。`py_compile` 通过，两个节点均已暴露该参数
+- [x] README performance notes 新增「Streamed DiT weight prefetch (opt-in)」小节
+      （含开关、四条分辨率实测表、交叉点随 GPU/磁盘比移动的说明）
+- [ ] 待办：ComfyUI 侧的**部署副本** `/Volumes/data/Documents/ComfyUI/custom_nodes/h3_binary_nodes/h3_binary.py`
+      仍是旧版（仓库外，需用户确认再同步）
+
+### 最终交付（本任务）
+| 项 | 状态 |
+|---|---|
+| 代码 | `h3_dit.c` / `h3_gpu.h` / `h3_gpu.m`，0 警告 |
+| 默认行为 | 与改动前**逐字节一致**且耗时相同（512×512 −0.1%） |
+| 一键加速 | `H3_DIT_STREAM_WORKERS=2` → 256×256 **1.70×** / 384×384 **1.27×** |
+| ComfyUI | 新增 `fast_stream` 开关 + 自动提示 |
+| 文档 | README 新增小节；planning 三件套已同步 |

@@ -222,6 +222,11 @@ struct h3_dit {
     uint64_t stream_bytes;
     double stream_read_seconds;
     double stream_wait_seconds;
+    /* Split of stream_read_seconds into the two serial phases of
+     * read_stream_layer: file I/O (incl. the convrot scale read) and the CPU
+     * Walsh-Hadamard un-rotate / slot write. Diagnostic only. */
+    double stream_pread_seconds;
+    double stream_dequant_seconds;
     h3_gpu_tensor *final_norm;
     h3_gpu_tensor *final_video_w;
     h3_gpu_tensor *final_video_b;
@@ -1328,6 +1333,10 @@ static h3_gpu_tensor *stream_slot_target(h3_dit_block *slot,
     return NULL;
 }
 
+/* Upper bound on the per-block streaming workers (see read_stream_layer). One
+ * worker per source is enough: a block has at most five slot targets. */
+#define H3_DIT_STREAM_MAX_WORKERS 4
+
 typedef struct {
     h3_dit *dit;
     unsigned layer;
@@ -1335,8 +1344,75 @@ typedef struct {
     int ok;
     uint64_t bytes;
     double seconds;
+    /* Split of seconds into the phase blocked on file I/O (including the
+     * convrot scale read) and the CPU Walsh-Hadamard un-rotate plus slot
+     * write. Diagnostic only; reported at teardown under H3_PROFILE. */
+    double pread_seconds;
+    double dequant_seconds;
     char error[512];
 } h3_dit_stream_job;
+
+/* Two-slot single-producer/single-consumer ring that decouples one streaming
+ * worker's file reads from its CPU work. Reading a block's int8 weights and
+ * un-rotating them each took about half of the worker's busy time and, run back
+ * to back on one thread, simply added up (findings.md, 2026-09-12). The reader
+ * thread fills int8 staging buffers; the dequantizing thread runs the fast
+ * Walsh-Hadamard un-rotate and writes BF16 straight into the slot. Two slots
+ * let the reader run one source ahead while staying inside the working set.
+ * Slot index is always (source position % H3_STREAM_RING), so the ring needs no
+ * separate producer/consumer cursors — the `filled` flags carry the handshake. */
+enum { H3_STREAM_RING = 2 };
+
+typedef struct {
+    const h3_dit_stream_source *source[H3_STREAM_RING];
+    int needs_unrotate[H3_STREAM_RING];
+    int8_t *raw[H3_STREAM_RING];
+    size_t raw_capacity[H3_STREAM_RING];
+    float *scales[H3_STREAM_RING];
+    size_t scale_capacity[H3_STREAM_RING];
+    int filled[H3_STREAM_RING];
+    int ok[H3_STREAM_RING];
+    char error[H3_STREAM_RING][256];
+    int reader_finished;
+    int cancelled;
+    pthread_mutex_t mutex;
+    pthread_cond_t filled_cond;
+    pthread_cond_t emptied_cond;
+} h3_stream_ring;
+
+/* One worker's share of a block: its own job counters, the source indices it
+ * owns, and the ring joining its reader thread to its dequantizer. */
+/* One unit of streaming work: `rows` rows of one matrix starting at row
+ * `start`. Chunking the reads is what raises the pipeline's stage count, and
+ * that count is what bounds the drain at the end of a block — with M stages a
+ * worker's wall is R + D/M, which measured 210ms at M=2 against R=161ms
+ * (findings.md, 2026-09-12). 1024 rows matches the un-rotate's own granularity
+ * and keeps each staging slot at a few MiB instead of hundreds. */
+typedef struct {
+    unsigned source;
+    uint32_t start;
+    uint32_t rows;
+} h3_stream_chunk;
+
+#define H3_STREAM_CHUNK_ROWS 1024u
+/* Worst case is every streamed matrix landing in one worker: five matrices of
+ * at most 28672 rows (FFN * 2) at 1024 rows per chunk, rounded up. */
+#define H3_STREAM_MAX_CHUNKS (STREAM_MATRICES * 32u)
+
+typedef struct {
+    h3_dit_stream_job job;
+    unsigned count;
+    h3_stream_chunk chunks[H3_STREAM_MAX_CHUNKS];
+    int fast;           /* H3_DIT_STREAM_WORKERS>1: chunked reads and the
+                         * un-rotate writing straight into the slot */
+    int pipelined;      /* H3_DIT_STREAM_PIPELINE: overlap read and un-rotate */
+    /* The scale tensor is per-row and would otherwise be re-read in full for
+     * every 1024-row chunk of the same matrix. Reader-private: the consumer
+     * only ever reads the per-chunk copy staged in the ring. */
+    const h3_dit_stream_source *scales_source;
+    float *scales_cache;
+    h3_stream_ring ring;
+} h3_dit_stream_worker;
 
 /* Requantize a freshly streamed slot's int8 weights on the MAIN thread's command
  * buffer. Intentionally called on the main thread (never from read_stream_layer /
@@ -1376,123 +1452,488 @@ static int requant_stream_slot(h3_dit *dit, h3_dit_block *slot,
     return 1;
 }
 
-static int read_stream_layer(h3_dit_stream_job *job) {
-    h3_dit_stream_layer *layer = &job->dit->stream_layers[job->layer];
-    h3_dit_block *slot = &job->dit->stream_slots[job->slot];
-    double started = stream_now();
-    job->ok = 1;
-    job->bytes = 0;
-    job->error[0] = '\0';
+/* Producer stage: pread one chunk's int8 weights (and its convrot scales) into
+ * staging slot (position % H3_STREAM_RING) and hand it over. Only this function
+ * touches the file. */
+static int stream_fill_slot(h3_dit_stream_worker *worker, unsigned position) {
+    h3_dit_stream_job *job = &worker->job;
     h3_dit *dit = job->dit;
-    /* ConvRot int8 weights are dequantized and un-rotated on the CPU (the
-     * Walsh-Hadamard un-rotate below); the slot tensors are only read by the main
-     * thread after it joins this worker. The int8 streaming requantization (GPU
-     * h3_gpu_quantize_weight_int8) is intentionally NOT done here: this worker
-     * shares dit->gpu with the main thread, and encoding into the shared command
-     * buffer from two threads is a data race (Metal command buffers are not
-     * thread-safe). The main thread requantizes the slot after pthread_join — see
-     * requant_stream_slot(). */
+    h3_stream_ring *ring = &worker->ring;
+    h3_dit_stream_layer *layer = &dit->stream_layers[job->layer];
+    h3_dit_block *slot = &dit->stream_slots[job->slot];
+    const h3_stream_chunk *chunk = &worker->chunks[position];
+    unsigned index = position % H3_STREAM_RING;
+    const h3_dit_stream_source *source = &layer->sources[chunk->source];
+    int needs_unrotate = source->scale_path != NULL;
+    size_t bytes = (size_t)chunk->rows * source->columns;
+    h3_weight_store *store = source->field == STREAM_LIN_OUT
+        ? dit->vdn_weights : dit->weights;
+    char error[256] = "";
+    int ok = 1;
+    double pread_started;
 
-    for (unsigned index = 0; index < layer->source_count && job->ok;
-         index++) {
-        const h3_dit_stream_source *source = &layer->sources[index];
+    pthread_mutex_lock(&ring->mutex);
+    while (ring->filled[index] && !ring->cancelled)
+        pthread_cond_wait(&ring->emptied_cond, &ring->mutex);
+    if (ring->cancelled) {
+        pthread_mutex_unlock(&ring->mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&ring->mutex);
+
+    pread_started = stream_now();
+    if (needs_unrotate) {
+        if (bytes > ring->raw_capacity[index]) {
+            int8_t *grown = realloc(ring->raw[index], bytes);
+            if (!grown) {
+                ok = 0;
+                snprintf(error, sizeof(error),
+                         "cannot grow ConvRot streaming buffer");
+            } else {
+                ring->raw[index] = grown;
+                ring->raw_capacity[index] = bytes;
+            }
+        }
+        if (ok && chunk->rows > ring->scale_capacity[index]) {
+            float *grown = realloc(ring->scales[index],
+                                   (size_t)chunk->rows * sizeof(float));
+            if (!grown) {
+                ok = 0;
+                snprintf(error, sizeof(error),
+                         "cannot grow ConvRot scale buffer");
+            } else {
+                ring->scales[index] = grown;
+                ring->scale_capacity[index] = chunk->rows;
+            }
+        }
+        if (ok && worker->scales_source != source) {
+            /* The scale tensor is per-row and tiny next to the weights, but a
+             * block has ~30 chunks per worker, so read it once per matrix and
+             * stage only each chunk's slice. */
+            free(worker->scales_cache);
+            worker->scales_cache = NULL;
+            worker->scales_source = NULL;
+            float *loaded = load_convrot_scale_values(store,
+                source->scale_name, source->rows, error, sizeof(error));
+            if (!loaded) ok = 0;
+            else {
+                worker->scales_cache = loaded;
+                worker->scales_source = source;
+            }
+        }
+        if (ok)
+            memcpy(ring->scales[index], worker->scales_cache + chunk->start,
+                   (size_t)chunk->rows * sizeof(float));
+        if (ok && !convrot_read_weight(source->path, ring->raw[index], bytes,
+                                       source->file_offset +
+                                           (uint64_t)chunk->start *
+                                               source->columns)) {
+            ok = 0;
+            snprintf(error, sizeof(error), "cannot read convrot int8 weight");
+        }
+        job->bytes += (uint64_t)bytes;
+    } else {
+        /* Not ConvRot-encoded: strace the whole matrix in one piece, since the
+         * BF16 primitive writes a complete tensor. Those become a single
+         * whole-matrix chunk and the consumer has nothing left to do. */
+        if (!h3_gpu_tensor_stream_file_bf16(
+                stream_slot_target(slot, source->field), source->path,
+                source->file_offset, source->elements, error,
+                sizeof(error))) {
+            ok = 0;
+            if (!error[0])
+                snprintf(error, sizeof(error),
+                         "invalid BF16 streaming destination");
+        }
+        job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
+    }
+    job->pread_seconds += stream_now() - pread_started;
+
+    pthread_mutex_lock(&ring->mutex);
+    ring->source[index] = source;
+    ring->needs_unrotate[index] = needs_unrotate;
+    ring->ok[index] = ok;
+    snprintf(ring->error[index], sizeof(ring->error[index]), "%s", error);
+    ring->filled[index] = 1;
+    pthread_cond_signal(&ring->filled_cond);
+    pthread_mutex_unlock(&ring->mutex);
+    return ok;
+}
+
+/* Consumer stage: run the fast Walsh-Hadamard un-rotate on one staged int8
+ * weight and write the true BF16 weight straight into the shared-memory slot.
+ * No GPU commands — the main thread owns the command buffer, and the slot
+ * tensors are only read after this worker joins (see requant_stream_slot). */
+static int stream_consume_slot(h3_dit_stream_worker *worker,
+                               unsigned position) {
+    h3_dit_stream_job *job = &worker->job;
+    h3_dit *dit = job->dit;
+    h3_stream_ring *ring = &worker->ring;
+    h3_dit_block *slot = &dit->stream_slots[job->slot];
+    const h3_stream_chunk *chunk = &worker->chunks[position];
+    unsigned index = position % H3_STREAM_RING;
+    const h3_dit_stream_source *source;
+    int staged_ok, needs_unrotate;
+
+    pthread_mutex_lock(&ring->mutex);
+    while (!ring->filled[index] && !ring->reader_finished)
+        pthread_cond_wait(&ring->filled_cond, &ring->mutex);
+    if (!ring->filled[index]) {
+        pthread_mutex_unlock(&ring->mutex);
+        snprintf(job->error, sizeof(job->error),
+                 "streaming reader stopped before chunk %u", position);
+        return 0;
+    }
+    source = ring->source[index];
+    needs_unrotate = ring->needs_unrotate[index];
+    staged_ok = ring->ok[index];
+    if (!staged_ok)
+        snprintf(job->error, sizeof(job->error), "%s", ring->error[index]);
+    pthread_mutex_unlock(&ring->mutex);
+    if (!staged_ok) return 0;
+
+    if (needs_unrotate) {
         h3_gpu_tensor *target = stream_slot_target(slot, source->field);
-        if (!target) { job->ok = 0; break; }
-        if (source->scale_path) {
-            /* CPU path: pread int8 + scale, fast Walsh-Hadamard un-rotate,
-             * write the true BF16 weight straight into the shared-memory slot.
-             * No GPU commands — the main thread owns the command buffer. */
-            h3_weight_store *scale_store = (source->field == STREAM_LIN_OUT)
-                ? dit->vdn_weights : dit->weights;
-            float *scales = load_convrot_scale_values(scale_store,
-                source->scale_name, source->rows, job->error,
-                sizeof(job->error));
-            int8_t *raw = scales ? malloc(source->elements) : NULL;
-            uint16_t *full = (raw && source->elements)
-                ? malloc((size_t)source->rows * source->columns *
-                         sizeof(uint16_t)) : NULL;
-            if (!raw || !full) {
-                free(scales); free(raw); free(full);
-                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-                    "cannot allocate ConvRot streaming buffers");
-                job->ok = 0; break;
+        size_t target_elements = 0;
+        size_t wanted = (size_t)source->rows * source->columns;
+        uint16_t *staging = NULL;
+        uint16_t *storage = NULL;
+        if (worker->fast) {
+            /* Fast path: write straight into the slot's shared storage. The
+             * un-rotate is already a per-row permutation, so staging it through
+             * a host buffer only added a full copy plus a fresh mmap (and its
+             * first-touch page faults) for every source of every block. */
+            storage = target
+                ? h3_gpu_tensor_bf16_storage(target, &target_elements) : NULL;
+            if (!storage || target_elements < wanted) {
+                snprintf(job->error, sizeof(job->error),
+                         "cannot map the streamed BF16 slot for un-rotation");
+                return 0;
             }
-            if (!convrot_read_weight(source->path, raw, source->elements,
-                                     source->file_offset)) {
-                free(scales); free(raw); free(full);
-                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-                    "cannot read convrot int8 weight");
-                job->ok = 0; break;
+        } else {
+            /* Plain path: keep the original host staging buffer and full copy.
+             * Writing the permuted QKV rows straight into shared memory
+             * measured ~1-3% slower once the GPU hides the prefetch, because it
+             * trades sequential private pages for scattered shared ones. */
+            staging = malloc(wanted * sizeof(uint16_t));
+            if (!staging) {
+                snprintf(job->error, sizeof(job->error),
+                         "cannot allocate ConvRot streaming buffers");
+                return 0;
             }
-            /* qkv_proj is stored q/k/v-interleaved; remap to separated layout
-             * (layout == 1) so the unrotated weight lands at its true row. */
-            uint32_t layout = (source->field == STREAM_QKV) ? 1u : 0u;
-            int write_ok = 1;
-            for (uint32_t start = 0; start < source->rows; start += 1024) {
-                uint32_t count = source->rows - start < 1024 ?
-                    source->rows - start : 1024;
-                convrot_unrotate_cpu(
-                    raw + (size_t)start * source->columns, scales + start,
-                    full, start, count, source->columns,
-                    layout, HEADS, HEAD_DIM);
+            storage = staging;
+        }
+        /* qkv_proj is stored q/k/v-interleaved; remap to separated layout
+         * (layout == 1) so the unrotated weight lands at its true row. The
+         * chunk's absolute start row drives that remap. */
+        uint32_t layout = source->field == STREAM_QKV ? 1u : 0u;
+        double dequant_started = stream_now();
+        convrot_unrotate_cpu(ring->raw[index], ring->scales[index], storage,
+                             chunk->start, chunk->rows, source->columns,
+                             layout, HEADS, HEAD_DIM);
+        if (staging) {
+            if (!h3_gpu_tensor_write_bf16(target, staging, wanted)) {
+                free(staging);
+                snprintf(job->error, sizeof(job->error),
+                         "cannot write convrot weight: %s",
+                         h3_gpu_error(dit->gpu));
+                return 0;
             }
-            if (!h3_gpu_tensor_write_bf16(target, full,
-                    (size_t)source->rows * source->columns))
-                write_ok = 0;
-            free(scales); free(raw); free(full);
-            if (write_ok && job->layer == 0 &&
-                source->field == STREAM_OUT && getenv("H3_DEBUG_CONVROT")) {
-                uint16_t probe[8];
-                if (h3_gpu_tensor_read_bf16_range(target, 0, probe, 8)) {
-                    fprintf(stderr, "convrot debug: out_proj[0][0..7] =");
+            free(staging);
+        }
+        job->dequant_seconds += stream_now() - dequant_started;
+        if (job->layer == 0 &&
+            source->field == STREAM_OUT && getenv("H3_DEBUG_CONVROT")) {
+            uint16_t probe[8];
+            if (h3_gpu_tensor_read_bf16_range(target, 0, probe, 8)) {
+                fprintf(stderr, "convrot debug: out_proj[0][0..7] =");
+                for (int k = 0; k < 8; k++) {
+                    uint32_t bits = (uint32_t)probe[k] << 16;
+                    float v;
+                    memcpy(&v, &bits, sizeof(v));
+                    fprintf(stderr, " %.6f", v);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        if (job->layer == 0 &&
+            source->field == STREAM_QKV && getenv("H3_DEBUG_CONVROT")) {
+            uint16_t probe[8];
+            uint32_t rows[3] = {0, 7168u, 14336u};
+            const char *labels[3] = {"q[0]", "k[0]", "v[0]"};
+            for (int r = 0; r < 3; r++) {
+                if (h3_gpu_tensor_read_bf16_range(
+                        target, (size_t)rows[r], probe, 8)) {
+                    fprintf(stderr, "convrot debug: qkv %s[0..7] =",
+                            labels[r]);
                     for (int k = 0; k < 8; k++) {
                         uint32_t bits = (uint32_t)probe[k] << 16;
                         float v;
                         memcpy(&v, &bits, sizeof(v));
-                        fprintf(stderr, " %.6f", v);
+                        fprintf(stderr, " %.4f", v);
                     }
                     fprintf(stderr, "\n");
                 }
             }
-            if (write_ok && job->layer == 0 &&
-                source->field == STREAM_QKV && getenv("H3_DEBUG_CONVROT")) {
-                uint16_t probe[8];
-                uint32_t rows[3] = {0, 7168u, 14336u};
-                const char *labels[3] = {"q[0]", "k[0]", "v[0]"};
-                for (int r = 0; r < 3; r++) {
-                    if (h3_gpu_tensor_read_bf16_range(
-                            target, (size_t)rows[r], probe, 8)) {
-                        fprintf(stderr, "convrot debug: qkv %s[0..7] =",
-                                labels[r]);
-                        for (int k = 0; k < 8; k++) {
-                            uint32_t bits = (uint32_t)probe[k] << 16;
-                            float v;
-                            memcpy(&v, &bits, sizeof(v));
-                            fprintf(stderr, " %.4f", v);
-                        }
-                        fprintf(stderr, "\n");
-                    }
-                }
-            }
-            if (!write_ok) {
-                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-                    "cannot write convrot weight: %s",
-                    h3_gpu_error(dit->gpu));
-                job->ok = 0; break;
-            }
-            job->bytes += (uint64_t)source->elements;
-        } else {
-            if (!h3_gpu_tensor_stream_file_bf16(target, source->path,
-                    source->file_offset, source->elements, job->error,
-                    sizeof(job->error))) {
-                if (!job->error[0]) snprintf(job->error, sizeof(job->error),
-                    "invalid BF16 streaming destination");
-                job->ok = 0; break;
-            }
-            job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
         }
     }
-    if (job->ok && dit->lora_count) {
+
+    pthread_mutex_lock(&ring->mutex);
+    ring->filled[index] = 0;
+    pthread_cond_signal(&ring->emptied_cond);
+    pthread_mutex_unlock(&ring->mutex);
+    return 1;
+}
+
+static void *stream_reader_thread(void *opaque) {
+    h3_dit_stream_worker *worker = opaque;
+    for (unsigned position = 0; position < worker->count; position++)
+        if (!stream_fill_slot(worker, position)) break;
+    pthread_mutex_lock(&worker->ring.mutex);
+    worker->ring.reader_finished = 1;
+    pthread_cond_signal(&worker->ring.filled_cond);
+    pthread_mutex_unlock(&worker->ring.mutex);
+    return NULL;
+}
+
+/* Run one worker. `pipelined` overlaps the reader thread with the dequantizer
+ * on this thread; when it is off (or the reader thread cannot start) the two
+ * stages run back to back on this thread, which is the pre-pipeline reference
+ * path. Returns the worker's job->ok. */
+static int run_stream_pipeline(h3_dit_stream_worker *worker, int pipelined) {
+    h3_stream_ring *ring = &worker->ring;
+    pthread_t reader;
+    int started = 0;
+    worker->job.ok = 1;
+    worker->job.error[0] = '\0';
+    worker->scales_source = NULL;
+    worker->scales_cache = NULL;
+    memset(ring, 0, sizeof(*ring));
+    pthread_mutex_init(&ring->mutex, NULL);
+    pthread_cond_init(&ring->filled_cond, NULL);
+    pthread_cond_init(&ring->emptied_cond, NULL);
+
+    if (pipelined)
+        started = pthread_create(&reader, NULL, stream_reader_thread,
+                                 worker) == 0;
+    if (started) {
+        for (unsigned position = 0; position < worker->count; position++) {
+            if (stream_consume_slot(worker, position)) continue;
+            /* Release a reader still waiting for an empty slot. */
+            pthread_mutex_lock(&ring->mutex);
+            ring->cancelled = 1;
+            pthread_cond_signal(&ring->emptied_cond);
+            pthread_mutex_unlock(&ring->mutex);
+            worker->job.ok = 0;
+            break;
+        }
+        (void)pthread_join(reader, NULL);
+    } else {
+        if (pipelined) {
+            worker->job.ok = 0;
+            snprintf(worker->job.error, sizeof(worker->job.error),
+                     "cannot start DiT SSD streaming reader");
+        } else {
+            ring->reader_finished = 1;
+            for (unsigned position = 0; position < worker->count;
+                 position++) {
+                if (!stream_fill_slot(worker, position) ||
+                    !stream_consume_slot(worker, position)) {
+                    worker->job.ok = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (unsigned index = 0; index < H3_STREAM_RING; index++) {
+        free(ring->raw[index]);
+        free(ring->scales[index]);
+    }
+    free(worker->scales_cache);
+    worker->scales_cache = NULL;
+    worker->scales_source = NULL;
+    pthread_cond_destroy(&ring->emptied_cond);
+    pthread_cond_destroy(&ring->filled_cond);
+    pthread_mutex_destroy(&ring->mutex);
+    return worker->job.ok;
+}
+
+static void *read_stream_worker_thread(void *opaque) {
+    h3_dit_stream_worker *worker = opaque;
+    (void)run_stream_pipeline(worker, worker->pipelined);
+    return NULL;
+}
+
+/* Stream one DiT block. Each source is a [open+pread int8 -> CPU Walsh-Hadamard
+ * un-rotate -> write BF16 into the slot] chain; profiling showed the file read
+ * and the CPU phase each take about half of that worker's busy time and, run
+ * back to back, simply add up — which left the main thread blocked in
+ * pthread_join for about 60% of the denoise wall (findings.md, 2026-09-12).
+ * Two changes fix that: inside a worker the reader thread is pipelined against
+ * its dequantizer (see run_stream_pipeline), and the block's sources are split
+ * across a few workers. Every source lands in a different slot tensor, so the
+ * concurrent writes are disjoint.
+ *
+ * They are OPT-IN, because they only pay off while this prefetch is on the
+ * critical path. A/B against the pre-change binary (findings.md, 2026-09-12)
+ * measured 1.67x at 256x256 and 1.27x at 384x384, but 0.98x/1.02x at 512x512
+ * and 864x480: from 512x512 up the GPU already hides the whole prefetch (the
+ * reported unhidden wait is 0.001s) and the extra threads only steal memory
+ * bandwidth. Note the engine's own defaults (864x480, 56 frames, 20 steps) sit
+ * squarely in the region where this does nothing.
+ *
+ *   H3_DIT_STREAM_WORKERS=2   turn the whole fast path on (this also enables
+ *                             the pipeline, so one variable is enough)
+ *   H3_DIT_STREAM_PIPELINE=0  keep the source split but drop the reader thread
+ *   H3_DIT_STREAM_PIPELINE=1  pipeline only, without the source split
+ *
+ * The default (no variables set) is the original serial reference path. */
+static int read_stream_layer(h3_dit_stream_job *job) {
+    h3_dit_stream_layer *layer = &job->dit->stream_layers[job->layer];
+    h3_dit_block *slot = &job->dit->stream_slots[job->slot];
+    h3_dit *dit = job->dit;
+    double started = stream_now();
+    unsigned sources = layer->source_count;
+    unsigned workers = 1;
+    const char *value = getenv("H3_DIT_STREAM_WORKERS");
+    if (value && *value) {
+        long parsed = strtol(value, NULL, 10);
+        workers = parsed > 1 ? (unsigned)parsed : 1u;
+    }
+    if (workers > sources) workers = sources;
+    if (workers > H3_DIT_STREAM_MAX_WORKERS)
+        workers = H3_DIT_STREAM_MAX_WORKERS;
+    if (workers < 1) workers = 1;
+    int pipelined = workers > 1;
+    const char *pipeline_value = getenv("H3_DIT_STREAM_PIPELINE");
+    if (pipeline_value && *pipeline_value)
+        pipelined = strcmp(pipeline_value, "0") != 0;
+
+    job->ok = 1;
+    job->bytes = 0;
+    job->pread_seconds = 0.0;
+    job->dequant_seconds = 0.0;
+    job->error[0] = '\0';
+
+    {
+        h3_dit_stream_worker states[H3_DIT_STREAM_MAX_WORKERS];
+        pthread_t threads[H3_DIT_STREAM_MAX_WORKERS];
+        int spawned[H3_DIT_STREAM_MAX_WORKERS];
+        /* Contiguous ranges: the layer's sources are sorted by file offset
+         * (prepare_stream_layer), so each worker still walks the checkpoint
+         * sequentially. Balancing the ranges by byte count instead measured no
+         * gain (23.1s vs 22.4s denoise) and breaks that locality. */
+        unsigned slice = (sources + workers - 1) / workers;
+        int overflow = 0;
+        for (unsigned index = 0; index < workers && !overflow; index++) {
+            unsigned first = index * slice;
+            unsigned end = first + slice;
+            if (first > sources) first = sources;
+            if (end > sources) end = sources;
+            states[index].job = *job;
+            states[index].count = 0;
+            states[index].fast = workers > 1;
+            states[index].pipelined = pipelined;
+            spawned[index] = 0;
+            /* Expand this worker's matrices into chunks. Only ConvRot sources
+             * are chunked; the BF16 primitive streams a whole tensor, so those
+             * stay a single chunk that the consumer merely accounts for. */
+            for (unsigned position = first; position < end && !overflow;
+                 position++) {
+                const h3_dit_stream_source *source =
+                    &layer->sources[position];
+                if (!source->scale_path) {
+                    if (states[index].count >= H3_STREAM_MAX_CHUNKS) {
+                        overflow = 1;
+                        break;
+                    }
+                    states[index].chunks[states[index].count].source =
+                        position;
+                    states[index].chunks[states[index].count].start = 0;
+                    states[index].chunks[states[index].count].rows =
+                        source->rows;
+                    states[index].count++;
+                    continue;
+                }
+                /* Chunking belongs to the fast path too: it trades one large
+                 * read per matrix for many small ones, which measured 16%
+                 * faster at 256x256 (prefetch on the critical path) but ~4%
+                 * slower at 512x512, where it only adds syscalls. With the
+                 * fast path off the whole matrix is one chunk, i.e. the
+                 * original single pread per source. */
+                uint32_t chunk_rows = workers > 1 ? H3_STREAM_CHUNK_ROWS
+                                                  : source->rows;
+                if (chunk_rows == 0) chunk_rows = 1;
+                for (uint32_t start = 0; start < source->rows;
+                     start += chunk_rows) {
+                    if (states[index].count >= H3_STREAM_MAX_CHUNKS) {
+                        overflow = 1;
+                        break;
+                    }
+                    uint32_t rows = source->rows - start < chunk_rows
+                        ? source->rows - start : chunk_rows;
+                    states[index].chunks[states[index].count].source =
+                        position;
+                    states[index].chunks[states[index].count].start = start;
+                    states[index].chunks[states[index].count].rows = rows;
+                    states[index].count++;
+                }
+            }
+        }
+        if (overflow) {
+            /* Unreachable for the released shapes (five 28672-row matrices at
+             * 1024 rows each); fail loudly rather than stream a partial block. */
+            job->ok = 0;
+            snprintf(job->error, sizeof(job->error),
+                     "ConvRot streaming chunk list overflow (max %u)",
+                     (unsigned)H3_STREAM_MAX_CHUNKS);
+        } else {
+        /* The source split and the read/un-rotate pipeline are independent:
+         * pipelined only decides whether each worker spawns its own reader
+         * thread, never whether the workers themselves run concurrently. */
+        for (unsigned index = 1; index < workers; index++) {
+            if (states[index].count &&
+                pthread_create(&threads[index], NULL,
+                               read_stream_worker_thread,
+                               &states[index]) == 0)
+                spawned[index] = 1;
+        }
+        (void)run_stream_pipeline(&states[0], pipelined);
+        for (unsigned index = 1; index < workers; index++) {
+            /* A slice whose thread could not start is simply run inline; the
+             * block still loads, just without that slice's overlap. */
+            if (!states[index].count) continue;
+            if (spawned[index])
+                (void)pthread_join(threads[index], NULL);
+            else
+                (void)run_stream_pipeline(&states[index], pipelined);
+        }
+        for (unsigned index = 0; index < workers; index++) {
+            job->bytes += states[index].job.bytes;
+            job->pread_seconds += states[index].job.pread_seconds;
+            job->dequant_seconds += states[index].job.dequant_seconds;
+            if (job->ok && !states[index].job.ok) {
+                job->ok = 0;
+                snprintf(job->error, sizeof(job->error), "%s",
+                         states[index].job.error);
+            }
+        }
+        }
+    }
+
+    if (!job->ok) {
+        /* Preserve a specific upstream error (BF16 read/open failure, invalid
+         * request) instead of masking it with a generic int8 message. */
+        if (!job->error[0])
+            snprintf(job->error, sizeof(job->error),
+                     "int8 quantization of streamed DiT block failed: %s",
+                     h3_gpu_error(dit->gpu));
+        job->seconds = stream_now() - started;
+        return 0;
+    }
+
+    if (dit->lora_count) {
         /* Merge the LoRA deltas into the freshly streamed BF16 matrices,
          * before the int8 requantization bakes them into the resident slot. */
         char lora_prefix[64];
@@ -1503,13 +1944,6 @@ static int read_stream_layer(h3_dit_stream_job *job) {
                                sizeof(job->error)))
             job->ok = 0;
     }
-
-    /* Preserve a specific upstream error (BF16 read/open failure, invalid
-     * request) instead of masking it with a generic int8 message. */
-    if (!job->ok && !job->error[0])
-        snprintf(job->error, sizeof(job->error),
-                 "int8 quantization of streamed DiT block failed: %s",
-                 h3_gpu_error(dit->gpu));
     job->seconds = stream_now() - started;
     return job->ok;
 }
@@ -2131,6 +2565,8 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         dit->stream_ready_slot = 0;
         dit->stream_bytes += job.bytes;
         dit->stream_read_seconds += job.seconds;
+        dit->stream_pread_seconds += job.pread_seconds;
+        dit->stream_dequant_seconds += job.dequant_seconds;
     }
     dit->video_patch_w = f2(dit, "video_patch_proj.weight", HIDDEN,
                             VIDEO_PATCH, error, error_size);
@@ -3619,6 +4055,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 dit->stream_bytes += stream_job.bytes;
                 dit->stream_read_seconds += stream_job.seconds;
+                dit->stream_pread_seconds += stream_job.pread_seconds;
+                dit->stream_dequant_seconds += stream_job.dequant_seconds;
                 if (!stream_job.ok) {
                     fail(error, error_size,
                          "cannot stream DiT block %u: %s",
@@ -4441,11 +4879,12 @@ void h3_dit_free(h3_dit *dit) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
                 "h3: BF16 SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
-                "unhidden wait %.3fs\n",
+                "unhidden wait %.3fs, pread %.3fs, cpu-unrotate %.3fs\n",
                 gib, dit->stream_read_seconds,
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
-                dit->stream_wait_seconds);
+                dit->stream_wait_seconds, dit->stream_pread_seconds,
+                dit->stream_dequant_seconds);
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);

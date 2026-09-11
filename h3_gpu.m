@@ -368,6 +368,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         NSString *source = [NSString stringWithContentsOfFile:path
                                                      encoding:NSUTF8StringEncoding
                                                         error:&libraryError];
+        double libraryStart = h3_gpu_now();
         if (source) {
             MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
             options.mathMode = MTLMathModeSafe;
@@ -413,6 +414,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             }
             return NULL;
         }
+        double librarySeconds = h3_gpu_now() - libraryStart;
+        double pipelinesStart = h3_gpu_now();
         NSMutableArray<NSString *> *names = [@[
             @"h3_linear_f32", @"h3_linear_f32_tiled",
             @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
@@ -545,6 +548,15 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             pipelines[name] = pipeline;
         }
         gpu.pipelines = pipelines;
+        double pipelinesSeconds = h3_gpu_now() - pipelinesStart;
+        if (h3_gpu_profile_enabled()) {
+            fprintf(stderr,
+                "h3 profile: %-24s %-14s wall=%8.3fs library=%8.3fs "
+                "pipelines=%8.3fs kernels=%lu\n",
+                "Metal context", "shader-build",
+                librarySeconds + pipelinesSeconds, librarySeconds,
+                pipelinesSeconds, (unsigned long)names.count);
+        }
         return (__bridge_retained h3_gpu *)gpu;
     }
 }
@@ -932,6 +944,14 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
     memcpy(destination + destination_offset * sizeof(uint16_t), values,
            elements * sizeof(uint16_t));
     return 1;
+}
+
+uint16_t *h3_gpu_tensor_bf16_storage(h3_gpu_tensor *tensor, size_t *elements) {
+    if (!tensor || TENSOR(tensor).dtype != H3_GPU_BF16) return NULL;
+    unsigned char *storage = TENSOR(tensor).buffer.contents;
+    if (!storage) return NULL;
+    if (elements) *elements = TENSOR(tensor).elements;
+    return (uint16_t *)(void *)storage;
 }
 
 int h3_gpu_begin(h3_gpu *opaque) {

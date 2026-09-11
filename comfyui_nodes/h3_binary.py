@@ -271,6 +271,11 @@ class _H3BinaryBase:
                               "tooltip": "去噪复用：1 close，2 fast，3 aggressive"}),
             "layers": ("INT", {"default": 0, "min": 0, "max": 50,
                                "tooltip": "DiT 块数：0=默认，50 精确，45 快，40 激进"}),
+            "fast_stream": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "低分辨率流式提速（H3_DIT_STREAM_WORKERS=2）：把 DiT 权重流式预取"
+                           "拆成多 worker 并与 CPU 反旋转重叠。实测 256×256 1.70×、384×384 1.27×；"
+                           "512×512 及以上无效（GPU 已完全掩盖预取）且略慢，故默认关闭"}),
             "binary": ("STRING", {"default": _DEFAULT_BINARY}),
             "clipproj_dir": ("STRING", {"default": _DEFAULT_CLIPPROJ_DIR}),
             "clipproj_proj": ("STRING", {"default": _DEFAULT_CLIPPROJ_PROJ}),
@@ -357,6 +362,24 @@ class _H3BinaryBase:
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, f"{prefix}_{int(time.time() * 1000)}.mp4")
 
+    def _engine_env(self, clipproj_dir, clipproj_proj, fast_stream):
+        """引擎子进程环境变量。fast_stream → H3_DIT_STREAM_WORKERS=2，
+        引擎侧即开启「分块 + 多 worker + 读/算重叠」整条流式快路径。"""
+        env = {"H3_CLIPPROJ_DIR": clipproj_dir, "H3_CLIPPROJ_PROJ": clipproj_proj}
+        if fast_stream:
+            env["H3_DIT_STREAM_WORKERS"] = "2"
+        return env
+
+    @staticmethod
+    def _fast_stream_hint(width, height, seconds, fast_stream):
+        """低分辨率短时长落在这个提速真正有效的区间里（实测数据见 h3.c
+        README「Streamed DiT weight prefetch」），提醒用户可以打开。"""
+        if fast_stream:
+            return
+        if width * height <= 384 * 384 and seconds <= 1.0:
+            print(f"[H3] 提示: {width}x{height} / {seconds}s 属于流式提速有效区间，"
+                  f"开启 fast_stream 可获约 1.2~1.7x（实测数据，非估计）")
+
     def _finish(self, rc, out_path, log):
         if rc != 0 or not os.path.isfile(out_path):
             tail = "\n".join(log.splitlines()[-25:])
@@ -386,12 +409,14 @@ class H3_BinaryT2V(_H3BinaryBase):
 
     def generate(self, prompt, width, height, resolution_preset, seconds, steps, seed,
                  lora="", auto_steps=True, model_dir=_DEFAULT_MODEL_DIR, output_path="",
-                 core_reuse=1, reuse=1, layers=0, binary=_DEFAULT_BINARY,
+                 core_reuse=1, reuse=1, layers=0, fast_stream=False,
+                 binary=_DEFAULT_BINARY,
                  clipproj_dir=_DEFAULT_CLIPPROJ_DIR,
                  clipproj_proj=_DEFAULT_CLIPPROJ_PROJ, extra_args="",
                  first_frame=None, last_frame=None):
         width, height, steps = self._resolve_inputs(
             width, height, resolution_preset, steps, lora, auto_steps)
+        self._fast_stream_hint(width, height, float(seconds), fast_stream)
         extra = []
         if first_frame is not None:
             extra += ["--first-frame", _save_image(first_frame, "first_frame.png")]
@@ -402,8 +427,8 @@ class H3_BinaryT2V(_H3BinaryBase):
         cmd = self._build_cmd(binary, model_dir, prompt, width, height, seconds,
                               steps, seed, lora, out_path, core_reuse, reuse,
                               layers, extra_args, extra)
-        rc, log = _run_engine(cmd, {"H3_CLIPPROJ_DIR": clipproj_dir,
-                                    "H3_CLIPPROJ_PROJ": clipproj_proj}, tag="H3_T2V")
+        rc, log = _run_engine(cmd, self._engine_env(clipproj_dir, clipproj_proj,
+                                                    fast_stream), tag="H3_T2V")
         return self._finish(rc, out_path, log)
 
 
@@ -428,13 +453,15 @@ class H3_BinaryR2V(_H3BinaryBase):
 
     def generate(self, prompt, width, height, resolution_preset, seconds, steps, seed,
                  lora="", auto_steps=True, model_dir=_DEFAULT_MODEL_DIR, output_path="",
-                 core_reuse=1, reuse=1, layers=0, binary=_DEFAULT_BINARY,
+                 core_reuse=1, reuse=1, layers=0, fast_stream=False,
+                 binary=_DEFAULT_BINARY,
                  clipproj_dir=_DEFAULT_CLIPPROJ_DIR,
                  clipproj_proj=_DEFAULT_CLIPPROJ_PROJ, extra_args="",
                  ref_image_1=None, ref_image_2=None, ref_image_size="match",
                  ref_video_path="", ref_audio_path=""):
         width, height, steps = self._resolve_inputs(
             width, height, resolution_preset, steps, lora, auto_steps)
+        self._fast_stream_hint(width, height, float(seconds), fast_stream)
         extra = []
         for idx, img in enumerate((ref_image_1, ref_image_2), start=1):
             if img is not None:
@@ -454,8 +481,8 @@ class H3_BinaryR2V(_H3BinaryBase):
         cmd = self._build_cmd(binary, model_dir, prompt, width, height, seconds,
                               steps, seed, lora, out_path, core_reuse, reuse,
                               layers, extra_args, extra)
-        rc, log = _run_engine(cmd, {"H3_CLIPPROJ_DIR": clipproj_dir,
-                                    "H3_CLIPPROJ_PROJ": clipproj_proj}, tag="H3_R2V")
+        rc, log = _run_engine(cmd, self._engine_env(clipproj_dir, clipproj_proj,
+                                                    fast_stream), tag="H3_R2V")
         return self._finish(rc, out_path, log)
 
 

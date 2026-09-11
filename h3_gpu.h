@@ -91,6 +91,13 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
                                    size_t destination_offset,
                                    const uint16_t *values, size_t elements);
 
+/* Host pointer to a shared-storage BF16 tensor's backing store, so a producer
+ * can write rows in place instead of staging them through a host buffer and
+ * copying them over. Returns NULL unless the tensor is BF16 with host-visible
+ * storage; *elements receives its element count. The caller must own the
+ * tensor for the duration: the GPU must not be reading it concurrently. */
+uint16_t *h3_gpu_tensor_bf16_storage(h3_gpu_tensor *tensor, size_t *elements);
+
 int h3_gpu_begin(h3_gpu *gpu);
 /* Commit the current command buffer without waiting, then continue encoding on
  * the same ordered queue. h3_gpu_submit() waits and validates the whole chain. */
