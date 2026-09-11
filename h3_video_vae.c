@@ -629,7 +629,15 @@ static int run_stream_tile(vae_context *vae, char *error,
     /* Serial VAE decode: load -> run -> free each block. The async prefetch path
      * was removed because its worker thread touched the shared vae->gpu while the
      * main thread held an open command buffer, racing and crashing. Serial decode
-     * is correct; the lost overlap only marginally slows the VAE stage. */
+     * is correct; the lost overlap only marginally slows the VAE stage. The command
+     * buffer is opened and submitted per phase (prep, each block, output): because
+     * h3_gpu_submit leaves gpu.command nil, the next h3_gpu_begin opens a fresh
+     * buffer. The prep ops above share the decoder's opened buffer and are flushed
+     * here before the block loop, so the first per-block begin does not find the
+     * buffer still open (that was the bug: the decoder begin had no matching submit,
+     * so the loop's begin failed with "unknown Metal error"). Each block's own
+     * buffer lets free_block reclaim its weights as soon as the GPU is done. */
+    OP(h3_gpu_submit(vae->gpu), "submit streamed video VAE prep");
     for (int index = 0; index < LAYERS; index++) {
         if (!load_block(vae, index, error, error_size)) {
             h3_gpu_tensor_free(zero);
@@ -643,6 +651,7 @@ static int run_stream_tile(vae_context *vae, char *error,
         OP(h3_gpu_submit(vae->gpu), "submit streamed video VAE block");
         free_block(&vae->blocks[index]);
     }
+    OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE output");
     OP(h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
        "streamed video VAE output LayerNorm");

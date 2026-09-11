@@ -445,6 +445,16 @@ LoRA 合并链路与新的 `h3_superres`。`findings.md` 已记录的项(如 DiT
 - 三条路径实测:错误模型路径 → **exit 1**(测试确实会失败);默认 `make test` → skip;
   `make test AUDIO_VAE_MODEL=models/minimax-h3` → 套件内实际执行并通过。
 
+### Phase 23: 修复流式 video VAE 解码命令缓冲 bug — complete
+- 复现:ComfyUI `H3_BinaryT2V` 报 rc=1,日志 `audio VAE 7/7` 后
+  `begin streamed video VAE transformer block: unknown Metal error`;直连官方权重 `./h3` 同样复现。
+- 根因:`h3_gpu_submit` 提交后 `gpu.command` 置 nil 且不重新打开(重新打开只在 `h3_gpu_continue`);
+  `h3_gpu_begin` 在已开缓冲上直接 `return 0` 且**不设 lastError** → 错误串回退成 "unknown Metal error"。
+  `run_stream_tile` 在 prep 后缺一次 submit,导致循环首个 `h3_gpu_begin` 撞上已开缓冲而失败(此前改动未碰 video VAE,为既有 bug)。
+- 修复:镜像 `run_decoder` 的每阶段 begin/submit——prep 单独 submit、循环恢复每 block 的 begin+submit、post 前补 begin。
+- 验证:直连 `./h3` 跑通(448×256,1s,4 steps),`audio VAE 7/7 → FFmpeg 39/39 → wrote /tmp/h3_verify.mp4`
+  (270 KB;ffprobe:448×256,39 帧,1.625s,含音频流);日志无 Metal/error;全量 `make -j8 all test` 0 警告,三套件全绿。
+
 ### 运行清单(本 session)
 | # | 命令 | 结果 |
 |---|---|---|

@@ -257,6 +257,22 @@
       `make test AUDIO_VAE_MODEL=models/minimax-h3` 实际执行并通过
 - [ ] 待办(可选):把 `make test` 里 `h3_real_audio_vae_test` 的守卫路径也参数化到 `AUDIO_VAE_MODEL`
 
+### Phase 23: 修复流式 video VAE 解码命令缓冲 bug — complete
+- [x] 复现:用官方权重直连 `./h3`(ComfyUI `H3_BinaryT2V` 节点等价参数)跑 T2V,日志在
+      `audio VAE 7/7` 后报 `h3: begin streamed video VAE transformer block: unknown Metal error`,
+      rc=1,无输出(`vae->streaming` 由自动内存规划器在权重放不下常驻时开启)
+- [x] 根因:`run_stream_tile`(`h3_video_vae.c`)L614 用 `h3_gpu_begin` 开了命令缓冲编码 prep ops,
+      但**直到 L652 才 submit**,循环里 L638 又 `h3_gpu_begin` → 此时 `gpu.command` 已非空 →
+      `h3_gpu_begin` 直接 `return 0` 且不设 `lastError` → 错误串回退成 "unknown Metal error"。
+      `h3_gpu_submit` 提交后 `gpu.command = nil` **不重新打开**(重新打开只在 `h3_gpu_continue`),
+      故每阶段必须自带 begin。`run_resident_tile`/`run_decoder` 分别用单 begin 包全部 / 每 block 自带 begin,均正常
+- [x] 修复:镜像 `run_decoder` 的每阶段 begin/submit——prep 单独 `submit`;循环恢复每 block 的
+      `h3_gpu_begin`+`submit`(per-block 提交让 `free_block` 在 GPU 完成后回收权重,保持流式省内存);
+      post ops 前补一个 `h3_gpu_begin`
+- [x] 验证:直连 `./h3` 完整跑通(448×256,1s,4 steps)`audio VAE 7/7 → FFmpeg 39/39 →
+      wrote /tmp/h3_verify.mp4`(270 KB;ffprobe: 448×256,39 帧,1.625s,含音频流);日志无
+      Metal/error;全量 `make -j8 all test` 0 警告,三套件全绿。本 session 此前改动未碰 video VAE
+
 ## Decisions Made
 | Decision | Rationale |
 |---|---|

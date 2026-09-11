@@ -704,3 +704,74 @@ int h3_dit_schedule_gate_scores(const h3_dit_schedule *schedule,
   修法:先按 `uint64_t` 计算 `hidden_elements64` 再校验 `> SIZE_MAX` 后转 `size_t`(与 `run_stage` 既有写法一致)。
   → 再次印证:修复溢出检查时要选**与被乘数实际宽度匹配**的上界,否则只是"看起来有检查"。
 - `tests/test_lora.c`:未使用的 `gpu` 形参 + `printf("%zu", lora ? 0 : 0)` 格式不匹配且恒打印 0(已删)。
+
+# 流式 video VAE 解码命令缓冲 bug 修复 (2026-09-11)
+
+## 现象
+ComfyUI `H3_BinaryT2V` 报 `RuntimeError: H3 引擎失败 (rc=1)`,日志尾部 `audio VAE 7/7` 之后
+`h3: begin streamed video VAE transformer block: unknown Metal error`。用官方权重直连 `./h3`
+复现,确认是 video VAE **流式解码**路径(由自动内存规划器在权重放不下常驻时开启 `vae->streaming`)
+在第一个 block 即失败。
+
+## 根因(GPU 命令缓冲不变量)
+- `h3_gpu_begin`(`h3_gpu.m:937`):`if (!gpu || gpu.command || gpu.inflightCommands.count) return 0;`
+  —— 命令缓冲已开时**直接返回 0 且不设 `lastError`**,调用方 `h3_gpu_error` 于是回退成
+  `"unknown Metal error"`。
+- `h3_gpu_submit`(`h3_gpu.m:976`):提交后 `gpu.command = nil`,**不重新打开**(重新打开只在
+  `h3_gpu_continue:966`)。所以两阶段之间若要继续编码,必须下一次 `h3_gpu_begin` 重新开缓冲。
+
+`run_stream_tile`(`h3_video_vae.c`)原代码缺配对:
+- L614 `h3_gpu_begin("begin streamed video VAE decoder")` 编码 prep ops(L615-628),**此处缺一次 submit**
+  → `gpu.command` 一直开着;
+- 循环 L638 又 `h3_gpu_begin("begin streamed video VAE transformer block")` → 已开 → 返回 0 →
+  "unknown Metal error",整个解码在第一个 block 挂掉;post ops 也因无 begin 而无缓冲。
+
+对照 `run_decoder`(resident,正常):每阶段各有 begin/submit(prep→submit→每 block begin/submit→
+output begin/submit)。原 `run_stream_tile` 是 Phase 18c/18d 把异步预取线程改串行时只保留了循环里的
+per-block begin,却漏了 prep 之后的 submit 与 output 之前的 begin。
+
+## 修复(镜像 `run_decoder`)
+- prep ops 后加 `h3_gpu_submit("submit streamed video VAE prep")`
+- 循环里保留每 block 的 `h3_gpu_begin` + `h3_gpu_submit`(per-block 提交让 `free_block` 在该 block
+  的 GPU 完成后立即回收权重,保留流式省内存语义)
+- post ops 前加 `h3_gpu_begin("begin streamed video VAE output")`
+
+## 验证
+- 直连 `./h3`(与 ComfyUI 节点等价参数):`audio VAE 7/7 → FFmpeg 39/39 → wrote mp4`,270 KB,
+  ffprobe 确认 448×256 / 39 帧 / 1.625s / 含音频流;日志无 Metal/error 串。
+- 全量 `make -j8 all test` 0 警告;`h3_tests`(1768 checks)/`h3_audio_gpu_tests`/
+  `h3_real_audio_vae_e2e_test` 全绿。
+
+## 教训
+GPU 命令缓冲的 begin/submit 必须**成对且各阶段独立**:`h3_gpu_submit` 不留开缓冲,任何
+"在已开缓冲上再 begin"或"submit 后未 begin 就继续编码"都会静默失败成 "unknown Metal error"。
+这与 AudioVAE 的 `submissions==23`(Phase 21)同源——都是串行化改造时漏改一处配对导致的隐性 bug。
+
+## ComfyUI 自定义节点（2026-09-11）
+
+`comfyui_nodes/` 把本项目的 `h3` 二进制封装为 ComfyUI 节点，一节点完成
+「文本/图像/参考 → 视频+原生音频(MP4)」全链路，可替换官方工作流的整条采样链。
+
+| 文件 | 说明 |
+|------|------|
+| `comfyui_nodes/h3_binary.py` | `H3_BinaryT2V` / `H3_BinaryR2V` / `H3_BinaryInfo` |
+| `comfyui_nodes/__init__.py` | 节点注册（`NODE_CLASS_MAPPINGS`） |
+| `comfyui_nodes/README.md` | 安装、参数、前置条件 |
+| `gen_comfyui_workflows.py` | 生成 `h3_binary_t2v.json` / `h3_binary_r2v.json` |
+
+### 关键约束（实现时踩过的坑）
+1. **cwd 必须是二进制所在目录**：引擎用相对路径 `"h3_shaders.metal"`
+   （`h3.c:1071` 等）运行时编译 Metal kernel，否则报
+   `cannot compile h3_shaders.metal`。节点已把子进程 `cwd` 设为该目录。
+2. **`--steps` 范围 `[2, 1000]`**（见 `h3_cli.c` 校验）。
+3. **宽高必须为 32 的倍数**：`h3_frame_grid` 要求 `latent_h/latent_w` 为偶数，
+   而 latent = 像素/16。
+4. **`H3_CLIPPROJ_DIR` 设置后 `FL2VA/text_encoder` 可缺失**
+   （`h3.c:774-797`：4B+ClipProj 路径替代 50 层编码器）。
+5. 输出 `VIDEO` 用 `comfy_api.latest.InputImpl.VideoFromFile(path)` 包装，可直连 `SaveVideo`。
+
+### 实测
+```
+256×256 / 0.5s / 2 步 / core-reuse 4            → 57.8s
+256×256 / 0.5s / 4 步 + turbo LoRA / core-reuse 4 → 69s（auto_steps 自动 20→4）
+```
