@@ -271,7 +271,42 @@
       post ops 前补一个 `h3_gpu_begin`
 - [x] 验证:直连 `./h3` 完整跑通(448×256,1s,4 steps)`audio VAE 7/7 → FFmpeg 39/39 →
       wrote /tmp/h3_verify.mp4`(270 KB;ffprobe: 448×256,39 帧,1.625s,含音频流);日志无
-      Metal/error;全量 `make -j8 all test` 0 警告,三套件全绿。本 session 此前改动未碰 video VAE
+      Metal/error;全量 `make -j8 all test` 0 警告,      三套件全绿。本 session 此前改动未碰 video VAE
+
+### Phase 24: 修复 ComfyUI 子进程找不到 ffmpeg — complete
+- [x] 现象:video VAE 修复后,ComfyUI 跑到 `FFmpeg 0/56` 报 `h3: cannot start FFmpeg: No such
+      file or directory`(rc=1)。直连 `./h3`(agent shell PATH 含 ffmpeg)能过 → 是 ComfyUI 子进程
+      PATH 不含 ffmpeg
+- [x] 根因:引擎 `posix_spawnp("ffmpeg",...,environ)`(h3_ffmpeg.c,8 处)依赖 PATH 查找;已支持
+      `H3_FFMPEG`/`H3_FFPROBE` 覆盖为绝对路径。ComfyUI 由 GUI/launchd 拉起时 PATH 仅含
+      /usr/bin:/bin 等,不含本机 /opt/zerobrew/bin/ffmpeg(及 /usr/local/bin 软链)→ ENOENT
+- [x] 修复(集成层,不碰引擎):`comfyui_nodes/h3_binary.py` 的 `_run_engine` 在传 env 前经
+      `_resolve_ffmpeg_env()` 把 ffmpeg/ffprobe 绝对路径注入 `H3_FFMPEG`/`H3_FFPROBE`
+      (先 `shutil.which`,失败再扫 zerobrew/homebrew/macports/system 常见目录;用户已设则跳过)。
+      **该节点文件在 ComfyUI 目录,不在 h3.c 仓库内**
+- [x] 验证:`env -i PATH=/usr/bin:/bin H3_FFMPEG=/opt/zerobrew/bin/ffmpeg ...` 直连 `./h3` 完整跑通
+      `FFmpeg 39/39 → wrote /tmp/h3_verify2.mp4`(270 KB);节点 `python3 -m py_compile` 通过
+
+### Phase 25: 修复空白提示词产生无意义画面 — complete
+- [x] 现象:ComfyUI 生成的视频"和提示词无任何关系,像编辑器截屏"(近黑+竖向边缘结构)
+- [x] 诊断:用户帧 mean=28.9 / bright=0.000 / gy=28.93(竖向边缘主导);空白提示词 `-p "   "` 复现
+      完全同形态(mean=49.8 / bright=0.008 / gy=49.76);正常提示词 mean=138.7 / bright=0.048。
+      三者对比证实:空白提示词通过引擎 `!*prompt` 检查后 tokenize 近零嵌入 → DiT 生成无条件先验
+      (近黑+竖向结构,恰似暗色编辑器截屏)
+- [x] 修复(集成层):`_build_cmd` 在发命令前 `prompt.strip()` 校验,空白/纯空格抛 ValueError 给
+      出清晰提示(而非等 2 分钟产出垃圾)。**节点文件在 ComfyUI 目录,不在 h3.c 仓库内**
+- [x] 验证:`python3 -m py_compile` 通过;引擎侧仅缺 ClipProj 时才需要 text_encoder 权重
+      (h3.c:774-796,ClipProj 激活时容忍 text_encoder 缺失)
+
+### Phase 26: 定位"画面与提示词无关 + 节点无 prompt 框"真因(接线错误) — complete
+- [x] 现象:Phase 25 修复后仍产出近黑"文字/编辑器截屏"画面,且节点上**找不到 prompt 输入框**
+- [x] 诊断:`GET /object_info/H3_BinaryT2V` 显示 required 第一项确为 `prompt`(multiline),节点定义正常;
+      再读 `user/default/workflows/h3_binary_t2v.json` 发现 node31 的 `prompt` 带 `"link":2`,
+      由 node10 `H3_BinaryInfo.info` 连入 → prompt 被 Convert to Input(故界面无文本框),
+      引擎实际收到的是 `h3 --info` 的整段环境日志文本 → 生成"文字"般画面
+- [x] 结论:**非引擎/节点 bug**,是工作流把"环境检查节点输出"误接进了 prompt
+- [x] 修复指引(界面):删除该连线 → 右键 prompt 输入点 Convert Input to Widget → 填真实提示词重跑
+- [x] 记录:findings.md「生成画面与提示词无关 / 节点无 prompt 输入框 (2026-09-11)」
 
 ## Decisions Made
 | Decision | Rationale |

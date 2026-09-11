@@ -23,6 +23,7 @@
 import math
 import os
 import re
+import shutil
 import subprocess
 import time
 
@@ -162,6 +163,30 @@ def _interrupted() -> bool:
         return False
 
 
+def _resolve_ffmpeg_env():
+    """引擎用 posix_spawnp 查找 ffmpeg/ffprobe（依赖 PATH）。ComfyUI 由 GUI/launchd
+    拉起时 PATH 往往不含 /opt/zerobrew/bin、/usr/local/bin 等，导致
+    'cannot start FFmpeg: No such file or directory'。这里把绝对路径通过
+    H3_FFMPEG / H3_FFPROBE 注入子进程环境（引擎已支持这两个覆盖变量）。"""
+    result = {}
+    for var, name in (("H3_FFMPEG", "ffmpeg"), ("H3_FFPROBE", "ffprobe")):
+        if os.environ.get(var):
+            continue
+        path = shutil.which(name)
+        if not path:
+            for cand in ("/opt/zerobrew/bin", "/usr/local/bin",
+                         "/opt/homebrew/bin", "/opt/local/bin", "/usr/bin"):
+                p = os.path.join(cand, name)
+                if os.path.exists(p):
+                    path = p
+                    break
+        if path:
+            result[var] = path
+        else:
+            print(f"[H3] 警告: 未找到 {name}，请安装 ffmpeg 或设置 {var} 环境变量")
+    return result
+
+
 def _run_engine(cmd, env_extra, tag="H3"):
     """运行引擎二进制，实时转发日志；返回 (returncode, 输出全文)。
 
@@ -170,6 +195,7 @@ def _run_engine(cmd, env_extra, tag="H3"):
     二进制所在目录，否则报 "cannot compile h3_shaders.metal"。
     """
     env = os.environ.copy()
+    env.update(_resolve_ffmpeg_env())
     env.update({k: v for k, v in env_extra.items() if v})
     work_dir = os.path.dirname(os.path.abspath(cmd[0]))
     print(f"[{tag}] exec: {' '.join(cmd)}")
@@ -297,8 +323,12 @@ class _H3BinaryBase:
                 f"请先在 h3.c 目录执行 `make`，或用 `binary` 参数/环境变量 H3_BINARY 指定路径")
         if not os.path.isdir(model_dir):
             raise FileNotFoundError(f"模型目录不存在: {model_dir}")
+        if not (prompt and prompt.strip()):
+            raise ValueError(
+                "提示词为空：ComfyUI 节点的 prompt 框未填写或仅含空白。"
+                "请输入有效提示词（否则引擎会生成与提示词无关的噪声画面）。")
 
-        cmd = [binary, "-d", model_dir, "-p", prompt,
+        cmd = [binary, "-d", model_dir, "-p", prompt.strip(),
                "--width", str(width), "--height", str(height),
                "--seconds", f"{float(seconds):g}",
                "--steps", str(steps), "--seed", str(seed),

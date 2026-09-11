@@ -747,6 +747,57 @@ GPU 命令缓冲的 begin/submit 必须**成对且各阶段独立**:`h3_gpu_subm
 "在已开缓冲上再 begin"或"submit 后未 begin 就继续编码"都会静默失败成 "unknown Metal error"。
 这与 AudioVAE 的 `submissions==23`(Phase 21)同源——都是串行化改造时漏改一处配对导致的隐性 bug。
 
+# ComfyUI 子进程找不到 ffmpeg (2026-09-11)
+
+## 现象
+video VAE 流式解码修复后,ComfyUI 跑到 `FFmpeg 0/56` 报 `h3: cannot start FFmpeg: No such file or directory`。
+直连 `./h3`(agent shell PATH 含 ffmpeg)能完整产出 → 是 ComfyUI 子进程 PATH 问题。
+
+## 根因
+引擎在 mux/读取参考媒体时用 `posix_spawnp(ffmpeg_program(), ...)`(h3_ffmpeg.c,共 8 处),依赖 `environ`
+的 PATH 查找可执行。`ffmpeg_program()`/`ffprobe_program()` 优先取 `H3_FFMPEG`/`H3_FFPROBE`,否则裸名
+`"ffmpeg"`/`"ffprobe"`。ComfyUI 由 GUI/launchd 拉起时 PATH 仅含 `/usr/bin:/bin` 等,不含本机
+`/opt/zerobrew/bin/ffmpeg`(及 `/usr/local/bin` 软链、`/opt/homebrew/bin`)→ `posix_spawnp` 返回 ENOENT。
+
+## 修复(集成层,不碰引擎)
+`comfyui_nodes/h3_binary.py`(`/Volumes/data/Documents/ComfyUI/custom_nodes/h3_binary_nodes/`,**不在 h3.c
+仓库内**)的 `_run_engine` 在拼装子进程 env 时先调 `_resolve_ffmpeg_env()` 把 ffmpeg/ffprobe 绝对路径注入
+`H3_FFMPEG`/`H3_FFPROBE`:先 `shutil.which(name)`,失败再扫 `/opt/zerobrew/bin`、`/usr/local/bin`、
+`/opt/homebrew/bin`、`/opt/local/bin`、`/usr/bin`;用户已在环境设置则跳过。无论 ComfyUI 的 PATH 多精简,
+引擎都用绝对路径拉起 ffmpeg。
+
+## 验证
+`env -i PATH=/usr/bin:/bin H3_FFMPEG=/opt/zerobrew/bin/ffmpeg H3_FFPROBE=/opt/zerobrew/bin/ffprobe ./h3 \
+ -d ... --width 448 --height 256 --seconds 1 --steps 4 -o /tmp/h3_verify2.mp4` 完整跑通
+(`FFmpeg 39/39 → wrote /tmp/h3_verify2.mp4`,270 KB,与正常 PATH 一致),无 "cannot start FFmpeg"。
+节点 `python3 -m py_compile` 通过。
+
+## 教训
+引擎把外部工具(ffmpeg)的查找交给 PATH + 可选环境变量覆盖(`H3_FFMPEG`/`H3_FFPROBE`),是刻意解耦设计;
+GUI/launchd 启动的程序 PATH 极简,集成层(ComfyUI 节点)有责任把绝对路径注入子进程环境,而非依赖 PATH。
+这是"集成环境 ≠ 开发 shell 环境"的典型坑——验证时务必用 `env -i` 最小 PATH 复现,而非只在自己 shell 里跑。
+
+# 空白提示词产生"编辑器截屏"式画面 (2026-09-11)
+
+## 现象
+ComfyUI 生成的视频"和提示词无任何关系",画面近黑、像暗色编辑器截屏。
+
+## 诊断
+对比帧统计(mean / bright>200占比 / 竖向边缘gy):
+- 用户 ComfyUI 输出: mean=28.9 / bright=0.000 / gy=28.93
+- 空白提示词 `-p "   "`: mean=49.8 / bright=0.008 / gy=49.76
+- 正常提示词"fox": mean=138.7 / bright=0.048 / gy=138.71
+
+空白提示词与用户输出**同形态**(近黑+竖向边缘主导+无亮像素),证实为同一成因。
+引擎 prompt 非空检查是 C 字符串 `!*prompt`(h3.c:1218),纯空格通过该检查,但 tokenize 后
+嵌入近零 → DiT 跑无条件生成 → 输出模型无条件先验(近黑+竖向结构,恰似暗色代码编辑器)。
+ClipProj 路径下 `FL2VA/text_encoder` 权重不加载(h3.c:774-796,容忍缺失),与本次无关。
+
+## 修复
+集成层(`comfyui_nodes/h3_binary.py`,不在 h3.c 仓库)_build_cmd 里 `prompt.strip()` 校验,
+空白/纯空格抛 ValueError 给出清晰提示。**未改引擎**——引擎的空检查对 CLI 交互式输入足够,
+ComfyUI 节点作为集成层应替用户拦住无效输入,避免白等 2 分钟产出垃圾。
+
 ## ComfyUI 自定义节点（2026-09-11）
 
 `comfyui_nodes/` 把本项目的 `h3` 二进制封装为 ComfyUI 节点，一节点完成
@@ -775,3 +826,38 @@ GPU 命令缓冲的 begin/submit 必须**成对且各阶段独立**:`h3_gpu_subm
 256×256 / 0.5s / 2 步 / core-reuse 4            → 57.8s
 256×256 / 0.5s / 4 步 + turbo LoRA / core-reuse 4 → 69s（auto_steps 自动 20→4）
 ```
+
+# 生成画面与提示词无关 / 节点无 prompt 输入框 (2026-09-11)
+
+## 现象
+ComfyUI 跑 `H3_BinaryT2V` 产出的视频与提示词毫无关系，画面像「编辑器截屏 / 近黑文字帧」；
+节点上**看不到 prompt 文本框**（只有一块空白 + 左侧一个多余输入点）。
+
+## 根因（工作流接线错误，不是引擎/节点 bug）
+用户工作流 `user/default/workflows/h3_binary_t2v.json` 里，`H3_BinaryT2V`(node 31) 的
+`prompt` 控件被 **Convert to Input** 并连了线：
+```json
+{"name":"prompt","type":"STRING","widget":{"name":"prompt"},"link":2}   // prompt 已变成输入
+"links":[[2, 10, 0, 31, 2, "STRING"]]                                    // 来自 node10=H3_BinaryInfo 的输出0(info)
+"widgets_values":["", 448, 256, ...]                                     // prompt 本身为空 ""，被连线覆盖
+```
+即把 **`H3_BinaryInfo`（运行 `h3 --info` 打印设备/权重清单）的整段日志文本**接到了 prompt。
+→ 引擎收到的提示词 = `h3 --info` 的文字转储，于是生成了「一堆文字」般的画面。
+同时因为控件被转成输入，节点上的文本输入框消失 → 用户以为「没有输入框」。
+
+## 判定方法（无需看界面）
+`GET /object_info/H3_BinaryT2V` 显示 `input_order.required` 第一项就是 `prompt`（`multiline:true`），
+说明节点定义正常；再读工作流 JSON 看到 `prompt` 带 `link` 即确诊接线导致。
+
+## 修复（界面 3 步）
+1. 删除 `H3_BinaryInfo.info → H3_BinaryT2V.prompt` 的连线。
+2. 右键 T2V 节点左侧 `prompt` 输入点 → **Convert Input to Widget**（文本框恢复）。
+3. 输入真正提示词后重跑。
+`H3_BinaryInfo` 的输出只应连到预览/文本显示节点或留空看日志，不得接入 prompt。
+
+## 教训
+- ComfyUI 里控件的 `widget`+`link` 同时存在 = 该控件已被 Convert to Input；界面上文本框会消失，
+  排查「找不到输入框」应优先怀疑此项。
+- ComfyUI 会给 `seed` 自动追加 `control_after_generate` 控件（中文界面显示「生成后控制」，
+  值 `randomize/fixed/…`），**不是**自定义节点定义的控件，勿据此误判节点版本。
+- 「引擎参数校验非空」拦不住此类错误：prompt 非空（是 info 文本），故生成照常进行。
