@@ -356,6 +356,16 @@ class _H3BinaryBase:
                 "提示词为空：ComfyUI 节点的 prompt 框未填写或仅含空白。"
                 "请输入有效提示词（否则引擎会生成与提示词无关的噪声画面）。")
 
+        # 引擎硬限制：core reuse 与 denoiser reuse 不能同时 >1，
+        # 否则引擎直接报错 `core reuse and denoiser reuse cannot be combined`。
+        if core_reuse and core_reuse > 1 and reuse and reuse > 1:
+            raise ValueError(
+                "core_reuse 与 reuse 不能同时 > 1（引擎硬限制：二者互斥）。\n"
+                "二者都是「复用近似」提速手段，只能二选一：\n"
+                "  - core_reuse：每 N 步重算一次核心激活（1 精确 / 4 快速 / 6 激进）\n"
+                "  - reuse：去噪步间细粒度复用（1 close / 2 fast / 3 aggressive）\n"
+                "把其中一个设回 1 即可。")
+
         cmd = [binary, "-d", model_dir, "-p", prompt.strip(),
                "--width", str(width), "--height", str(height),
                "--seconds", f"{float(seconds):g}",
@@ -545,3 +555,107 @@ class H3_BinaryInfo:
                               {"H3_CLIPPROJ_DIR": clipproj_dir,
                                "H3_CLIPPROJ_PROJ": clipproj_proj}, tag="H3_INFO")
         return (log,)
+
+
+# ---------------------------------------------------------------------------
+# 特殊开关 / 环境变量 说明（Markdown）。作为可编辑文本节点呈现；复制本节点的
+# notes 输出到 ComfyUI 内置 "Note" 节点即可在画布上渲染 Markdown。
+# ---------------------------------------------------------------------------
+H3_SWITCHES_DOC = """\
+# H3 引擎 特殊开关与环境变量
+
+> 这些开关都是「近似 / 提速」手段：开大会更快，但输出**不再与精确路径逐 bit 一致**。
+> 追求可复现 / 最高质量时全部回到默认值（core_reuse=1, reuse=1, layers=0, fast_stream=关）。
+
+## 节点加速开关
+
+### core_reuse（--core-reuse，默认 1，1~6）
+核心张量复用间隔。去噪时每 N 步才完整重算一次「核心」中间激活（如部分 hidden state），其间的步直接复用上一次结果做近似。
+- 1 = 每步重算（close，最精确、最慢）
+- 4 = 快速（fast）
+- 6 = 激进（aggressive，最快、画质损失最大）
+适用：质量优先保持 1；想提速又不舍太多画质用 4；快速草稿 / 预览用 6。
+⚠ 与 `reuse` 互斥：二者不能同时 >1（引擎报错 `core reuse and denoiser reuse cannot be combined`），只能二选一。
+
+### reuse（--reuse，默认 1，常用 1~3，引擎上限更高）
+去噪步间细粒度复用。在连续去噪步之间复用 DiT block 内部的中间结果（attention 上下文、投影缓存等），比 core_reuse 颗粒更细。
+- 1 = close（逐步精确）
+- 2 = fast
+- 3 = aggressive（最快）
+适用：与 core_reuse **互斥**——二者不能同时 >1（引擎报错 `core reuse and denoiser reuse cannot be combined`），只能二选一用于提速，不要同时开。
+
+### layers（--layers，默认 0 = 50 块，0~50）
+实际参与的 DiT block 数。
+- 0 = 用 checkpoint 完整块数（默认 50，精确）
+- 45 = 快
+- 40 = 激进
+直接砍掉后半段 transformer 层，提速显著但画质下降。只缩短 DiT 主干，不影响 tokenizer / VAE。
+适用：低质量快速预览。
+
+### fast_stream（节点开关 → H3_DIT_STREAM_WORKERS=2，默认关）
+把 DiT 权重流式预取拆成多 worker 并与 CPU 反旋转重叠。仅在低分辨率（≤384²）权重预取处于关键路径时有效：实测 256²≈1.67×、384²≈1.27×；512² 及以上 GPU 已完全掩盖预取，无效且略慢，故默认关。节点会在低分辨率未开启时主动提示。
+适用：低分辨率批量出图时打开。
+
+### extra_args（附加 CLI 参数）
+直接拼到引擎命令行，用于传节点未暴露的开关，例如：
+- `--video-vae-streaming 0`：强制 VAE 解码器常驻（快，但常驻占 ~9 GiB；16 GB 机器在干扰下可能 OOM）
+- `--video-vae-streaming 1`：强制 VAE 流式（只占 ~0.25 GiB，慢一些）
+- 留空则由自动内存规划器决定（auto）。
+
+## 环境变量（进程级，节点 extra_args / 系统环境均可设）
+
+### H3_DIT_RESIDENT_BLOCKS=N（部分常驻 DiT 块，默认 0）
+保留前 N 个 DiT 块常驻、只流式其余块，用内存换 I/O。实测在 16 GB 上 wall time 几乎不降（甚至略升），因为常驻块与流式路径争抢统一内存；每块约 0.7 GiB，8 块已占 5+ GiB。仅在内存充裕（约 20 块以上能轻松放下）且磁盘是瓶颈时才有收益；16 GB 不要开。
+
+### H3_VIDEO_VAE_STREAMING / --video-vae-streaming（0|1|-1 auto，默认 auto）
+见上「extra_args」。auto 由内存规划器决定：内存紧用流式，内存松用常驻。
+
+### H3_DIT_STREAM_WORKERS / H3_DIT_STREAM_PIPELINE
+即 fast_stream 的底层旋钮（=2 启用分块多 worker；PIPELINE 只调重叠）。一般直接用节点的 fast_stream 开关即可。
+
+### H3_PROFILE=1
+打印 I/O 字节、吞吐、未被 GPU 隐藏的读等待，用于性能诊断。
+
+### H3_CLIPPROJ_DIR / H3_CLIPPROJ_PROJ
+Qwen3-VL 与 ClipProj 路径。节点已通过 clipproj_dir / clipproj_proj 参数自动注入，无需手动设。
+
+### H3_FFMPEG / H3_FFPROBE
+ffmpeg / ffprobe 绝对路径覆盖。节点已自动探测 /opt/zerobrew/bin、/usr/local/bin 等并注入，无需手动设。
+
+### H3_BINARY / H3_MODEL_DIR
+二进制与模型路径。节点已默认读取，也可在 binary / model_dir 参数覆盖。
+
+## 调参优先级（在节点里）
+1. 默认（1/1/0/关）：精确基准。
+2. 想快：低分辨率开 fast_stream；低质量预览把 layers 降到 45/40，或把 core_reuse / reuse 调大。
+3. 质量没达标：全部回到精确（1/1/0）。
+4. 内存紧张（16 GB）：保持 video_vae_streaming 默认（流式），不要开 H3_DIT_RESIDENT_BLOCKS。
+5. 内存充裕且要榨速度：video_vae_streaming=0（常驻 VAE）+ fast_stream（低分辨率）+ 视情况 H3_DIT_RESIDENT_BLOCKS（>16 GB 且磁盘慢）。
+"""
+
+
+class H3_BinaryNote:
+    """H3 引擎特殊开关 / 环境变量说明（Markdown 文本节点）。
+
+    ComfyUI 仅在自带的 "Note" 节点上做画布级 Markdown 渲染，自定义节点无法获得
+    该渲染；本节点把说明作为可编辑文本呈现，复制其 notes 输出到内置 Note 节点即可
+    在画布上预览。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "notes": ("STRING", {"multiline": True, "default": H3_SWITCHES_DOC,
+                                 "dynamicPrompts": False}),
+        }}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("notes",)
+    FUNCTION = "show"
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = True
+    DESCRIPTION = ("H3 引擎特殊开关与环境变量说明（Markdown）；"
+                   "复制 notes 到 ComfyUI 内置 Note 节点即可画布预览")
+
+    def show(self, notes):
+        return (notes,)

@@ -91,3 +91,35 @@ python3 gen_comfyui_workflows.py
   → 节点已自动把子进程 `cwd` 设为该目录。
 - `steps` 合法范围 `[2, 1000]`；宽高必须为 32 的倍数（节点会自动校正）。
 - 实测：256×256 / 0.5s / 4 步（turbo LoRA）/ core-reuse 4 ≈ **69 秒**。
+
+## 特殊开关与环境变量说明
+
+> 与 `H3_BinaryNote` 节点（显示名 "H3 Engine Notes (Markdown)"）的默认文本一致，
+> 可直接加到工作流里随时查看；复制该节点的 `notes` 输出到 ComfyUI 内置 **Note** 节点即可在画布上渲染 Markdown。
+> 这些开关都是「近似 / 提速」手段：开大会更快，但输出**不再与精确路径逐 bit 一致**；
+> 追求可复现 / 最高质量时全部回到默认值（core_reuse=1, reuse=1, layers=0, fast_stream=关）。
+
+### 节点加速开关
+
+- **core_reuse**（`--core-reuse`，默认 1，1~6）：核心张量复用间隔。每 N 步才完整重算一次「核心」中间激活，其间复用上一次结果做近似。1=精确(close)，4=快速(fast)，6=激进(aggressive)。质量优先保持 1；快速草稿用 6。
+- **reuse**（`--reuse`，默认 1，常用 1~3）：去噪步间细粒度复用，复用 DiT block 内部中间结果（attention 上下文、投影缓存等），颗粒比 core_reuse 更细。1=close，2=fast，3=aggressive。**与 core_reuse 互斥**：二者不能同时 >1（引擎报错 `core reuse and denoiser reuse cannot be combined`），只能二选一。
+- **layers**（`--layers`，默认 0=50 块，0~50）：实际参与的 DiT block 数。0=完整(精确)，45=快，40=激进。只缩短 DiT 主干，不影响 tokenizer / VAE；低质量快速预览用 45/40。
+- **fast_stream**（节点开关 → `H3_DIT_STREAM_WORKERS=2`，默认关）：把 DiT 权重流式预取拆成多 worker 并与 CPU 反旋转重叠。仅在低分辨率（≤384²）有效：实测 256²≈1.67×、384²≈1.27×；512² 及以上无效且略慢。低分辨率批量出图时打开。
+- **extra_args**（附加 CLI 参数）：传节点未暴露的开关，例如 `--video-vae-streaming 0|1`（强制 VAE 解码器常驻/流式，见下）。
+
+### 环境变量（进程级；节点 extra_args / 系统环境均可设）
+
+- **H3_DIT_RESIDENT_BLOCKS=N**（默认 0）：前 N 个 DiT 块常驻、其余流式，用内存换 I/O。实测 16 GB 上 wall time 几乎不降（甚至略升），因常驻块与流式路径争抢统一内存；每块约 0.7 GiB。仅在内存充裕（≥20 块能轻松放下）且磁盘是瓶颈时才有收益；16 GB 不要开。
+- **H3_VIDEO_VAE_STREAMING / --video-vae-streaming**（0|1|-1 auto，默认 auto）：0=VAE 解码器常驻（快但占 ~9 GiB，16 GB 干扰下可能 OOM），1=流式（只占 ~0.25 GiB，慢一些），-1=由内存规划器决定。
+- **H3_DIT_STREAM_WORKERS / H3_DIT_STREAM_PIPELINE**：fast_stream 的底层旋钮（=2 启用分块多 worker；PIPELINE 只调重叠），一般直接用节点 fast_stream 开关。
+- **H3_PROFILE=1**：打印 I/O 字节、吞吐、未被 GPU 隐藏的读等待，性能诊断用。
+- **H3_CLIPPROJ_DIR / H3_CLIPPROJ_PROJ**：节点已通过 clipproj_dir / clipproj_proj 参数自动注入。
+- **H3_FFMPEG / H3_FFPROBE**：节点已自动探测并注入；**H3_BINARY / H3_MODEL_DIR**：节点默认读取，也可参数覆盖。
+
+### 调参优先级
+
+1. 默认（1/1/0/关）：精确基准。
+2. 想快：低分辨率开 fast_stream；低质量预览把 layers 降到 45/40，或把 core_reuse / reuse 调大。
+3. 质量没达标：全部回到精确（1/1/0）。
+4. 内存紧张（16 GB）：保持 video_vae_streaming 默认（流式），不要开 H3_DIT_RESIDENT_BLOCKS。
+5. 内存充裕且要榨速度：video_vae_streaming=0（常驻 VAE）+ fast_stream（低分辨率）+ 视情况 H3_DIT_RESIDENT_BLOCKS（>16 GB 且磁盘慢）。
