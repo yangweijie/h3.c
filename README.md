@@ -621,6 +621,28 @@ interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
 
+The video VAE decoder is the other residency decision on the same machine. By
+default the auto planner streams it when the working set is tight and keeps it
+resident otherwise; `--video-vae-streaming 0` forces the resident decoder
+(faster, ~9.4 GiB) and `--video-vae-streaming 1` forces streaming (~0.25 GiB).
+Either value overrides only that one decision and leaves the planner's other
+choices (DiT streaming, int8, layer count) intact; `-1` or unset defers to the
+planner. This is narrower than `--ssd-streaming`, which skips the planner
+entirely.
+
+Measured on an M4/16 GB (256x256, 2 s, 4 steps, same seed, byte-identical
+output):
+
+| video VAE decoder | total | decode | resident GiB |
+| --- | --- | --- | --- |
+| streamed (default) | 112.5 s | 29.3 s | 0.61 |
+| resident (`--video-vae-streaming 0`) | 104.7 s | 19.8 s | 9.37 |
+
+The resident decoder is faster but holds ~9.4 GiB; on 16 GB the run sits at the
+memory edge (an interrupted run was killed by the OS under memory pressure).
+Prefer it when the machine is idle, or keep the default on constrained systems.
+In the ComfyUI node, pass it through `extra_args`.
+
 #### Streamed DiT weight prefetch (opt-in)
 
 The `--ssd-streaming` reader is a single thread that preads a block's int8
