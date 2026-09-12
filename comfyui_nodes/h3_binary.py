@@ -23,9 +23,11 @@
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
+from collections import deque
 
 # 本包位于 <h3.c>/comfyui_nodes/ → 上溯一级即项目根，二进制默认取同级的 h3
 _H3_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -134,9 +136,17 @@ def _save_image(img, name: str) -> str:
     for attr in ("detach", "cpu"):
         if hasattr(arr, attr):
             arr = getattr(arr, attr)()
-    arr = np.clip(np.asarray(arr, dtype="float32"), 0.0, 1.0)
-    if arr.ndim == 3 and arr.shape[0] == 1:      # 单帧 [1,H,W,C]
+    arr = np.asarray(arr, dtype="float32")
+    # ComfyUI 的 IMAGE 是 [N,H,W,C]（N 通常为 1）。原先只判断 ndim==3，
+    # 于是 [1,H,W,C] 会被原样交给 PIL 而报错；这里按维度统一归一到 [H,W,C]。
+    if arr.ndim == 4:
+        if arr.shape[0] != 1:
+            print(f"[H3] 提示: 输入是 {arr.shape[0]} 帧的批次，只使用第 1 帧")
         arr = arr[0]
+    if arr.ndim != 3 or arr.shape[-1] not in (3, 4):
+        raise ValueError(
+            f"图像张量形状无法识别: {tuple(arr.shape)}（期望 [N,H,W,C]）")
+    arr = np.clip(arr, 0.0, 1.0)
     d = os.path.join(_comfy_temp_dir(), "h3_binary_in")
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, name)
@@ -204,7 +214,9 @@ def _run_engine(cmd, env_extra, tag="H3"):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
                             bufsize=1, env=env, cwd=work_dir)
-    lines = []
+    # 进度行会逐条刷新，长任务下日志可以很长；只保留尾部即可
+    # （错误信息只用到最后 25 行）。
+    lines = deque(maxlen=2000)
     try:
         for raw in proc.stdout:
             line = raw.rstrip()
@@ -215,6 +227,8 @@ def _run_engine(cmd, env_extra, tag="H3"):
                 proc.kill()
                 raise RuntimeError("用户取消（已终止引擎进程）")
     finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
         if proc.poll() is None:
             proc.wait()
     dt = time.time() - t0
@@ -256,11 +270,10 @@ class _H3BinaryBase:
             "lora": ("STRING", {
                 "default": "",
                 "tooltip": "LoRA 路径；多个用逗号分隔，按顺序合并（如 default,turbo）"}),
-        }
-
-    @classmethod
-    def _common_optional(cls):
-        return {
+            # 以下几项原先在 optional：optional 里的 widget 会被前端折叠
+            # （序列化成 "shape": 7）而在节点上看不见。把它们整体前移成 required
+            # 的「连续前缀」，前端 widget 顺序就与改动前逐项一致，旧工作流的
+            # widgets_values 依然对位 —— 不能只挑其中几项移动，那样会打乱顺序。
             "auto_steps": ("BOOLEAN", {
                 "default": True,
                 "tooltip": "按 LoRA 名自动校正步数：turbo/4step/8step → 4/8 步，无 LoRA → 20 步"}),
@@ -280,6 +293,12 @@ class _H3BinaryBase:
                 "tooltip": "低分辨率流式提速（H3_DIT_STREAM_WORKERS=2）：把 DiT 权重流式预取"
                            "拆成多 worker 并与 CPU 反旋转重叠。实测 256×256 1.70×、384×384 1.27×；"
                            "512×512 及以上无效（GPU 已完全掩盖预取）且略慢，故默认关闭"}),
+        }
+
+    @classmethod
+    def _common_optional(cls):
+        return {
+            # 纯环境配置，默认值即正确值，留在 optional（折叠）里避免节点过长。
             "binary": ("STRING", {"default": _DEFAULT_BINARY}),
             "clipproj_dir": ("STRING", {"default": _DEFAULT_CLIPPROJ_DIR}),
             "clipproj_proj": ("STRING", {"default": _DEFAULT_CLIPPROJ_PROJ}),
@@ -353,7 +372,11 @@ class _H3BinaryBase:
         if extra:
             cmd += extra
         if extra_args:
-            cmd += extra_args.split()
+            try:
+                cmd += shlex.split(extra_args)
+            except ValueError as exc:
+                raise ValueError(
+                    f"extra_args 解析失败（引号不配对？）: {extra_args}") from exc
         return cmd
 
     def _output_path(self, output_path, prefix):
@@ -511,6 +534,9 @@ class H3_BinaryInfo:
     FUNCTION = "run"
     CATEGORY = CATEGORY
     DESCRIPTION = "运行 h3 --info（设备 + 各组件权重文件数/GiB）"
+    # 输出没有被其它节点消费时，ComfyUI 不会执行这个节点；而它的用途恰恰是
+    # 「跑一下看日志」，所以必须自行声明为输出节点，否则不连线就完全不跑。
+    OUTPUT_NODE = True
 
     def run(self, model_dir, binary, clipproj_dir, clipproj_proj):
         if not os.path.isfile(binary):
