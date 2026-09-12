@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import time
 from collections import deque
@@ -236,6 +237,66 @@ def _run_engine(cmd, env_extra, tag="H3"):
     return proc.returncode, "\n".join(lines)
 
 
+_H3_LATENT_MAGIC = 0x48334C54  # 引擎 --latent-out 写出的 raw latent 文件魔数 ("H3LT")
+
+
+def _read_h3_latent(path):
+    """读取引擎 --latent-out 写出的 latent 包 → ComfyUI LATENT dict。
+
+    返回 {"samples": [1,C,T,H,W], "h3_audio": [32,2,T_audio] 或 None}。
+    h3_audio 是 H3 原生音频 latent（channel-major [32,2,T]），由
+    H3_BinaryLatentDecode 透传给引擎做音频 VAE 解码，从而保留音轨。
+    """
+    import numpy as np
+    import torch
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, version = struct.unpack_from("II", data, 0)
+    if magic != _H3_LATENT_MAGIC:
+        raise RuntimeError(
+            f"latent 文件魔数错误: {path}（不是 h3 --latent-out 产物）")
+    if version != 2:
+        raise RuntimeError(
+            f"latent 文件版本不支持: {path}（期望 v2，得到 v{version}）")
+    t, h, w, c = struct.unpack_from("iiii", data, 8)
+    off = 24
+    vn = c * t * h * w
+    arr = np.frombuffer(data, dtype=np.float32, count=vn, offset=off).reshape(c, t, h, w)
+    off += vn * 4
+    (ap,) = struct.unpack_from("i", data, off)
+    off += 4
+    audio = None
+    if ap:
+        ac, a_stereo, at = struct.unpack_from("iii", data, off)
+        off += 12
+        an = ac * a_stereo * at
+        audio = np.frombuffer(data, dtype=np.float32, count=an, offset=off).reshape(ac, a_stereo, at)
+    tensor = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)  # [1,C,T,H,W]
+    return {"samples": tensor, "h3_audio": audio}
+
+
+def _write_h3_latent(latent, path):
+    """把 ComfyUI LATENT（samples: [B,C,T,H,W]，可选 h3_audio: [32,2,T]）写回引擎 raw 包。"""
+    import numpy as np
+    samples = latent["samples"]
+    arr = samples.detach().cpu().numpy()
+    if arr.ndim == 5:
+        arr = arr[0]  # [C,T,H,W]
+    c, t, h, w = arr.shape
+    audio = latent.get("h3_audio")
+    audio = np.ascontiguousarray(audio, dtype=np.float32) if audio is not None else None
+    with open(path, "wb") as f:
+        f.write(struct.pack("IIiiii", _H3_LATENT_MAGIC, 2, t, h, w, c))
+        f.write(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+        if audio is not None:
+            at = int(audio.shape[-1])  # [32,2,T]
+            f.write(struct.pack("i", 1))
+            f.write(struct.pack("iii", int(audio.shape[0]), int(audio.shape[1]), at))
+            f.write(audio.tobytes())
+        else:
+            f.write(struct.pack("i", 0))
+
+
 class _H3BinaryBase:
     """两个节点共用的参数与执行逻辑。"""
 
@@ -344,7 +405,7 @@ class _H3BinaryBase:
 
     def _build_cmd(self, binary, model_dir, prompt, width, height, seconds,
                    steps, seed, lora, output_path, core_reuse, reuse, layers,
-                   extra_args, extra=None):
+                   extra_args, extra=None, latent_out=None):
         if not os.path.isfile(binary):
             raise FileNotFoundError(
                 f"H3 引擎二进制不存在: {binary}\n"
@@ -379,6 +440,8 @@ class _H3BinaryBase:
             cmd += ["--reuse", str(reuse)]
         if layers and layers > 0:
             cmd += ["--layers", str(layers)]
+        if latent_out:
+            cmd += ["--latent-out", latent_out]
         if extra:
             cmd += extra
         if extra_args:
@@ -525,6 +588,158 @@ class H3_BinaryR2V(_H3BinaryBase):
         rc, log = _run_engine(cmd, self._engine_env(clipproj_dir, clipproj_proj,
                                                     fast_stream), tag="H3_R2V")
         return self._finish(rc, out_path, log)
+
+
+class H3_BinaryLatent(H3_BinaryT2V):
+    """文本/首尾帧 → 视频 + 视频 latent（FL2VA），音频 latent 一并携带。
+
+    与 H3_BinaryT2V 相同地出视频（含原生音频），*额外*把去噪后的视频 latent
+    ([C=24,T,H,W]) 与音频 latent ([32,2,T]) 一并写出到 LATENT 字典
+    （键 samples / h3_audio）。latent 接 H3_BinaryLatentUpscale（仅空间上采样，
+    音频原样透传）→ H3_BinaryLatentDecode 即可做 latent 空间放大且保留音轨。
+    """
+    RETURN_TYPES = ("VIDEO", "LATENT", "STRING")
+    RETURN_NAMES = ("video", "latent", "video_path")
+    DESCRIPTION = ("H3 引擎(C 二进制) 文本/首尾帧 → 视频+音频 + 视频/音频 latent；"
+                   "latent 接 Upscale/Decode 节点可做 latent 空间上采样且保留音轨")
+
+    def generate(self, prompt, width, height, resolution_preset, seconds, steps, seed,
+                 lora="", auto_steps=True, model_dir=_DEFAULT_MODEL_DIR, output_path="",
+                 core_reuse=1, reuse=1, layers=0, fast_stream=False,
+                 binary=_DEFAULT_BINARY,
+                 clipproj_dir=_DEFAULT_CLIPPROJ_DIR,
+                 clipproj_proj=_DEFAULT_CLIPPROJ_PROJ, extra_args="",
+                 first_frame=None, last_frame=None):
+        width, height, steps = self._resolve_inputs(
+            width, height, resolution_preset, steps, lora, auto_steps)
+        self._fast_stream_hint(width, height, fast_stream)
+        extra = []
+        if first_frame is not None:
+            extra += ["--first-frame", _save_image(first_frame, "first_frame.png")]
+        if last_frame is not None:
+            extra += ["--last-frame", _save_image(last_frame, "last_frame.png")]
+
+        out_path = self._output_path(output_path, "h3_t2v")
+        latent_path = os.path.abspath(os.path.join(
+            _comfy_temp_dir(), "h3_binary_out",
+            f"latent_{int(time.time() * 1000)}.bin"))
+        cmd = self._build_cmd(binary, model_dir, prompt, width, height, seconds,
+                              steps, seed, lora, out_path, core_reuse, reuse,
+                              layers, extra_args, extra, latent_out=latent_path)
+        rc, log = _run_engine(cmd, self._engine_env(clipproj_dir, clipproj_proj,
+                                                    fast_stream), tag="H3_LATENT")
+        if rc != 0 or not os.path.isfile(out_path):
+            tail = "\n".join(log.splitlines()[-25:])
+            raise RuntimeError(
+                f"H3 引擎失败 (rc={rc})，输出文件"
+                f"{'存在' if os.path.isfile(out_path) else '不存在'}\n"
+                f"--- 日志尾部 ---\n{tail}")
+        latent = None
+        if os.path.isfile(latent_path):  # latent 是附赠，读取失败不阻断视频返回
+            try:
+                latent = _read_h3_latent(latent_path)
+            except Exception as exc:
+                print(f"[H3] 警告: 读取 latent 失败（仍返回视频）: {exc}")
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        print(f"[H3] 完成: {out_path} ({size_mb:.2f} MB)"
+              + (f"，latent→{latent_path}" if latent else ""))
+        return (_make_video(out_path), latent, out_path)
+
+
+class H3_BinaryLatentUpscale:
+    """视频 latent 空间上采样（纯 Python，不调引擎）。
+
+    仅放大空间 H,W，保持通道 C 与时间 T 不变（T 不变以维持 VAE 时序对齐）。
+    接 H3_BinaryLatentDecode 即用上采样后的 latent 解出更高分辨率视频。
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT",),
+            "factor": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.5,
+                                "tooltip": "空间放大倍数（仅 H,W；T 不变以保持 VAE 时序对齐）"}),
+            "mode": (["trilinear", "bicubic", "nearest"], {"default": "trilinear",
+                       "tooltip": "插值方式；5D latent 用 trilinear（等价于对 H,W 做 bilinear）"}),
+        }}
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "upscale"
+    CATEGORY = CATEGORY
+    DESCRIPTION = "latent 空间 (H,W) 上采样，保持 C/T；接 H3_BinaryLatentDecode 出高清视频"
+
+    def upscale(self, latent, factor, mode):
+        import torch
+        import torch.nn.functional as F
+        samples = latent["samples"]
+        if factor == 1.0:
+            out = samples
+        else:
+            kwargs = {"scale_factor": (1.0, float(factor), float(factor)), "mode": mode}
+            if mode != "nearest":
+                kwargs["align_corners"] = False
+            out = F.interpolate(samples, **kwargs)
+        # 空间上采样只动 H,W（T 不变），音频 latent 原样透传以保持时序对齐
+        result = {"samples": out}
+        if latent.get("h3_audio") is not None:
+            result["h3_audio"] = latent["h3_audio"]
+        return (result,)
+
+
+class H3_BinaryLatentDecode:
+    """视频 latent → 视频（直接走 VAE 解码，跳过 DiT 去噪，保留音轨）。
+
+    接在 H3_BinaryLatent / H3_BinaryLatentUpscale 之后。LATENT 字典里的
+    h3_audio（音频 latent）会被透传给引擎做音频 VAE 解码并合入 MP4；若没有
+    h3_audio（旧 latent 或纯视频 latent）则回退为静音音轨。
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT",),
+            "width": ("INT", {"default": 864, "min": 64, "max": 2048, "step": 32,
+                             "tooltip": "最终视频宽（VAE 输出会缩放到此）"}),
+            "height": ("INT", {"default": 480, "min": 64, "max": 2048, "step": 32}),
+            "model_dir": ("STRING", {"default": _DEFAULT_MODEL_DIR}),
+            "binary": ("STRING", {"default": _DEFAULT_BINARY}),
+            "clipproj_dir": ("STRING", {"default": _DEFAULT_CLIPPROJ_DIR}),
+            "clipproj_proj": ("STRING", {"default": _DEFAULT_CLIPPROJ_PROJ}),
+        }}
+
+    RETURN_TYPES = ("VIDEO", "STRING")
+    RETURN_NAMES = ("video", "video_path")
+    FUNCTION = "decode"
+    CATEGORY = CATEGORY
+    DESCRIPTION = "latent → 视频（VAE 解码；若含 h3_audio 则保留音轨）；接在 H3_BinaryLatent/Upscale 之后"
+
+    def decode(self, latent, width, height, model_dir=_DEFAULT_MODEL_DIR,
+               binary=_DEFAULT_BINARY,
+               clipproj_dir=_DEFAULT_CLIPPROJ_DIR,
+               clipproj_proj=_DEFAULT_CLIPPROJ_PROJ):
+        if not os.path.isfile(binary):
+            raise FileNotFoundError(
+                f"H3 引擎二进制不存在: {binary}\n"
+                f"请先在 h3.c 目录执行 `make`，或用 binary 参数/环境变量 H3_BINARY 指定")
+        latent_path = os.path.abspath(os.path.join(
+            _comfy_temp_dir(), "h3_binary_out",
+            f"decode_{int(time.time() * 1000)}.bin"))
+        _write_h3_latent(latent, latent_path)
+        d = os.path.abspath(os.path.join(_comfy_temp_dir(), "h3_binary_out"))
+        os.makedirs(d, exist_ok=True)
+        out_path = os.path.join(d, f"h3_latent_dec_{int(time.time()*1000)}.mp4")
+        cmd = [binary, "-d", model_dir, "--latent-in", latent_path,
+               "--width", str(width), "--height", str(height), "-o", out_path]
+        rc, log = _run_engine(cmd,
+                             {"H3_CLIPPROJ_DIR": clipproj_dir,
+                              "H3_CLIPPROJ_PROJ": clipproj_proj},
+                             tag="H3_LATENT_DEC")
+        if rc != 0 or not os.path.isfile(out_path):
+            tail = "\n".join(log.splitlines()[-25:])
+            raise RuntimeError(
+                f"H3 latent 解码失败 (rc={rc})\n--- 日志尾部 ---\n{tail}")
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        print(f"[H3] 解码完成: {out_path} ({size_mb:.2f} MB)")
+        return (_make_video(out_path), out_path)
 
 
 class H3_BinaryInfo:

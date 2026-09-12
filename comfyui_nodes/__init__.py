@@ -19,13 +19,17 @@
 2. 设置 `H3_CLIPPROJ_DIR` + `H3_CLIPPROJ_PROJ`（设了则 `FL2VA/text_encoder` 可缺失）。
 3. R2V 需安装 `Ref2VA/` 权重。
 """
-from .h3_binary import H3_BinaryT2V, H3_BinaryR2V, H3_BinaryInfo, H3_BinaryNote
+from .h3_binary import (H3_BinaryT2V, H3_BinaryR2V, H3_BinaryInfo, H3_BinaryNote,
+                         H3_BinaryLatent, H3_BinaryLatentUpscale, H3_BinaryLatentDecode)
 
 NODE_CLASS_MAPPINGS = {
     "H3_BinaryT2V": H3_BinaryT2V,
     "H3_BinaryR2V": H3_BinaryR2V,
     "H3_BinaryInfo": H3_BinaryInfo,
     "H3_BinaryNote": H3_BinaryNote,
+    "H3_BinaryLatent": H3_BinaryLatent,
+    "H3_BinaryLatentUpscale": H3_BinaryLatentUpscale,
+    "H3_BinaryLatentDecode": H3_BinaryLatentDecode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -33,6 +37,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3_BinaryR2V": "H3 Engine R2V (C binary)",
     "H3_BinaryInfo": "H3 Engine Info (C binary)",
     "H3_BinaryNote": "H3 Engine Notes (Markdown)",
+    "H3_BinaryLatent": "H3 Engine Latent (C binary)",
+    "H3_BinaryLatentUpscale": "H3 Latent Upscale",
+    "H3_BinaryLatentDecode": "H3 Latent Decode (C binary)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -1178,3 +1178,49 @@ planner 算出的 5 个决策里，**2 个从未被消费**。
 ## 结论
 - `encoder_streaming` → **删除**（冗余，意图已天然实现）。
 - `cache_budget_bytes` → 先做代理实验（`--layers 40` 验证线性），再定接线或删除。
+
+# ===== 本任务发现: H3 latent 子系统（音频 latent 与落盘格式）=====
+
+## 音频 latent 的真实格式（关键，此前未 pin 过）
+- `h3_audio_latent`（`h3_audio_vae.h:17-24`）：`channels=32, stereo=2, length=T`，
+  `values` 布局 **[32,2,T]** channel-major，归一化 posterior means。
+- 解码入口 `h3_audio_vae_decode(weight_dir, shader, normalized_latent, latent_length, …)`；
+  主路径调用 `h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio, temporal.audio_t, …)`
+  —— `audio` 缓冲即该 `[32,2,T]` 张量。
+- **与视频 latent 不同秩**：视频是 `[C,T,H,W]`（4D），音频是 `[32,2,T]`（3D、无空间维）。
+  → 空间上采样与音频无关；音频只需原样透传。
+
+## 落盘点为何恰好正确
+h3.c 主路径顺序：**2119 落盘** → 2135 音频 VAE 解码 → 2158 视频 VAE 解码；
+`free(audio)` 在 **2141**。故落盘点处 `audio` 仍有效，且**尚未被 transform**，
+正是 `h3_audio_vae_decode` 期望的输入 → 直接 dump 即得**精确往返**（无需逆变换）。
+视频 latent 同理：`h3_video_vae_decode` 内部才做 `z*std+mean`，dump 的是变换前的 z。
+
+## latent 文件格式 v1 → v2
+```
+v2 布局（小端、全 int32/float32）：
+  uint32 magic = 0x48334C54 ("H3LT")
+  int32  version = 2
+  int32  video_t, video_h, video_w, video_c
+  c*t*h*w float32     // 视频 latent [C,T,H,W]
+  int32  audio_present (0/1)
+  if audio_present:
+    int32 audio_c, audio_s, audio_t
+    c*s*t float32     // 音频 latent [32,2,T]
+```
+v1 无 version 字段且只有视频 → 无法区分是否含音频，故整体升级（中间产物不向后兼容）。
+
+## 音频合成的两个易错点
+1. `h3_ffmpeg_write_av_rgb24_f32` 对 **NULL pcm 直接失败**（`h3_ffmpeg.c:620-624`），
+   所以「无音频」分支必须显式 calloc 静音轨，不能传 NULL。
+2. `waveform` 的 pcm 由 `h3_audio_vae_decode` 分配 → 必须用
+   `h3_audio_waveform_free(&waveform)` 释放（照主路径 h3.c:2266 写法），
+   直接 `free(pcm)` 会重复释放。
+
+## 官方工作流音频路径（对照，已用本地官方 JSON 解析确认）
+- `video_minimax_h3_r2v.json`：`SamplerCustomAdvanced.output` **同时**连
+  `VAEDecode`(video) 与 `VAEDecodeAudio`(audio) → `CreateVideo` 合成。
+- 这些官方文件里**没有** `MinimaxH3LatentUpscaler3D` 节点（均为单阶段）；
+  `LatentUpscaler3D` 只出现在我们改造的工作流里（且已移除）。
+- `MiniMaxH3_Convrot_Workflow.json` 变体：`output`→`VAEDecode`、
+  `denoised_output`→`VAEDecodeAudio`，两路并行后 `CreateVideo` 合成。

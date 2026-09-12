@@ -144,6 +144,12 @@ typedef struct {
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
+    /* Dump the denoised video latent (z-space, [C=24,T,H,W] layout) to PATH after
+     * denoising, in addition to the normal video output. Read back with --latent-in. */
+    const char *latent_out_path;
+    /* Decode a pre-existing latent file (written by --latent-out) straight to
+     * video, skipping denoising entirely. Requires --output/-o. */
+    const char *latent_in_path;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
@@ -155,6 +161,7 @@ typedef struct {
     .core_reuse = 1, \
     .video_vae_streaming = -1, \
     .memory_plan_auto = 1, \
+    .latent_out_path = NULL, .latent_in_path = NULL, \
 }
 
 typedef struct {
@@ -221,6 +228,8 @@ void h3_cache_set_disk_dir(h3_ctx *ctx, const char *directory);
 /* Generate media, delivering decoded frames incrementally through on_frame. */
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params);
+/* Decode a latent file (--latent-in) to video without denoising. */
+h3_result *h3_decode_latent(h3_ctx *ctx, const h3_params *params);
 void h3_result_free(h3_result *result);
 
 #ifdef __cplusplus

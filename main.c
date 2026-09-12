@@ -74,6 +74,9 @@ static void usage(const char *program) {
         "      --sr-model NAME    Model name (default: realesrgan-x4plus)\n"
         "      --sr-target WxH    Final resolution after SR (else inner*scale)\n"
         "      --sr-scale N       Upscale 2/3/4 when no --sr-target (default 4)\n"
+        "      --latent-out PATH  Also dump the denoised video latent (raw) to PATH\n"
+        "      --latent-in PATH   Decode a latent file to video, skipping denoise\n"
+        "                         (requires --output/-o)\n"
         "  -h, --help             Show this help\n",
         program, program, program);
 }
@@ -291,7 +294,7 @@ int main(int argc, char **argv) {
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
            OPT_PROFILE, OPT_INFO,
            OPT_SR, OPT_SR_BIN, OPT_SR_MODEL_DIR, OPT_SR_MODEL,
-           OPT_SR_TARGET, OPT_SR_SCALE };
+           OPT_SR_TARGET, OPT_SR_SCALE, OPT_LATENT_OUT, OPT_LATENT_IN };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -354,6 +357,8 @@ int main(int argc, char **argv) {
         {"sr-model", required_argument, NULL, OPT_SR_MODEL},
         {"sr-target", required_argument, NULL, OPT_SR_TARGET},
         {"sr-scale", required_argument, NULL, OPT_SR_SCALE},
+        {"latent-out", required_argument, NULL, OPT_LATENT_OUT},
+        {"latent-in", required_argument, NULL, OPT_LATENT_IN},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
@@ -546,6 +551,8 @@ int main(int argc, char **argv) {
                 sr_scale = s;
                 break;
             }
+            case OPT_LATENT_OUT: params.latent_out_path = optarg; break;
+            case OPT_LATENT_IN: params.latent_in_path = optarg; break;
             default: usage(argv[0]); return 2;
         }
     }
@@ -582,8 +589,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (info) print_info(ctx);
+    params.output_path = output;
     if (prompt) {
-        params.output_path = output;
         params.on_progress = cli_progress;
         params.callback_opaque = &cli;
         if (cli.frames_dir) params.on_frame = cli_frame;
@@ -639,6 +646,15 @@ int main(int argc, char **argv) {
         if (output && *output) fprintf(stderr, "h3: wrote %s\n", output);
         if (cli.frames_dir)
             fprintf(stderr, "h3: wrote frames to %s\n", cli.frames_dir);
+    } else if (params.latent_in_path && *params.latent_in_path) {
+        h3_result *result = h3_decode_latent(ctx, &params);
+        if (!result) {
+            fprintf(stderr, "h3: %s\n", h3_last_error(ctx));
+            h3_free(ctx);
+            return 1;
+        }
+        h3_result_free(result);
+        if (output && *output) fprintf(stderr, "h3: wrote %s\n", output);
     } else if (!info) {
         int cli_status = h3_cli_run(ctx, model_dir, &params, show, seed_given);
         h3_free(ctx);

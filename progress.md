@@ -762,3 +762,43 @@ dequant 87ms → 理想 173.5ms → 去噪 ≈17.4s；当前 199.6ms，差 15% �
 |---|---|---|
 | ComfyUI 节点 `binary` 收到模型目录路径 | 1 | 定位为 widgets_values 整体错位（缺 `fast_stream`/`control_after_generate`），修生成器并重生成 |
 | `--video-vae-streaming 0` 进程 rc=-9 | 1 | 非代码问题：用户同时开浏览器导致内存不足；干净环境重跑 104.7 s 成功 |
+
+# ===== 本 session: H3 latent 子系统（ComfyUI）往返保留音频 =====
+
+## 起因
+用户指出：官方工作流能「视频 VAE + 音频 VAE 并行 → CreateVideo」保留音频，
+而我们的 `H3_BinaryLatent` 只 dump 视频 latent → 走 latent 往返会**丢音频**。
+该判断经核对为**正确**：`--latent-out` 原实现只写 `video`，`audio` 缓冲从未落盘；
+`H3_BinaryLatentDecode` 也只做视频 VAE 解码并写静音轨。
+
+## 用户选定方案
+**(i) 空间上采样 + 音频透传保留音频**（另两选项：接受无声分支 / 连时间维也上采样）。
+
+## 改动清单
+| 文件 | 改动 |
+|---|---|
+| `h3.c` | `write_video_latent`→`write_latent_bundle`（写视频+音频 latent）；`read_video_latent`→`read_latent_bundle`（含 version 校验）；`h3_decode_latent` 末尾改「有音频 latent 则解音频并 mux，否则静音」 |
+| `comfyui_nodes/h3_binary.py` | `_read/_write_h3_latent` 升级 v2 携带 `h3_audio`；`H3_BinaryLatentUpscale` 透传 `h3_audio`；`H3_BinaryLatentDecode` 写回带音频；更新两处 docstring + 1 处 DESCRIPTION |
+
+## 验证（真机，256×256 / 2s / 20 步，模型 MiniMax-H3-Convrot）
+1. 生成 + `--latent-out`：日志 `latent 17/17`、`audio VAE 7/7`，写出 `/tmp/h3_out.mp4`。
+2. `ffprobe` 原片：`0,video` + `1,audio` ✓
+3. `--latent-in` 回解：写出 `/tmp/h3_dec.mp4`，`ffprobe` 同样是 `0,video` + `1,audio`。
+4. **决定性验证**（排除静音兜底）：抽取两份音轨为 f32le wav →
+   **字节数 598108 相同、MD5 完全一致 `56ab82615d7b9054464f6bb13cd1187d`**；
+   解码音频最大振幅 **1.005 > 0**（非静音）。→ 音频 latent 被逐字节带回。
+5. 真实节点链（anaconda python 调 `H3_BinaryLatentUpscale`）：
+   - 读回 `samples (1,24,17,16,16)` + `h3_audio (32,2,93)`
+   - factor=2 `trilinear` 上采样 → `samples (1,24,17,32,32)`、`h3_audio (32,2,93)` **未动** ✓
+   - 回解 → `0,video,512,512` + `1,audio`，解码音频振幅 1.005（音频透传）✓
+
+## 结论
+方案 (i) 落地完成：**空间上采样不影响音轨，latent 往返保留 H3 原生音频**。
+
+## 已知限制
+- latent 格式 v2 与改动前生成的旧 `.bin` 不兼容（中间产物，无影响）。
+- 音频 VAE 路径硬编码 `FL2VA/audio_vae` —— 与 latent 节点的 FL2VA(T2V) 定位一致；
+  若将来做 R2V latent 需按 `ref2va` 切换为 `Ref2VA/audio_vae`。
+
+## Errors Encountered（本 session）
+（无）

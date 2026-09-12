@@ -30,6 +30,9 @@ ln -s /Volumes/data/git/c/h3.c/comfyui_nodes \
 | `H3_BinaryT2V` | 文本 / 首尾帧 → 视频（FL2VA） | `VIDEO`, `video_path` |
 | `H3_BinaryR2V` | 参考图/视频/音频 → 视频（Ref2VA） | `VIDEO`, `video_path` |
 | `H3_BinaryInfo` | 跑 `h3 --info` 看设备/权重清单 | `info` |
+| `H3_BinaryLatent` | 文本/首尾帧 → 视频 + 视频 latent（FL2VA） | `VIDEO`, `LATENT`, `video_path` |
+| `H3_BinaryLatentUpscale` | 视频 latent 空间上采样（纯 Python） | `LATENT` |
+| `H3_BinaryLatentDecode` | 视频 latent → 视频（VAE 解码，无音频） | `VIDEO`, `video_path` |
 
 ### 参数
 
@@ -123,3 +126,49 @@ python3 gen_comfyui_workflows.py
 3. 质量没达标：全部回到精确（1/1/0）。
 4. 内存紧张（16 GB）：保持 video_vae_streaming 默认（流式），不要开 H3_DIT_RESIDENT_BLOCKS。
 5. 内存充裕且要榨速度：video_vae_streaming=0（常驻 VAE）+ fast_stream（低分辨率）+ 视情况 H3_DIT_RESIDENT_BLOCKS（>16 GB 且磁盘慢）。
+
+## Latent 子系统（生成 / 上采样 / 解码）
+
+把 H3 引擎当可「中断在 VAE 解码前」的推理后端：先产出**视频 latent**（去噪结果，z 空间 `[C=24, T, H, W]`），
+后续的 latent 空间操作（上采样、合成、插值）都更便宜，最后再用 VAE 解码成视频。适合做「高分辨率放大」「latent 编辑」等玩法。
+
+| 节点 | 用途 | 输出 |
+|------|------|------|
+| `H3_BinaryLatent` | 等同 T2V/R2V（文本/首尾帧 → 视频+音频），**额外**同时写出视频 latent | `VIDEO`, `LATENT`, `video_path` |
+| `H3_BinaryLatentUpscale` | 对 latent 的 H,W 做空间放大（factor 倍，T/C 不变） | `LATENT` |
+| `H3_BinaryLatentDecode` | latent → 视频（直接 VAE 解码，跳过 DiT 去噪；**无音频**） | `VIDEO`, `video_path` |
+
+### 典型工作流（latent 上采样放大分辨率）
+
+```
+H3_BinaryLatent ──VIDEO──▶ SaveVideo
+        │
+      LATENT
+        │
+        ▼
+H3_BinaryLatentUpscale (factor=2) ──LATENT──▶ H3_BinaryLatentDecode ──VIDEO──▶ SaveVideo
+```
+
+- `H3_BinaryLatent` 内部等价于 T2V，只是多一步把去噪后的 latent 存到 `--latent-out`（raw 文件，节点自动读取成 ComfyUI `LATENT`）。
+- `H3_BinaryLatentUpscale` 是纯 Python（torch 插值），只放大空间 H,W，保持时间 T 与通道 C，以维持 VAE 时序对齐。
+- `H3_BinaryLatentDecode` 把 latent 写回 raw 文件，调引擎 `--latent-in` 直接走 VAE 解码出视频。因为 latent 不含音频，解码出的视频**无音轨**（要音频请用 `H3_BinaryT2V`/`H3_BinaryR2V`）。
+
+### latent 文件格式（引擎 ↔ 节点共用）
+
+raw 二进制，自描述：
+- 头部 20 字节：`uint32 magic=0x48334C54` + `int32 t, h, w, c`
+- 随后 `c*t*h*w` 个 `float32`，按 `[C, T, H, W]` 连续存放（与引擎 `h3_video_vae_decode` 内部索引顺序一致）
+
+> 注意：这是 **H3 自己的 latent 空间**（24 通道、16× 空间压缩、H3 专属归一化），
+> **不能**直接喂给官方 `MinimaxH3LatentUpscaler3D` / 官方 `VAEDecode`；本子系统内部自洽即可。
+
+### 命令行等价验证（已实测通过）
+
+```bash
+# 生成视频 + 落 latent（需设 H3_CLIPPROJ_DIR/PROJ，见「前置条件」）
+./h3 -d <model> -p "..." --width 256 --height 160 --seconds 2 --steps 4 \
+     -o /tmp/direct.mp4 --latent-out /tmp/latent.bin
+# 用 latent 反解视频（与直出视频逐帧 md5 一致）
+./h3 -d <model> --latent-in /tmp/latent.bin --width 256 --height 160 -o /tmp/decoded.mp4
+# latent 空间 2x 上采样后解码 → 512x320 视频（上采样在节点内用 torch 完成）
+```

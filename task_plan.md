@@ -710,3 +710,54 @@ K=8 更慢 —— 该公式（`7/8 × working_set − steady`）过于乐观，�
 
 ## Errors Encountered（本任务）
 （暂无）
+
+# ===== Task Plan（当前任务）: H3 latent 子系统（ComfyUI）往返保留音频 =====
+
+## Goal
+补完「生成 latent → latent 空间上采样 → latent 回解视频」这条 ComfyUI 节点链
+（`H3_BinaryLatent` / `H3_BinaryLatentUpscale` / `H3_BinaryLatentDecode`），
+并让它在往返过程中**保留 H3 原生音频** —— 与官方
+「`VAEDecode` + `VAEDecodeAudio` 并行 → `CreateVideo`」等效。
+用户选定方案 **(i)：空间上采样 + 音频 latent 透传**。
+
+## 硬约束（源码级确认，非假设）
+- 去噪产出两个**独立**缓冲：`video`（z 空间 `[C=24,T,H,W]`）与 `audio`
+  （归一化音频 latent，`[32,2,T]` channel-major，见 `h3_audio_vae.h:17-24`）。
+- 音频 latent 是 **3D、无 H,W 空间维** → 空间上采样只动视频 latent 的 H,W，
+  音频原样透传；时间维不变则音视天然对齐。
+- `h3_ffmpeg_write_av_rgb24_f32` **不接受 NULL pcm**（`h3_ffmpeg.c:620-624` 直接失败），
+  故「无音频」时也须显式写静音轨。
+
+## Phases
+### Phase 1: 确认音频 latent 真实 shape — complete
+- [x] `h3_audio_vae.h:17-24` 坐实 `h3_audio_latent{channels=32,stereo=2,length}` → `[32,2,T]`
+- [x] 确认落盘点（h3.c:2119）在音频 VAE 解码（2135）与 `free(audio)`（2141）**之前**，
+      `audio` 缓冲有效且未被 transform → 直接 dump 即精确往返
+
+### Phase 2: 引擎 latent 格式升级 v1→v2（携带音频）— complete
+- [x] `write_video_latent` → `write_latent_bundle`（同时写视频 latent + 音频 latent）
+- [x] `read_video_latent` → `read_latent_bundle`（读回两者；含 version 校验）
+- [x] `h3_decode_latent` 末尾：有音频 latent → `h3_audio_vae_decode` 解波形再 mux；
+      无 → 回退静音轨（兼容旧 latent）
+
+### Phase 3: Python 节点接线 — complete
+- [x] `_read/_write_h3_latent` 升级 v2，LATENT 字典携带 `h3_audio` 键
+- [x] `H3_BinaryLatent`：输出 LATENT 含 `h3_audio`
+- [x] `H3_BinaryLatentUpscale`：**只动 `samples` 空间维，透传 `h3_audio`**（音频不失真的核心）
+- [x] `H3_BinaryLatentDecode`：写回时带 `h3_audio` → 引擎据此合成带音轨 MP4
+
+### Phase 4: 端到端验证 — complete
+- [x] 编译 0 error（唯一 warning 为既存 `conditioning_key` 未使用，与本任务无关）
+- [x] factor=1 往返：解码音频与原片音频 **MD5 完全一致**（`56ab826…`）→ 真透传、非静音
+- [x] factor=2 上采样：视频 `16×16→32×32` → 512×512；音频 `[32,2,93]` 未动，仍解出原音频
+
+## Decisions Made（本任务）
+| 决策 | 理由 |
+|---|---|
+| 音频 latent 与视频 latent 存**同一 bundle 文件**（而非两个文件） | 保持 `--latent-out/--latent-in` 单路径设计，与既有实现一致 |
+| 上采样限定为**空间（H,W）**，不改时间维 | 音频 latent 无空间维；T 不变则音视帧数天然对齐，无需扩音频时序 |
+| 格式升到 **v2**（与 v1 不兼容） | v1 无 version 字段、无法区分是否含音频；中间产物无需向后兼容 |
+| 音频 VAE 路径取 `FL2VA/audio_vae` | latent 节点属 FL2VA（T2V）定位；R2V latent 未涉及 |
+
+## Errors Encountered（本任务）
+（无 —— 首轮即通过；验证阶段未出现失败重试）
