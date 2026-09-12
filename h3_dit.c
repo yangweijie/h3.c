@@ -215,6 +215,12 @@ struct h3_dit {
     h3_gpu_tensor *audio_patch_w;
     h3_gpu_tensor *audio_patch_b;
     h3_dit_block blocks[H3_DIT_BLOCKS];
+    /* Partial residency (H3_DIT_RESIDENT_BLOCKS): the first N active blocks are
+     * loaded once into blocks[] and never join the prefetch ring, so a denoise
+     * step only re-streams the tail. block_resident marks which ones were
+     * loaded that way. */
+    unsigned resident_blocks;
+    uint8_t block_resident[H3_DIT_BLOCKS];
     h3_dit_block stream_slots[2];
     h3_dit_stream_layer stream_layers[H3_DIT_BLOCKS];
     unsigned stream_ready_layer;
@@ -2462,9 +2468,19 @@ static unsigned first_active_block(const h3_dit *dit) {
     return H3_DIT_BLOCKS;
 }
 
-static unsigned next_active_block(const h3_dit *dit, unsigned current) {
+/* The prefetch ring walks only the blocks that actually stream; resident
+ * blocks are already in blocks[]. */
+static unsigned first_streamed_block(const h3_dit *dit) {
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        if (dit->block_active[block] && !dit->block_resident[block])
+            return block;
+    return H3_DIT_BLOCKS;
+}
+
+static unsigned next_streamed_block(const h3_dit *dit, unsigned current) {
     for (unsigned block = current + 1; block < H3_DIT_BLOCKS; block++)
-        if (dit->block_active[block]) return block;
+        if (dit->block_active[block] && !dit->block_resident[block])
+            return block;
     return H3_DIT_BLOCKS;
 }
 
@@ -2509,17 +2525,102 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+/* Whether a resident block must keep its bf16 matrices: run_block falls back to
+ * them whenever an int8 path is absent, disabled for diagnosis, or the VDN
+ * branch is active. Dropping them when every int8 path is live is what keeps a
+ * resident block near 0.39 GiB instead of ~1.16 GiB. */
+static int resident_needs_bf16(const h3_dit *dit) {
+    if (dit->vdn) return 1;
+    if (dit->keep_bf16_qkv || dit->keep_bf16_attention_out ||
+        dit->keep_bf16_mlp) return 1;
+    if (!dit->int8_qkv || getenv("H3_DISABLE_INT8_QKV")) return 1;
+    if (!dit->int8_attention_out ||
+        getenv("H3_DISABLE_INT8_ATTENTION_OUT")) return 1;
+    if (!dit->int8_mlp || getenv("H3_DISABLE_INT8_MLP")) return 1;
+    return 0;
+}
+
+/* Hand the matrices a streaming slot just received to a resident block, so the
+ * block holds exactly the bytes the ring would have delivered. The slot is left
+ * empty for reuse. */
+static void adopt_slot_weights(h3_dit_block *block, h3_dit_block *slot,
+                               int keep_bf16) {
+    block->qkv_int8 = slot->qkv_int8;
+    slot->qkv_int8 = NULL;
+    block->qkv_scales = slot->qkv_scales;
+    slot->qkv_scales = NULL;
+    block->out_int8 = slot->out_int8;
+    slot->out_int8 = NULL;
+    block->out_scales = slot->out_scales;
+    slot->out_scales = NULL;
+    block->fc1_int8 = slot->fc1_int8;
+    slot->fc1_int8 = NULL;
+    block->fc1_scales = slot->fc1_scales;
+    slot->fc1_scales = NULL;
+    block->fc2_int8 = slot->fc2_int8;
+    slot->fc2_int8 = NULL;
+    block->fc2_scales = slot->fc2_scales;
+    slot->fc2_scales = NULL;
+    /* The bf16 matrices exist only as the requantization source; run_block
+     * still needs them when an int8 path is off. */
+    if (keep_bf16) {
+        block->qkv = slot->qkv;
+        slot->qkv = NULL;
+        block->out = slot->out;
+        slot->out = NULL;
+        block->fc1 = slot->fc1;
+        slot->fc1 = NULL;
+        block->fc2 = slot->fc2;
+        slot->fc2 = NULL;
+        block->lin_to_out = slot->lin_to_out;
+        slot->lin_to_out = NULL;
+    } else {
+        if (slot->qkv) { h3_gpu_tensor_free(slot->qkv); slot->qkv = NULL; }
+        if (slot->out) { h3_gpu_tensor_free(slot->out); slot->out = NULL; }
+        if (slot->fc1) { h3_gpu_tensor_free(slot->fc1); slot->fc1 = NULL; }
+        if (slot->fc2) { h3_gpu_tensor_free(slot->fc2); slot->fc2 = NULL; }
+        if (slot->lin_to_out) {
+            h3_gpu_tensor_free(slot->lin_to_out);
+            slot->lin_to_out = NULL;
+        }
+    }
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
+    /* Partial residency only means something under SSD streaming: the fully
+     * resident path already keeps every block. Always leave at least two
+     * blocks in the ring, which is a two-slot alternation. */
+    unsigned resident_budget = dit->ssd_streaming ? dit->resident_blocks : 0;
+    if (resident_budget) {
+        unsigned active = dit->active_block_count;
+        unsigned limit = active > 2 ? active - 2 : 0;
+        if (resident_budget > limit) {
+            fprintf(stderr,
+                    "h3: H3_DIT_RESIDENT_BLOCKS %u exceeds what this DiT can "
+                    "keep resident (%u of %u active blocks); clamping\n",
+                    resident_budget, limit, active);
+            resident_budget = limit;
+        }
+    }
+    dit->resident_blocks = resident_budget;
+    memset(dit->block_resident, 0, sizeof(dit->block_resident));
+    unsigned active_index = 0;
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
                    H3_DIT_BLOCKS);
             continue;
         }
+        int resident = active_index < resident_budget;
+        dit->block_resident[index] = (uint8_t)resident;
+        active_index++;
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
         if (dit->ssd_streaming) {
+            /* Every streaming-mode block takes its small norms from here; the
+             * resident ones get their matrices from the stream further down, so
+             * they hold exactly the bytes the ring would have delivered. */
             if (!load_block_norms(dit, &dit->blocks[index], prefix,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
@@ -2543,14 +2644,46 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
+    if (dit->resident_blocks)
+        fprintf(stderr, "h3: DiT partial residency: %u of %u active blocks "
+                "resident, %u streamed\n", dit->resident_blocks,
+                dit->active_block_count,
+                dit->active_block_count - dit->resident_blocks);
     if (dit->ssd_streaming) {
+        /* Fill the resident blocks through the streaming reader: same sources,
+         * same un-rotate, same requantization as a streamed block, so turning
+         * partial residency on cannot change the numbers. Slot 0 doubles as the
+         * staging slot here (nothing else is running yet) and is reallocated
+         * below once its contents have been adopted. */
+        const int keep_bf16 = resident_needs_bf16(dit);
+        for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
+            if (!dit->block_resident[index]) continue;
+            if (!allocate_stream_slot(dit, &dit->stream_slots[0],
+                                      error, error_size)) return 0;
+            h3_dit_stream_job job = {
+                .dit = dit, .layer = index, .slot = 0
+            };
+            if (!read_stream_layer(&job)) {
+                fail(error, error_size,
+                     "cannot load resident DiT block %u: %s", index, job.error);
+                return 0;
+            }
+            dit->stream_bytes += job.bytes;
+            dit->stream_read_seconds += job.seconds;
+            dit->stream_pread_seconds += job.pread_seconds;
+            dit->stream_dequant_seconds += job.dequant_seconds;
+            if (!requant_stream_slot(dit, &dit->stream_slots[0],
+                                     error, error_size)) return 0;
+            adopt_slot_weights(&dit->blocks[index], &dit->stream_slots[0],
+                               keep_bf16);
+        }
         if (!allocate_stream_slot(dit, &dit->stream_slots[0],
                                   error, error_size) ||
             !allocate_stream_slot(dit, &dit->stream_slots[1],
                                   error, error_size)) return 0;
-        unsigned first = first_active_block(dit);
+        unsigned first = first_streamed_block(dit);
         if (first == H3_DIT_BLOCKS) {
-            fail(error, error_size, "SSD stream has no active DiT block");
+            fail(error, error_size, "SSD stream has no streamed DiT block");
             return 0;
         }
         h3_dit_stream_job job = {
@@ -2919,6 +3052,25 @@ static h3_dit *load_dit(const char *weight_directory,
             goto failed;
         }
         dit->fb_cache_threshold = parsed;
+    }
+    /* Opt-in partial residency: keep the first N active blocks fully resident
+     * and stream only the tail. A resident block costs its int8 weight bytes
+     * (~0.39 GiB here, since the quantizers release the bf16 copies), which is
+     * about one streamed read of the same block, so the trade is
+     * memory-for-IO. Opt-in because it only pays when the prefetch is on the
+     * critical path; see README. */
+    const char *resident_env = getenv("H3_DIT_RESIDENT_BLOCKS");
+    if (resident_env && *resident_env && strcmp(resident_env, "0") != 0) {
+        char *resident_end = NULL;
+        long parsed_blocks = strtol(resident_env, &resident_end, 10);
+        if (resident_end == resident_env || *resident_end ||
+            parsed_blocks < 0 || parsed_blocks > H3_DIT_BLOCKS) {
+            fail(error, error_size,
+                 "H3_DIT_RESIDENT_BLOCKS must be an integer in [0, %d]",
+                 (int)H3_DIT_BLOCKS);
+            goto failed;
+        }
+        dit->resident_blocks = (unsigned)parsed_blocks;
     }
     if (lora_path && *lora_path) {
         /* Comma-separated adapter list, merged in order (VDN default then
@@ -3971,7 +4123,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             h3_dit_stream_job stream_job;
             pthread_t stream_thread;
             int stream_started = 0;
-            if (dit->ssd_streaming) {
+            /* Resident blocks are already complete in blocks[]; only the
+             * streamed tail goes through the prefetch ring. */
+            if (dit->ssd_streaming && !dit->block_resident[block]) {
                 if (dit->stream_ready_layer != block ||
                     dit->stream_ready_slot > 1) {
                     fail(error, error_size,
@@ -4004,9 +4158,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 weight = &streamed_weight;
 
-                unsigned future = next_active_block(dit, block);
+                unsigned future = next_streamed_block(dit, block);
                 if (future == H3_DIT_BLOCKS)
-                    future = first_active_block(dit);
+                    future = first_streamed_block(dit);
                 stream_job = (h3_dit_stream_job){
                     .dit = dit,
                     .layer = future,

@@ -655,6 +655,36 @@ split becomes a wash. Note that the engine's own defaults (864x480, 56 frames,
 GPU-to-disk ratio -- a faster GPU or a slower SSD pushes it lower, and a machine
 that can keep the model resident never streams at all.
 
+#### Partially resident DiT blocks (opt-in)
+
+`H3_DIT_RESIDENT_BLOCKS=N` keeps the first N active DiT blocks fully resident and
+streams only the tail, trading memory for I/O. Opt-in and off by default (`0`).
+It leaves at least two blocks in the ring, which is a two-slot alternation.
+
+The stream count drops exactly as designed, but on a 16 GB machine the wall time
+does not. Measured on an M4/16 GB (256x256, 2 s, 4 steps, same seed):
+
+| `H3_DIT_RESIDENT_BLOCKS` | streamed | pread+unrotate | denoise | peak |
+| --- | --- | --- | --- | --- |
+| 0 | 72.136 GiB | 73.53 s | 72.11 s | 1.65 GiB |
+| 4 | 67.830 GiB | 70.52 s | 73.27 s | 4.52 GiB |
+| 8 | 63.523 GiB | 67.94 s | **74.02 s** | 7.39 GiB |
+
+Every run produced byte-identical output, so this is purely a memory strategy.
+Disk I/O turns out not to be the denoise bottleneck: cutting reads by 12% left
+the step time unchanged and then slightly worse, because the resident blocks
+compete for the same unified memory the streaming path needs. At 0.72 GiB per
+resident block (this checkpoint keeps qkv/mlp/attention-out in BF16, so the
+quantizers do not release it) eight blocks already cost more than they save.
+Expect it to help only where ~20 blocks fit comfortably; do not enable it on
+16 GB.
+
+One correctness trap worth keeping: the resident blocks are filled through the
+*streaming* reader (`read_stream_layer` + `requant_stream_slot` +
+`adopt_slot_weights`), never through `load_block`. The two readers are not
+bit-identical, and filling resident blocks through the ordinary loader silently
+changes the output.
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and

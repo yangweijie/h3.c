@@ -710,6 +710,53 @@ dequant 87ms → 理想 173.5ms → 去噪 ≈17.4s；当前 199.6ms，差 15% �
 ### Phase 4 cache_budget_bytes — 待用户决策
 范围已从「删死代码」升级为「实现流式权重常驻缓存」（详见 task_plan.md 的 Phase 4）。
 
+---
+
+# Session 2026-09-12 续：部分常驻缓存实现（选项 A）
+
+## 实现（`H3_DIT_RESIDENT_BLOCKS`，env-only，默认 0 = 关闭）
+| 位置 | 改动 |
+|---|---|
+| `h3_dit` struct | `resident_blocks` + `block_resident[H3_DIT_BLOCKS]` |
+| `load_dit` | 解析 `H3_DIT_RESIDENT_BLOCKS`（0..50，越界 fail） |
+| `load_core` | clamp 到 `active-2`；按前缀标记常驻；常驻块也走 `load_block_norms` |
+| `load_core` 尾部 | 常驻块用 `read_stream_layer` + `requant_stream_slot` 灌进 `blocks[]`，再 `adopt_slot_weights` |
+| 新增 | `first_streamed_block` / `next_streamed_block` / `resident_needs_bf16` / `adopt_slot_weights` |
+| 主循环 | `if (ssd_streaming && !block_resident[block])`；预取目标改用 `next_streamed_block` |
+| 删除 | `next_active_block`（因改动而孤立） |
+
+## 关键教训：走 `load_block` 会改变数值
+第一版让常驻块走 `load_block`（`bf2_convrot`），结果 **md5 变了**
+（`82a84345…` ≠ 基线 `0d353faf…`）—— 与流式块的 `pread + convrot_unrotate_cpu`
+不是同一条权重来源。改成让常驻块也走流式读取路径后，md5 恢复一致。
+
+## 实测（256×256 / 2 s / 4 步 / seed 42，同机同种子）
+| 配置 | 总耗时 | denoise | 读取量 | pread+unrotate | unhidden wait | md5 |
+|---|---|---|---|---|---|---|
+| K=0（基线） | 112.5~119.1 s | 72.11~73.67 s | 72.136 GiB | 73.53 s | 7.25 s | `0d353faf…` |
+| K=4 | 117.3~119.1 s | 73.27~73.67 s | **67.830 GiB** | 70.52 s | 6.47 s | `0d353faf…` ✓ |
+
+- 读取量精确按比例下降（188 次块读取 = 4 + 4×46）✓
+- **但时间没有下降**：读取链短了 3.0 s，denoise 反而 +1.2 s（噪声内）
+- 常驻块实际占 **0.72 GiB/块**（peak 1.646→4.517 GiB），即只保留了 bf16 ——
+  该基座的 `int8_qkv/mlp/attention_out` 未启用，`resident_needs_bf16` 判定为真
+
+## 最终结论：A + C（用户选定）
+| 项 | 处置 |
+|---|---|
+| `H3_DIT_RESIDENT_BLOCKS`（部分常驻） | **保留**为 env-only opt-in（默认 0，零影响）+ README 新小节 |
+| `cache_budget_bytes` + `h3_memory_cache_budget_bytes()` | **删除**（含 planner reason 里的 "cache X GiB"、AGENTS.md 引用） |
+
+**判定依据**：K=8 读取量降 12%（72.136 → 63.523 GiB）、读取链短 5.6 s，denoise 却
++1.9 s（74.02 s vs 72.11 s）。磁盘 I/O 不是 denoise 瓶颈；16 GB 机器上常驻块
+与流式路径争同一片统一内存，节省被抵消。产物全程逐字节一致（`0d353faf…`）。
+
+**为什么不自动接线**：`cache_budget` = `7/8 × working_set − steady` = 8.0 GiB，
+换算 K≈11 会比 K=8 更慢 —— 公式过于乐观，未计入内存压力下的退化。
+
+**验证**：编译 0 warning；`cache_budget` 代码零残留；K=0 与删除后端到端 md5
+均为 `0d353faf2173acaab0badd4f9af62bf4`；planner 日志不再出现误导性的 cache 数值。
+
 ## Errors Encountered（本 session）
 | Error | Attempt | Resolution |
 |---|---|---|

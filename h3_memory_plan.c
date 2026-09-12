@@ -47,7 +47,6 @@ int h3_memory_plan_auto(const h3_device_info *device,
         out->use_int8_row_fc2 = 0; /* suggest; caller checks metal4 */
         out->dit_layers = 0;       /* keep default (full) */
         out->video_vae_streaming = 0;
-        out->cache_budget_bytes = 0;
         snprintf(out->reason, sizeof(out->reason),
                  "model %.1f GiB + activations %.1f GiB fit in %.1f GiB "
                  "working set; full resident",
@@ -62,8 +61,6 @@ int h3_memory_plan_auto(const h3_device_info *device,
     out->ssd_streaming = 1;
     out->use_int8_row_fc2 = 1; /* suggest; caller checks metal4 */
     out->video_vae_streaming = 1;
-    out->cache_budget_bytes =
-        h3_memory_cache_budget_bytes(device, steady_streamed);
 
     /* Extreme budget after streaming: also trim DiT depth toward the validated
      * minimum. */
@@ -73,7 +70,7 @@ int h3_memory_plan_auto(const h3_device_info *device,
         out->dit_layers = H3_MIN_DIT_LAYERS;
         snprintf(out->reason, sizeof(out->reason),
                  "model %.1f GiB exceeds %.1f GiB working set; after streaming "
-                 "%.1f GiB remain, SSD+VAE streaming on, int8 on, "
+                 "%.1f GiB stay resident, SSD+VAE streaming on, int8 on, "
                  "DiT layers -> %d",
                  (double)total_weight_bytes / H3_GIB,
                  (double)target / H3_GIB,
@@ -82,29 +79,10 @@ int h3_memory_plan_auto(const h3_device_info *device,
         out->dit_layers = 0;
         snprintf(out->reason, sizeof(out->reason),
                  "model %.1f GiB exceeds %.1f GiB working set; after streaming "
-                 "%.1f GiB remain, SSD+VAE streaming on, int8 on, "
-                 "cache %.1f GiB",
+                 "%.1f GiB stay resident, SSD+VAE streaming on, int8 on",
                  (double)total_weight_bytes / H3_GIB,
                  (double)target / H3_GIB,
-                 (double)steady_streamed / H3_GIB,
-                 (double)out->cache_budget_bytes / H3_GIB);
+                 (double)steady_streamed / H3_GIB);
     }
     return 0;
-}
-
-uint64_t h3_memory_cache_budget_bytes(const h3_device_info *device,
-                                      uint64_t steady_state_bytes) {
-    if (!device || device->recommended_working_set == 0) return 0;
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
-    /* Keep the streaming cache below 7/8 of the recommended working set after
-     * accounting for the steady-state model + activation footprint. GiB-align
-     * the result and floor at 1 GiB when positive. */
-    uint64_t target = device->recommended_working_set > UINT64_MAX / 7ull
-                          ? UINT64_MAX
-                          : (device->recommended_working_set * 7ull) / 8ull;
-    uint64_t safe = 0;
-    if (target > steady_state_bytes) safe = target - steady_state_bytes;
-    safe = (safe / gib) * gib;
-    if (safe == 0) safe = gib;
-    return safe;
 }

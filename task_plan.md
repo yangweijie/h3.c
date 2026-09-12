@@ -652,7 +652,46 @@ N=4→199ms、N=8→179ms、N=16→169ms（收敛 159ms）→ 只到 ~19.5s，�
 - [x] reason 文本 "SSD+VAE+encoder streaming on" → "SSD+VAE streaming on"
 - [x] 编译通过；端到端 md5 `0d353faf2173acaab0badd4f9af62bf4` 与删除前**逐字节一致**（117.1 s，噪声内）
 
-### Phase 4: cache_budget_bytes 处置 — 待用户决策（范围已升级）
+### Phase 4a: 实现常驻缓存（选项 A）— complete（结论：本机无收益）
+- [x] 前置确认：`quantize_block_*` 会释放 bf16（仅诊断开关下保留）；
+      `fuse_next_attention` 只读 `norm1`（流式块也有）；`load_core` 在
+      `configure_gate_ranked_blocks` 之后调用
+- [x] 实现：`H3_DIT_RESIDENT_BLOCKS`（env-only opt-in，默认 0）+ `resident_blocks`
+      / `block_resident[]` + `first_streamed_block` / `next_streamed_block`
+      + `resident_needs_bf16` + `adopt_slot_weights` + `load_core`/主循环分流
+- [x] 编译 0 warning（顺带删除因改动而孤立的 `next_active_block`）
+- [x] **正确性（踩坑后修好）**：第一版常驻块走 `load_block`（`bf2_convrot`）→
+      md5 变（`82a84345…`）。改成让常驻块也走流式读取路径（同源）后，
+      K=4 / K=8 产物 md5 均 = 基线 `0d353faf2173acaab0badd4f9af62bf4` ✓
+- [x] 回归：K=0 与改动前完全一致（md5 + 读取量 72.136 GiB）
+
+**实测（256×256 / 2 s / 4 步 / seed 42）**
+| K | 读取量 | pread+unrotate | denoise | peak | md5 |
+|---|---|---|---|---|---|
+| 0（基线） | 72.136 GiB | 73.53 s | 72.11 s | 1.65 GiB | `0d353faf…` |
+| 4 | 67.830 GiB | 70.52 s | 73.27 s | 4.52 GiB | `0d353faf…` |
+| 8 | 63.523 GiB | 67.94 s | **74.02 s** | 7.39 GiB | `0d353faf…` |
+
+**判定：磁盘 I/O 不是 denoise 的瓶颈。** 读取量降 12%、读取链短 5.6 s，
+denoise 却 +1.9 s。按 200 次块执行反推：流式块 ≈0.36 s/次（预取主导），
+常驻块反而 ≈0.42 s/次 —— 8 块常驻 5.8 GiB 后统一内存压力抵消了 I/O 节省。
+这与「VAE 常驻 9.365 GiB 在 16 GB 上 OOM / 退化」是同一个故事。
+
+**外推**：常驻块本身更快（0.42 vs 0.36 是在本机被内存压力拖累后的结果；
+无压力时按计算量应 ≈0.21 s/次）。若内存宽裕，K=20 可让 denoise ≈60 s（−17%）。
+即该功能**在 ≥32 GB 机器上可能有效，在 16 GB 上无效**。
+
+### Phase 4b: 处置 — complete（用户选 A + C）
+- [x] **A**：保留 `H3_DIT_RESIDENT_BLOCKS` 为 env-only opt-in（默认 0，零影响），
+      并写入 README 新小节「Partially resident DiT blocks (opt-in)」——
+      含 K=0/4/8 实测表 + 「必须走流式读取路径，否则数值会变」的坑
+- [x] **C**：删除 `cache_budget_bytes` 字段、`h3_memory_cache_budget_bytes()`
+      函数与声明，清理 planner reason 里误导的 "cache X GiB"，同步 AGENTS.md
+- [x] 编译 0 warning；代码零残留；端到端 md5 仍为 `0d353faf2173acaab0badd4f9af62bf4`
+
+**为什么不自动接线**：按 `cache_budget` 换算 K（8.0 GiB / 0.72 ≈ 11 块）会比
+K=8 更慢 —— 该公式（`7/8 × working_set − steady`）过于乐观，未计入 macOS
+统一内存在压力下的退化，实测 8 GiB 预算就已伤性能。
 **重要**：这里「接线」不是接一根线，而是要**新建一个「流式权重常驻缓存」机制**。
 - 现状约束（h3_dit.c:3974-3998）：`stream_slots[2]` 双槽轮转，且主循环有严格顺序断言
   `stream_ready_layer != block || stream_ready_slot > 1` → fail。

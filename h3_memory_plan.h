@@ -10,9 +10,8 @@
  * Ported in spirit from ds4/DwarfStar's SSD-streaming cache planner
  * (ds4_ssd_auto_cache_plan / ds4_streaming_manual_cache_safe_bytes): given the
  * device's recommended working set and the model's resident weight footprint,
- * decide whether to enable SSD streaming and/or int8, and how large a streaming
- * cache budget to reserve. This lets small-RAM Macs (16/24 GB) run MiniMax-H3
- * without manual --ssd-streaming / --int8 tuning.
+ * decide whether to enable SSD streaming and/or int8. This lets small-RAM Macs
+ * (16/24 GB) run MiniMax-H3 without manual --ssd-streaming / --int8 tuning.
  *
  * The plan is advisory: callers may override any field by setting the matching
  * h3_params entry explicitly before generate().
@@ -34,8 +33,6 @@ typedef struct {
      * the single largest fixed footprint driver and the main reason 32 GB is
      * the practical floor). Suggested when budget is tight. */
     int video_vae_streaming;
-    /* Bytes to reserve for the streaming weight cache (resident hot set). */
-    uint64_t cache_budget_bytes;
     /* Plain-text rationale for logging / --verbose. */
     char reason[256];
 } h3_memory_plan;
@@ -62,7 +59,4 @@ int h3_memory_plan_auto(const h3_device_info *device,
  * minus the steady-state model + activation footprint. Mirrors ds4's
  * ds4_streaming_manual_cache_safe_bytes. Returns a GiB-aligned byte count
  * (at least 1 GiB when positive). */
-uint64_t h3_memory_cache_budget_bytes(const h3_device_info *device,
-                                      uint64_t steady_state_bytes);
-
 #endif /* H3_MEMORY_PLAN_H */
