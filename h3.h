@@ -106,13 +106,10 @@ typedef struct {
      * combined with ssd_streaming. */
     const char *linear_branch_path;
     /* Stream the video VAE decoder weights instead of keeping the whole decoder
-     * resident. Off by default; the auto memory planner (h3_memory_plan) turns
-     * it on when the device working set is tight. */
+     * resident: -1 lets the auto memory planner decide (h3_memory_plan turns it
+     * on when the device working set is tight), 0 forces the resident decoder
+     * (faster, ~9 GiB), 1 forces streaming (~0.25 GiB). Defaults to -1. */
     int video_vae_streaming;
-    /* Release the text/image encoder (Qwen3-VL first 50 layers) after condition
-     * building instead of keeping it resident through denoise. Off by default;
-     * turned on by the auto planner on tight budgets. */
-    int encoder_streaming;
     /* When nonzero, auto-pick ssd_streaming / int8 / dit_layers from the device
      * working set at load time (see h3_memory_plan). Overridden by explicit
      * ssd_streaming / use_int8_row_fc2 settings. Default on. */
@@ -156,6 +153,7 @@ typedef struct {
     .reference_image_size = H3_REFERENCE_IMAGE_MATCH, \
     .denoise_reuse = 1, .dit_layers = H3_DEFAULT_DIT_LAYERS, \
     .core_reuse = 1, \
+    .video_vae_streaming = -1, \
     .memory_plan_auto = 1, \
 }
 

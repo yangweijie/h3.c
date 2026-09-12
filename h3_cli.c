@@ -769,10 +769,11 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                 printf("Auto memory plan: off (manual knobs)\n");
             }
             printf("Current: ssd_streaming=%d int8_row_fc2=%d "
-                   "video_vae_streaming=%d encoder_streaming=%d layers=%d\n",
+                   "video_vae_streaming=%s layers=%d\n",
                    state->params.ssd_streaming, state->params.use_int8_row_fc2,
-                   state->params.video_vae_streaming,
-                   state->params.encoder_streaming, state->params.dit_layers);
+                   state->params.video_vae_streaming < 0 ? "auto" :
+                       (state->params.video_vae_streaming ? "on" : "off"),
+                   state->params.dit_layers);
         }
     } else if (!strcasecmp(command, "sr")) {
         char *sub = skip_spaces(argument);

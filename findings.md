@@ -1123,3 +1123,58 @@ LoRA 合并在所有 worker join 之后由编排器执行，`job->seconds` 也�
 - 常跑 ≤384 小画布（预览、低分辨率快出）→ 值 1.27–1.67×，值得留
 - 按默认 864×480 跑 → 白给约 500 行并发代码，建议默认关闭（`H3_DIT_STREAM_WORKERS=1
   H3_DIT_STREAM_PIPELINE=0` 即回到原始行为）或整体回退
+
+---
+
+# memory-plan 未接线字段（2026-09-12 session）
+
+## 现象
+给 `--video-vae-streaming 0` 做 A/B 时，逐字段核对 `h3_memory_plan` 的输出发现：
+planner 算出的 5 个决策里，**2 个从未被消费**。
+
+| planner 输出 | 消费方 | 状态 |
+|---|---|---|
+| `ssd_streaming` | h3.c → DiT load | ✅ 接线 |
+| `use_int8_row_fc2` | h3.c → DiT load（且被 streaming 强制归零） | ✅ 接线 |
+| `video_vae_streaming` | h3.c → decoder load/decode | ✅ 接线 |
+| `encoder_streaming` | **无** | ❌ 死字段 |
+| `cache_budget_bytes` | **无** | ❌ 死字段 |
+| `dit_layers` | h3.c（仅当 >0 时覆盖） | ✅ 接线 |
+
+## git 证据：从未接线，不是撤回
+- 引入提交 `d5752a0`（2026-08-28，"分析为何只能 32GB 跑通…让 16/24GB 设备也能跑"）。
+- `git log --all -S "params->encoder_streaming"` → **零结果**（全历史从未被读取）。
+  只有写入侧：`out->encoder_streaming = …`（planner）与 `eff.encoder_streaming = …`（h3.c）。
+- `git log -S "cache_budget" -- h3.c h3_dit.c h3.h` → **零结果**（h3.c/h3_dit.c/h3.h 从未提及）。
+  该符号只活在 `h3_memory_plan.c/.h` 内部。
+- `d5752a0` 的 h3.c diff 对照：同批次的 `video_vae_streaming` 一路传到
+  `h3_video_vae_decoder_load` / `h3_video_vae_decode`；`encoder_streaming` 只有孤零零一行赋值。
+
+## encoder_streaming 为何无意义
+- 声明意图（h3.h:112-115）："Release the text/image encoder (Qwen3-VL first 50 layers)
+  after condition building instead of keeping it resident through denoise."
+- 事实：编码器根本没有可常驻的对象。`h3_text_encode_bf16()` /
+  `h3_text_encode_multimodal_bf16()` / `h3_text_encode_clipproj_bf16()` 都是
+  "打开权重 → 跑完 → 释放" 的一次性函数（h3_text_encoder.c:517 open、540/758 free），
+  只把 `h3_text_embedding` 交给调用方。
+- planner 自己也按这个前提估算：`streamed_resident` 里 `text_encoder.bytes * 0
+  /* freed per call */`（h3_memory_plan.c:20, h3.c:1253）。
+- → 意图已天然满足；接线需要反过来**新增**常驻缓存，无收益场景。
+
+## cache_budget_bytes 为何仍有研究价值
+- 意图（h3_memory_plan.c:97-112，移植自 ds4 的 streaming cache planner）：
+  `budget = GiB_align(7/8 × recommended_working_set − steady_streamed)`，下限 1 GiB。
+  在这台机器上算出 8.0 GiB —— 且只被写进 `plan.reason` 文本
+  （"… cache 8.0 GiB"），**日志会误导人以为真占了 8 GiB 内存**。
+- 收益指向当前最大瓶颈：denoise 每步重流全部 50 块。
+  实测（256×256 / 2 s / 4 步）：`72.136 GiB / 4 步`，denoise 73 s，
+  其中 pread 35.0 s + cpu-unrotate 38.5 s + unhidden wait 6.4 s。
+- 每块 ≈ 0.36 GiB（72.136 / 4 / 50）→ 8.0 GiB 可常驻 ≈22 块
+  → 每步只流 28 块 → 读取量 −44%。
+- 障碍：`stream_slots[2]` 是硬编码双槽轮转（h3_dit.c:218、`h3_stream_ring`），
+  "部分块常驻"要改 ring 调度；且 8 GiB 常驻与 16 GB 机器的余量冲突
+  （反证：`--video-vae-streaming 0` 的 9.365 GiB VAE 常驻在同条件下 OOM 过一次）。
+
+## 结论
+- `encoder_streaming` → **删除**（冗余，意图已天然实现）。
+- `cache_budget_bytes` → 先做代理实验（`--layers 40` 验证线性），再定接线或删除。

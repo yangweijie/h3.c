@@ -34,9 +34,6 @@ typedef struct {
      * the single largest fixed footprint driver and the main reason 32 GB is
      * the practical floor). Suggested when budget is tight. */
     int video_vae_streaming;
-    /* Stream the text/image encoder (Qwen3-VL first 50 layers) once condition
-     * building is done; freed before denoise. Suggested on tight budgets. */
-    int encoder_streaming;
     /* Bytes to reserve for the streaming weight cache (resident hot set). */
     uint64_t cache_budget_bytes;
     /* Plain-text rationale for logging / --verbose. */

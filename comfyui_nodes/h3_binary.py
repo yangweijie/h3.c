@@ -249,14 +249,18 @@ class _H3BinaryBase:
             "steps": ("INT", {"default": 20, "min": 2, "max": 1000,
                               "tooltip": "引擎要求 2~1000；turbo LoRA 用 4/8，无 LoRA 用 20"}),
             "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+            # lora 放 required：optional 里的 widget 会被前端折叠（序列化成
+            # "shape": 7）而看不见。它本就是 optional 首项，移到这里不改变
+            # 前端 widget 顺序（required 整体排在 optional 之前），旧工作流
+            # 的 widgets_values 依然对位。
+            "lora": ("STRING", {
+                "default": "",
+                "tooltip": "LoRA 路径；多个用逗号分隔，按顺序合并（如 default,turbo）"}),
         }
 
     @classmethod
     def _common_optional(cls):
         return {
-            "lora": ("STRING", {
-                "default": "",
-                "tooltip": "LoRA 路径；多个用逗号分隔，按顺序合并（如 default,turbo）"}),
             "auto_steps": ("BOOLEAN", {
                 "default": True,
                 "tooltip": "按 LoRA 名自动校正步数：turbo/4step/8step → 4/8 步，无 LoRA → 20 步"}),
@@ -371,13 +375,17 @@ class _H3BinaryBase:
         return env
 
     @staticmethod
-    def _fast_stream_hint(width, height, seconds, fast_stream):
-        """低分辨率短时长落在这个提速真正有效的区间里（实测数据见 h3.c
-        README「Streamed DiT weight prefetch」），提醒用户可以打开。"""
+    def _fast_stream_hint(width, height, fast_stream):
+        """低分辨率落在这个提速真正有效的区间里（实测数据见 h3.c README
+        「Streamed DiT weight prefetch」），提醒用户可以打开。
+
+        判据只看分辨率：该提速是否生效取决于「权重预取是否在关键路径上」，
+        即 GPU 算力量，与视频时长无关。README 实测 256x256 1.67x、
+        384x384 1.27x、512x512 及以上无效（预取已被 GPU 完全掩盖）。"""
         if fast_stream:
             return
-        if width * height <= 384 * 384 and seconds <= 1.0:
-            print(f"[H3] 提示: {width}x{height} / {seconds}s 属于流式提速有效区间，"
+        if width * height <= 384 * 384:
+            print(f"[H3] 提示: {width}x{height} 属于流式提速有效区间，"
                   f"开启 fast_stream 可获约 1.2~1.7x（实测数据，非估计）")
 
     def _finish(self, rc, out_path, log):
@@ -416,7 +424,7 @@ class H3_BinaryT2V(_H3BinaryBase):
                  first_frame=None, last_frame=None):
         width, height, steps = self._resolve_inputs(
             width, height, resolution_preset, steps, lora, auto_steps)
-        self._fast_stream_hint(width, height, float(seconds), fast_stream)
+        self._fast_stream_hint(width, height, fast_stream)
         extra = []
         if first_frame is not None:
             extra += ["--first-frame", _save_image(first_frame, "first_frame.png")]
@@ -461,7 +469,7 @@ class H3_BinaryR2V(_H3BinaryBase):
                  ref_video_path="", ref_audio_path=""):
         width, height, steps = self._resolve_inputs(
             width, height, resolution_preset, steps, lora, auto_steps)
-        self._fast_stream_hint(width, height, float(seconds), fast_stream)
+        self._fast_stream_hint(width, height, fast_stream)
         extra = []
         for idx, img in enumerate((ref_image_1, ref_image_2), start=1):
             if img is not None:

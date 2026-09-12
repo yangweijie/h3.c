@@ -659,3 +659,59 @@ dequant 87ms → 理想 173.5ms → 去噪 ≈17.4s；当前 199.6ms，差 15% �
 | 一键加速 | `H3_DIT_STREAM_WORKERS=2` → 256×256 **1.70×** / 384×384 **1.27×** |
 | ComfyUI | 新增 `fast_stream` 开关 + 自动提示 |
 | 文档 | README 新增小节；planning 三件套已同步 |
+
+---
+
+# Session 2026-09-12：memory-plan 未接线字段
+
+## 起因
+用户问「除了 denoise 和文本编解码还有哪些步骤可优化」→ 逐阶段计时 →
+发现 `--video-vae-streaming` 无独立开关 → 加开关做 A/B →
+逐字段核对 planner 输出时发现 2 个死字段。
+
+### 本 session 已完成的旁支工作
+- [x] `gen_comfyui_workflows.py`：补 `fast_stream` + `control_after_generate`，
+      修 widgets_values 错位（这是 ComfyUI 那次 FileNotFoundError 的根因）
+- [x] 校验加强：按名字锚定 `binary` / `model_dir` 槽位，错位直接 FATAL
+- [x] `_common_required()`：`lora` 从 optional 移入（optional 会被前端折叠成 `shape:7` 看不见）；
+      顺序不变，旧工作流仍对位
+- [x] `_fast_stream_hint`：去掉 `seconds <= 1.0`，改为纯分辨率判据
+- [x] 新增 `--video-vae-streaming 0|1`（三态 `-1`=auto），planner 尊重显式设置
+- [x] ComfyUI 部署副本确认与仓库**同一 inode**（硬链接，无需同步）
+
+### 阶段计时基线（256×256 / 2 s / 4 步 / seed 42 / M4 16 GB）
+| 配置 | 总耗时 | DiT denoise | VAE 解码 | 备注 |
+|---|---|---|---|---|
+| 默认（planner，VAE 流式） | 126.2 / 112.5 s | 82.1 / 72.1 s | 31.5 / 29.3 s | 两次（有/无干扰） |
+| `--ssd-streaming` | 108.7 s | 74.1 s | 22.1 s | |
+| `--video-vae-streaming 0` | 104.7 s | 73.2 s | 19.8 s | 干净环境；有干扰时 123.7 s / OOM |
+| 带 turbo LoRA（4 步） | 166.3 s | 122.1 s | 31.3 s | LoRA 在流式路径阻塞 merge，+40.1 s |
+
+关键：三种成功的产物 md5 全为 `0d353faf2173acaab0badd4f9af62bf4`（逐字节一致）。
+
+## 当前任务：死字段处置
+### Phase 1 调查 — complete
+- [x] `encoder_streaming` / `cache_budget_bytes` 均由 `d5752a0`（2026-08-28）引入
+- [x] 证明**从未接线**（`git log -S` 对读取侧全历史零结果），不是撤回
+- [x] `encoder_streaming`：意图（释放 encoder）已由「一次性编码函数」天然实现 → 冗余
+- [x] `cache_budget_bytes`：意图未实现，且指向 denoise 最大瓶颈（每步重流 50 块）→ 有研究价值
+
+### Phase 2 代理实验 — complete
+- [x] `--layers 40`：总 100.5 s、denoise 58.84 s（−18.4%）、SSD 读 57.781 GiB（−19.9%）→ 线性
+- [x] 推出关键路径模型 `denoise ≈ (pread + cpu-unrotate) × 0.98`，GPU 仅 14 s/72 s
+      → 读取链完全在关键路径上，缓存的收益按 `× (1 − K/50)` 计算
+- [x] 估算：8.0 GiB 常驻 22 块 → denoise 72 → ~41 s → 总时间 −28%
+
+### Phase 3 删除 encoder_streaming — complete
+- [x] 6 个文件移除（h3.h / h3_memory_plan.h / h3_memory_plan.c ×2 / h3.c / h3_cli.c / AGENTS.md）
+- [x] 无 tests 引用；代码零残留；编译通过
+- [x] 端到端 117.1 s、md5 `0d353faf2173acaab0badd4f9af62bf4` —— 与删除前逐字节一致
+
+### Phase 4 cache_budget_bytes — 待用户决策
+范围已从「删死代码」升级为「实现流式权重常驻缓存」（详见 task_plan.md 的 Phase 4）。
+
+## Errors Encountered（本 session）
+| Error | Attempt | Resolution |
+|---|---|---|
+| ComfyUI 节点 `binary` 收到模型目录路径 | 1 | 定位为 widgets_values 整体错位（缺 `fast_stream`/`control_after_generate`），修生成器并重生成 |
+| `--video-vae-streaming 0` 进程 rc=-9 | 1 | 非代码问题：用户同时开浏览器导致内存不足；干净环境重跑 104.7 s 成功 |

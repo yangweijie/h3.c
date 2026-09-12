@@ -35,6 +35,9 @@ static void usage(const char *program) {
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
+        "      --video-vae-streaming N  Video VAE decoder weights: 0 resident\n"
+        "                         (faster, ~9 GiB), 1 streamed (~0.25 GiB);\n"
+        "                         default: the auto memory plan decides\n"
         "      --lora PATH        Merge LoRA adapter(s) into the DiT; comma-\n"
         "                         separated list merges in order (VDN: default,turbo)\n"
         "      --linear-branch DIR  VDN-H3 linear-branch checkpoint directory\n"
@@ -267,6 +270,7 @@ int main(int argc, char **argv) {
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
            OPT_SSD_STREAMING,
+           OPT_VIDEO_VAE_STREAMING,
            OPT_LORA,
            OPT_LINEAR_BRANCH,
            OPT_USE_INT8_ROW_FC2,
@@ -304,6 +308,8 @@ int main(int argc, char **argv) {
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
+        {"video-vae-streaming", required_argument, NULL,
+         OPT_VIDEO_VAE_STREAMING},
         {"lora", required_argument, NULL, OPT_LORA},
         {"linear-branch", required_argument, NULL, OPT_LINEAR_BRANCH},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
@@ -405,6 +411,17 @@ int main(int argc, char **argv) {
                 break;
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
+            case OPT_VIDEO_VAE_STREAMING: {
+                int value = parse_int(optarg, "video vae streaming");
+                if (value > 1) {
+                    fprintf(stderr,
+                            "h3: --video-vae-streaming expects 0 or 1: %s\n",
+                            optarg);
+                    exit(2);
+                }
+                params.video_vae_streaming = value;
+                break;
+            }
             case OPT_LORA: params.lora_path = optarg; break;
             case OPT_LINEAR_BRANCH: params.linear_branch_path = optarg; break;
             case OPT_USE_INT8_ROW_FC2:

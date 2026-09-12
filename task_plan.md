@@ -589,3 +589,85 @@ N=4→199ms、N=8→179ms、N=16→169ms（收敛 159ms）→ 只到 ~19.5s，�
 | `-Wshadow`：`read_stream_sources` 新参数名 `count` 与循环内既有的 `uint32_t count` 冲突 | 1 | 参数改名 `source_count`（不动既有局部变量，遵守「精准修改」） |
 | 按数量均分导致负载不均（154.1M vs 231.2M 元素/块） | 1 | 改用 LPT 按字节均衡 → 实测 **23.15s，无收益**（噪声内）→ **回退为连续区间**：source 已按文件偏移排序，连续区间保住 SSD 顺序局部性 |
 | 4 个 worker 反而更慢（denoise 25.19s，pread 累计 52.05s） | 1 | 并发读过多会让该 SSD 退化；2 个是甜点，旋钮保留以便复测 |
+
+---
+
+# 任务：memory-plan 未接线字段处置（encoder_streaming / cache_budget_bytes）
+
+## Goal
+给 `--video-vae-streaming 0` 做 A/B 时发现 `h3_memory_plan` 的输出里有两个字段从未被消费。
+查清引入时机与是否被撤回，按「合理撤回→删除 / 有研究对比意义→接线实测后再定」处置。
+
+## 调查结论（git 证据，已完成）
+| 字段 | 引入提交 | 是否曾被消费 | 性质判定 |
+|---|---|---|---|
+| `encoder_streaming` | `d5752a0`（2026-08-28，"让 16/24GB 设备也能跑"） | **否** —— `git log -S "params->encoder_streaming"` 全历史零结果 | 意图已由架构天然实现，冗余 |
+| `cache_budget_bytes` | `d5752a0` 同批 | **否** —— `git log -S "cache_budget" -- h3.c h3_dit.c h3.h` 全历史零结果 | 意图未实现，属预留 |
+
+- `d5752a0` 的 h3.c diff 里，同批次的 `video_vae_streaming` 一路传到 decoder load/decode；
+  `eff.encoder_streaming = plan.encoder_streaming;` 是孤立赋值，`cache_budget` 在 h3.c 根本没出现。
+- 所以**不是"逻辑被撤回"，而是"从未接线"**。
+
+### encoder_streaming 无意义的原因
+- 其声明意图（h3.h）："Release the text/image encoder after condition building"。
+- 实际：`h3_text_encode_bf16` / `h3_text_encode_clipproj_bf16` 是**一次性函数** ——
+  内部 `h3_weight_store_open()` → 跑完 → `h3_weight_store_free()`
+  （h3_text_encoder.c:517/522/540/758），无持久 encoder 对象。
+- planner 自己的注释就写着 `text_encoder.bytes * 0 /* freed per call */`（h3_memory_plan.c:20）。
+- → 意图已天然满足，接线反而要新增"encoder 常驻缓存"，无收益场景。
+
+### cache_budget_bytes 有研究对比意义的原因
+- 意图（源自 ds4 的 streaming cache planner）：`7/8 × working_set − steady_streamed`，
+  GiB 对齐、下限 1 GiB（h3_memory_plan.c:97-112）。
+- 直击当前最大瓶颈：denoise 每步重流全部 50 块（实测 72.136 GiB / 4 步，73 s，
+  unhidden wait 6.4 s + pread 35.0 s + cpu-unrotate 38.5 s）。
+- 量化：每块 ≈ 0.36 GiB（72.136/4/50）；8.0 GiB 预算可常驻 ≈22 块 → 每步只流 28 块
+  → 读取量约 −44%。
+- 代价：`stream_slots[2]` 是**硬编码双槽轮转**（h3_dit.c:218 + `h3_stream_ring`），
+  "部分块常驻"需改 ring 调度，属中等改动。
+
+## Phases
+### Phase 1: 调查与判定 — complete
+- [x] git 历史定位（`d5752a0`）
+- [x] 验证「从未接线」而非「撤回」
+- [x] 判定 `encoder_streaming` 冗余（freed-per-call 天然实现）
+- [x] 判定 `cache_budget_bytes` 有研究价值（直击 SSD 重流瓶颈）
+
+### Phase 2: 代理实验（先行验证收益假设，不写代码）— complete
+- [x] `--layers 40`（块数 −20%）→ SSD 读 57.781 GiB（**−19.9%**）、denoise 58.84 s（**−18.4%**）→ 线性成立
+- [x] 推导出关键路径模型（见下），据此估算常驻缓存的收益
+
+**关键路径模型**（两个数据点一致）：
+| 块数 | denoise wall | pread + cpu-unrotate | root-gpu |
+|---|---|---|---|
+| 50 | 72.11 s | 35.00 + 38.53 = 73.53 s | 14.31 s |
+| 40 | 58.84 s | 28.35 + 30.90 = 59.25 s | 11.36 s |
+
+`denoise ≈ (pread + cpu-unrotate) × 0.98`，GPU 只占 14 s —— **读取/反旋转链完全在关键路径上**。
+所以「缓存 K 块」的收益 = `denoise × (1 − K/50)`，而非 layers 那种「少算又少读」。
+- 8.0 GiB / 0.36 GiB每块 ≈ 22 块 → denoise 72 → ~41 s → 总时间 112.5 → ~81 s（**−28%**）
+
+### Phase 3: 删除 encoder_streaming — complete
+- [x] h3.h / h3_memory_plan.h/.c / h3.c / h3_cli.c / AGENTS.md 全链路移除（无 tests 引用）
+- [x] reason 文本 "SSD+VAE+encoder streaming on" → "SSD+VAE streaming on"
+- [x] 编译通过；端到端 md5 `0d353faf2173acaab0badd4f9af62bf4` 与删除前**逐字节一致**（117.1 s，噪声内）
+
+### Phase 4: cache_budget_bytes 处置 — 待用户决策（范围已升级）
+**重要**：这里「接线」不是接一根线，而是要**新建一个「流式权重常驻缓存」机制**。
+- 现状约束（h3_dit.c:3974-3998）：`stream_slots[2]` 双槽轮转，且主循环有严格顺序断言
+  `stream_ready_layer != block || stream_ready_slot > 1` → fail。
+- 实现路径（最小侵入）：流式模式下把**前 K 块完整 load 进 `dit->blocks[0..K-1]`**
+  （复用既有 `load_block`），主循环 `block < K` 时跳过 stream 分支，预取序列从 K 起。
+- 成本：中等，触及 DiT 核心调度；风险：8 GiB 常驻在 16 GB 上可行性未知
+  （反证：VAE 常驻 9.365 GiB 已 OOM 过一次）。
+- 选项 A：按上述实现 → 实测 → 定「新增开关」或「回退删除」
+- 选项 B：直接删除（含 `h3_memory_cache_budget_bytes()` 与 reason 里的 "cache X GiB" 误导文本）
+
+## 待验证的假设
+1. denoise wall 与「每步流式块数」近似线性（`--layers 40` 应降到 ~80%）。
+2. 8 GiB 常驻不会在 16 GB 机器上引发 OOM —— **反证已有**：VAE 常驻 9.365 GiB
+   在同等条件下 OOM 过一次，8 GiB 会踩同一块地。
+3. `cache_budget` 与 `video_vae_streaming=0` 互斥（两者合计 > 16 GiB）。
+
+## Errors Encountered（本任务）
+（暂无）

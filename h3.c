@@ -1261,12 +1261,25 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             /* The planner suggests both independently; int8 row FC2 stays an
              * M5-only resident-weights path and cannot ride on streaming. */
             if (eff.ssd_streaming) eff.use_int8_row_fc2 = 0;
-            eff.video_vae_streaming = plan.video_vae_streaming;
-            eff.encoder_streaming = plan.encoder_streaming;
+            /* An explicit video_vae_streaming (0 or 1) wins over the plan;
+             * only -1 defers to it. The resident decoder is measurably faster
+             * (31.5s -> 22.1s decode, and a 0.87 -> 0.97 GiB/s DiT stream on
+             * the same run) at the cost of ~9 GiB resident, so the choice is
+             * worth exposing. */
+            if (eff.video_vae_streaming < 0)
+                eff.video_vae_streaming = plan.video_vae_streaming;
+            else if (eff.video_vae_streaming != plan.video_vae_streaming)
+                fprintf(stderr, "h3: video VAE streaming forced to %d "
+                        "(plan suggested %d)\n", eff.video_vae_streaming,
+                        plan.video_vae_streaming);
             if (plan.dit_layers > 0) eff.dit_layers = plan.dit_layers;
             fprintf(stderr, "h3: auto memory plan: %s\n", plan.reason);
         }
     }
+    /* -1 means "let the planner decide"; that decision is made by now (or the
+     * planner was skipped entirely), so collapse it to the resident default.
+     * Never hand -1 downstream: the decoder tests it for truth. */
+    if (eff.video_vae_streaming < 0) eff.video_vae_streaming = 0;
     params = &eff;
     if (!h3_valid_params(ctx, params)) return NULL;
     int render_width = params->render_width ? params->render_width :

@@ -1,5 +1,5 @@
 {
-  "id": "554975d0-0702-425c-9f0e-e791bdffa67f",
+  "id": "de53728e-92ac-4e53-98d5-03fc4a244079",
   "revision": 0,
   "last_node_id": 30,
   "last_link_id": 3,
@@ -215,6 +215,7 @@
         2.0,
         20,
         42,
+        "randomize",
         "",
         true,
         "/Users/jay/h3_sys/MiniMax-H3-Convrot",
@@ -222,6 +223,7 @@
         1,
         1,
         0,
+        false,
         "/Volumes/data/git/c/h3.c/h3",
         "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot",
         "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3",

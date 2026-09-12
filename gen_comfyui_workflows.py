@@ -42,6 +42,8 @@ def _widget_names(cls):
                 names.append(name)
             elif ty in widget_types:
                 names.append(name)
+            if name == "seed":                # 前端在 seed 后插入该 widget
+                names.append("control_after_generate")
     return names
 
 H3_BINARY = os.environ.get("H3_BINARY", "/Volumes/data/git/c/h3.c/h3")
@@ -148,6 +150,7 @@ def t2v_workflow():
         2.0,               # seconds
         20,                # steps
         42,                # seed
+        "randomize",       # control_after_generate（seed 之后，前端占位）
         "",                # lora
         True,              # auto_steps
         MODEL_DIR,         # model_dir
@@ -155,6 +158,7 @@ def t2v_workflow():
         1,                 # core_reuse
         1,                 # reuse
         0,                 # layers
+        False,             # fast_stream
         H3_BINARY,         # binary
         CLIPPROJ_DIR,      # clipproj_dir
         CLIPPROJ_PROJ,     # clipproj_proj
@@ -193,6 +197,7 @@ def r2v_workflow():
         2.0,               # seconds
         20,                # steps
         42,                # seed
+        "randomize",       # control_after_generate（seed 之后，前端占位）
         "",                # lora
         True,              # auto_steps
         MODEL_DIR,         # model_dir
@@ -200,6 +205,7 @@ def r2v_workflow():
         1,                 # core_reuse
         1,                 # reuse
         0,                 # layers
+        False,             # fast_stream
         H3_BINARY,         # binary
         CLIPPROJ_DIR,      # clipproj_dir
         CLIPPROJ_PROJ,     # clipproj_proj
@@ -259,6 +265,12 @@ def main():
                 raise SystemExit(
                     f"[FATAL] {cls_name}: 声明 {len(expect)} 个 widget "
                     f"但工作流给了 {len(got)} 个\n  声明: {expect}")
+            mapping = dict(zip(expect, got))
+            for key, want in (("binary", H3_BINARY), ("model_dir", MODEL_DIR)):
+                if mapping.get(key) != want:
+                    raise SystemExit(
+                        f"[FATAL] {cls_name}: '{key}' 槽位错位 → "
+                        f"{mapping.get(key)!r}（应为 {want!r}）\n  实际映射: {mapping}")
             print(f"[check] {cls_name}: {len(got)} 个 widget 顺序一致 ✓")
         text = json.dumps(data, ensure_ascii=False, indent=2)
         for d in targets:

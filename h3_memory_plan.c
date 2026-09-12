@@ -47,7 +47,6 @@ int h3_memory_plan_auto(const h3_device_info *device,
         out->use_int8_row_fc2 = 0; /* suggest; caller checks metal4 */
         out->dit_layers = 0;       /* keep default (full) */
         out->video_vae_streaming = 0;
-        out->encoder_streaming = 0;
         out->cache_budget_bytes = 0;
         snprintf(out->reason, sizeof(out->reason),
                  "model %.1f GiB + activations %.1f GiB fit in %.1f GiB "
@@ -63,7 +62,6 @@ int h3_memory_plan_auto(const h3_device_info *device,
     out->ssd_streaming = 1;
     out->use_int8_row_fc2 = 1; /* suggest; caller checks metal4 */
     out->video_vae_streaming = 1;
-    out->encoder_streaming = 1;
     out->cache_budget_bytes =
         h3_memory_cache_budget_bytes(device, steady_streamed);
 
@@ -75,7 +73,7 @@ int h3_memory_plan_auto(const h3_device_info *device,
         out->dit_layers = H3_MIN_DIT_LAYERS;
         snprintf(out->reason, sizeof(out->reason),
                  "model %.1f GiB exceeds %.1f GiB working set; after streaming "
-                 "%.1f GiB remain, SSD+VAE+encoder streaming on, int8 on, "
+                 "%.1f GiB remain, SSD+VAE streaming on, int8 on, "
                  "DiT layers -> %d",
                  (double)total_weight_bytes / H3_GIB,
                  (double)target / H3_GIB,
@@ -84,7 +82,7 @@ int h3_memory_plan_auto(const h3_device_info *device,
         out->dit_layers = 0;
         snprintf(out->reason, sizeof(out->reason),
                  "model %.1f GiB exceeds %.1f GiB working set; after streaming "
-                 "%.1f GiB remain, SSD+VAE+encoder streaming on, int8 on, "
+                 "%.1f GiB remain, SSD+VAE streaming on, int8 on, "
                  "cache %.1f GiB",
                  (double)total_weight_bytes / H3_GIB,
                  (double)target / H3_GIB,
