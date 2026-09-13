@@ -1,0 +1,30 @@
+version: 1
+
+repowiki:
+  template: architecture
+  notes:
+    - text: 本项目是纯 C/Objective-C（macOS / Apple Silicon）实现的 MiniMax-H3 推理引擎，不依赖 Python 或 torch；唯一链接的第三方库是系统 Accelerate / Metal / MetalPerformanceShaders( Graph) 与 libicucore，另有 vendored 的 linenoise。
+      author: codebase-audit
+    - text: 只允许用 Apple clang 构建（make CC="xcrun clang"）。Homebrew LLVM 在 macOS 26 SDK 的 Accelerate/vecLib 头文件上会报 unrecognized platform name visionOS；而过旧 SDK（15.4）缺少 MTLGPUFamilyMetal4，无法编译 h3_metal.m。
+      author: codebase-audit
+    - text: 所有二进制必须从仓库根目录运行。h3_gpu.m 通过运行时编译 h3_shaders.metal 来加载内核，默认路径是相对进程 CWD 的字面量 "h3_shaders.metal"；CLI 不传绝对路径，因此换目录运行会找不到内核源码。
+      author: codebase-audit
+    - text: 修改 h3_shaders.metal 不需要重新链接，因为它在运行时被读取并编译；但新增任何库源文件必须同时加入 Makefile 的 LIB_C（.c）或 LIB_M（.m），否则会以 Undefined symbols 链接失败。
+      author: codebase-audit
+    - text: 视频 VAE 解码器的块数由 h3_video_vae.h 的 H3_VIDEO_VAE_LAYERS 导出（当前 36），内存规划器与 CLI 都引用它；任何地方都不要硬编码这个数字。
+      author: codebase-audit
+    - text: LoRA 合并与 VDN linear-branch 都在加载期改写权重，均与 --ssd-streaming 互斥；LoRA 还额外与 int8 路径不兼容。h3_lora_matches 会在 lora_A 宽度与基础权重不匹配时跳过该适配器并告警。
+      author: codebase-audit
+    - text: 大多数测试二进制在缺少权重或 fixture 时会自动跳过。未安装权重时实际运行的只有 h3_tests 与 h3_audio_gpu_tests；h3_lora_tests 不在 make test 内，且依赖 tests/gen_lora_data.py 先生成 tmp_lora_test/ fixture。
+      author: codebase-audit
+    - text: 只有 h3_metal.m、h3_gpu.m、h3_tokenizer.m 是 Objective-C（用 -fobjc-arc 编译），其余全部是 C11。C 与 ObjC 之间用 __bridge 转换，不引入额外句柄结构。
+      author: codebase-audit
+    - text: 跨模块共享的数据类型集中在 h3_internal.h（h3_ctx）与 h3_host.h（h3_layout / h3_sigma_schedule / h3_position），公共 API 只在 h3.h。新增内部类型应放入 h3_host.h 而不是 h3.h。
+      author: codebase-audit
+
+knowledgecard:
+  notes:
+    - text: 文档中的"事实"必须能指向具体文件与行号；无法在代码中确认的内容要显式标注为推断或未找到依据，不要补齐成看起来完整的描述。
+      author: codebase-audit
+    - text: 六阶段流水线（加载 → 提示解析 → 条件构建 → 去噪 → 解码 → 封装）是本项目的叙述骨架，描述任何模块时都应说明它落在哪个阶段。
+      author: codebase-audit
