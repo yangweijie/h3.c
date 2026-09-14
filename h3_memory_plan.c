@@ -4,6 +4,9 @@
 #include <string.h>
 
 #define H3_GIB (1024ull * 1024ull * 1024ull)
+/* Physical RAM kept for the OS / window server so a greedy long clip cannot
+ * starve the system into a panic. */
+#define H3_OS_RESERVE_GIB 4ull
 
 /*
  * Decide an automatic memory plan from the device's recommended working set and
@@ -37,7 +40,17 @@ int h3_memory_plan_auto(const h3_device_info *device,
     }
 
     const uint64_t rec = device->recommended_working_set;
-    const uint64_t target = (rec * 80ull) / 100ull; /* 80% headroom cap */
+    /* Cap the budget by Metal's recommendation *and* by physical RAM minus an
+     * OS reserve: on a unified-memory Mac the GPU's wired allocations cannot
+     * be swapped, so trusting Metal's optimistic recommendation alone lets a
+     * long clip overrun physical RAM and panic the system. */
+    uint64_t target = (rec * 80ull) / 100ull; /* 80% headroom cap */
+    const uint64_t physical = device->physical_memory;
+    const uint64_t reserve = H3_OS_RESERVE_GIB * H3_GIB;
+    if (physical > reserve) {
+        const uint64_t phys_target = ((physical - reserve) * 85ull) / 100ull;
+        if (phys_target < target) target = phys_target;
+    }
     const uint64_t steady = total_weight_bytes + activation_bytes;
     const uint64_t steady_streamed =
         streamed_resident_bytes + activation_bytes;

@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_host.h"
 #include "h3_lora.h"
 #include "h3_weights.h"
 
@@ -4880,6 +4881,10 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     for (int step = 0; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise enqueue", step,
                dit->sigmas.steps);
+        if (!h3_host_memory_guard("denoise", error, error_size)) {
+            ok = 0;
+            break;
+        }
         if (!command_active) {
             ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                         "begin GPU Euler command chain");
@@ -5127,6 +5132,10 @@ int h3_dit_denoise_euler_preview(
     int previous_evaluated = -1;
     for (int step = 0; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
+        if (!h3_host_memory_guard("denoise", error, error_size)) {
+            ok = 0;
+            break;
+        }
         int evaluate = selected[step];
         if (evaluate) {
             ok = h3_dit_forward(dit, step, video_latent, audio_latent,

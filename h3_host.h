@@ -143,6 +143,26 @@ int h3_euler_velocity_step(float *sample, const float *velocity, size_t count,
  * bytes. Returns 0 if the platform does not support the query. */
 uint64_t h3_host_available_memory(void);
 
+/* Runtime memory guard: returns 1 while available physical memory stays above
+ * the safety floor, or 0 (setting error) once it drops below. Called between
+ * denoise steps and VAE chunks so a small-RAM Mac errors out gracefully
+ * instead of thrashing into a system panic (GPU wired memory cannot be
+ * swapped). The floor is H3_MEM_GUARD_DEFAULT_MB, overridable with
+ * H3_MEM_GUARD_MB (0 disables the guard). */
+#ifndef H3_MEM_GUARD_DEFAULT_MB
+#define H3_MEM_GUARD_DEFAULT_MB 1024
+#endif
+/* System headroom kept below physical RAM for the footprint check. */
+#ifndef H3_MEM_HEADROOM_DEFAULT_MB
+#define H3_MEM_HEADROOM_DEFAULT_MB 2560
+#endif
+int h3_host_memory_guard(const char *phase, char *error, size_t error_size);
+
+/* Physical footprint of the current process (resident + GPU wired +
+ * compressed), in bytes. The most direct measure of how much RAM we actually
+ * hold. Returns 0 if unavailable. */
+uint64_t h3_host_footprint(void);
+
 /* Estimate how many DiT blocks can be kept resident given the available memory
  * headroom. per_block_cost is the resident cost of one block (bytes).
  * Returns a value in [0, active_blocks - 2] (at least 2 blocks must stay in the

@@ -12,6 +12,7 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/task.h>
 #include <sys/sysctl.h>
 #endif
 
@@ -682,6 +683,74 @@ uint64_t h3_host_available_memory(void) {
 #else
     return 0;
 #endif
+}
+
+uint64_t h3_host_footprint(void) {
+#if defined(__APPLE__)
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  (task_info_t)&info, &count) != KERN_SUCCESS)
+        return 0;
+    return (uint64_t)info.phys_footprint;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t h3_host_physical_memory(void) {
+    static uint64_t cached = 0;
+    if (cached) return cached;
+#if defined(__APPLE__)
+    uint64_t value = 0;
+    size_t length = sizeof(value);
+    int mib[2] = {CTL_HW, HW_MEMSIZE};
+    if (sysctl(mib, 2, &value, &length, NULL, 0) == 0) cached = value;
+#endif
+    return cached;
+}
+
+int h3_host_memory_guard(const char *phase, char *error, size_t error_size) {
+    static int initialized = 0;
+    static uint64_t floor_bytes = 0;
+    static uint64_t headroom_bytes = 0;
+    if (!initialized) {
+        initialized = 1;
+        const char *env = getenv("H3_MEM_GUARD_MB");
+        unsigned long long mb = env && *env
+            ? strtoull(env, NULL, 10) : H3_MEM_GUARD_DEFAULT_MB;
+        floor_bytes = (uint64_t)mb * 1024ull * 1024ull;
+        const char *henv = getenv("H3_MEM_HEADROOM_MB");
+        unsigned long long hmb = henv && *henv
+            ? strtoull(henv, NULL, 10) : H3_MEM_HEADROOM_DEFAULT_MB;
+        headroom_bytes = (uint64_t)hmb * 1024ull * 1024ull;
+    }
+    if (floor_bytes == 0) return 1; /* disabled */
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    uint64_t available = h3_host_available_memory();
+    uint64_t footprint = h3_host_footprint();
+    uint64_t physical = h3_host_physical_memory();
+    static int trace = -1;
+    if (trace < 0) trace = getenv("H3_MEM_TRACE") ? 1 : 0;
+    if (trace)
+        fprintf(stderr, "h3: [mem] %-18s footprint %.2f GiB available %.2f GiB\n",
+                phase ? phase : "phase",
+                (double)footprint / gib, (double)available / gib);
+    int trip = 0;
+    if (available && available < floor_bytes) trip = 1;
+    if (footprint && physical && footprint + headroom_bytes > physical) trip = 1;
+    if (!trip) return 1;
+    if (error && error_size)
+        snprintf(error, error_size,
+                 "memory guard tripped in %s: footprint %.2f GiB + headroom "
+                 "%.2f GiB vs physical %.2f GiB, available %.2f GiB (floor "
+                 "%.2f GiB); aborting before the system thrashes "
+                 "(H3_MEM_GUARD_MB / H3_MEM_HEADROOM_MB, 0 disables)",
+                 phase ? phase : "phase",
+                 (double)footprint / gib, (double)headroom_bytes / gib,
+                 (double)physical / gib, (double)available / gib,
+                 (double)floor_bytes / gib);
+    return 0;
 }
 
 /* Estimate how many DiT blocks can be kept resident. The streaming ring needs

@@ -1,5 +1,6 @@
 #include "h3_video_vae.h"
 
+#include "h3_host.h"
 #include "h3_weights.h"
 
 #include <errno.h>
@@ -1146,6 +1147,10 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     for (int chunk = 0; chunk < chunks && ok; chunk++) {
         h3_video_frames decoded;
         memset(&decoded, 0, sizeof(decoded));
+        if (!h3_host_memory_guard("video VAE decode", error, error_size)) {
+            ok = 0;
+            break;
+        }
         ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
                                   chunk, -1, &decoded, error, error_size);
         if (!ok) break;
@@ -1257,6 +1262,10 @@ static int decode_chunked(const char *weight_directory,
         ok = 0;
     }
     for (int chunk = 0; chunk < chunks && ok; chunk++) {
+        if (!h3_host_memory_guard("video VAE decode", error, error_size)) {
+            ok = 0;
+            break;
+        }
         float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
         if (!tiles) {
             fail(error, error_size, "out of memory retaining video VAE tiles");

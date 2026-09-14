@@ -1483,3 +1483,56 @@ v1 无 version 字段且只有视频 → 无法区分是否含音频，故整体
   | int6-g128 | +15% / +26% | ✅ 可信 |
   | int6-g64 | +8% / +14% | ✅ 可信 |
   | mixA / mixB | −7% / −1% | ❌ 在 ±0.15~0.25 的步数波动内 → 不可判 |
+
+# ===== 长时长内存墙 + 运行时守卫 (2026-09-14/15) =====
+
+## 设备与上限（实测 `./h3 --info`）
+| 项 | 值 |
+|---|---|
+| 芯片 / 内存 | Apple M4 / **16.0 GiB** |
+| recommended GPU set | **11.8 GiB** |
+| max Metal buffer | 8.9 GiB |
+| swap | **0.00M（零缓冲）** |
+| 权重合计 | ~36 GiB（DiT 17.4 + VAE 9.7 + Qwen 8.3 + audio 0.6）|
+
+**机制**：Apple 统一内存里 Metal/GPU 分配是 **wired（不可压缩、不可 swap）**；当 wired+活跃超物理，
+系统进入严重内存压力 → watchdog panic（死机重启），**不是进程级 OOM**。没有硬编码安全数字，
+但软线：物理 16 GiB（硬）/ rec 11.8 GiB（GPU 建议）/ 实测 3s 峰值已 12.7 GiB。
+
+## 内存 trace 实测（INT6 native，864×480，steps 4）
+| 时长/配置 | DiT 加载 peak | denoise footprint | VAE decode | 结果 |
+|---|---|---|---|---|
+| 3s | — | — | GPU peak **0.654 GiB** | ✅ 完成（peak footprint 12.7 GiB, RSS 8.1 GiB）|
+| 6s（无 token-reduction）| **13.00 GiB** | 10.11 → **13.88 GiB**（第1步 +3.77！）| — | ❌ 触发守卫 |
+| 6s（`--token-reduction`）| — | 9.97→13.00（峰）→12.21 | 0.48→2.05 GiB, available 13→6.8↘ | ✅ 完成（2333s）|
+| 2s 单段 | — | 峰值 **9.33 GiB** | — | ✅ 完成（698s）|
+
+**两条独立根因**：
+1. **denoise 激活 ∝ video token**：6s 比 3s token 翻倍 → 单步 footprint +3.77 GiB；15s 再 ×2.5 必爆。
+2. **VAE decode 的 GPU wired 逐 chunk 累积**：6s 时 available 从 13→6.8 GiB（每 chunk ~0.8 GiB），
+   且**进程 footprint 仅 ~2 GiB** → 这部分**不计入 `phys_footprint`**，只能从 available 观察；
+   15s（~20 chunk）必归零。
+
+## 守卫实现（`h3_host_memory_guard`）
+- `h3_host.c`：`h3_host_footprint()`（`task_info(TASK_VM_INFO).phys_footprint`）
+  + `h3_host_physical_memory()`（缓存 `hw.memsize`）+ `h3_host_memory_guard(phase,err,sz)`。
+- 触发条件（任一）：`available < H3_MEM_GUARD_MB`(默认 1024) 或
+  `footprint + H3_MEM_HEADROOM_MB`(默认 2560) `> physical`。
+- 插入点：`h3_dit.c` denoise **CPU/GPU 两个步循环**；`h3_video_vae.c` **resident/chunked 两个 chunk 循环**。
+- `H3_MEM_TRACE=1` 打印每步 `footprint / available`。
+- 效果：6s 在 denoise 1/4 优雅报错退出（**不再死机**）；3s 默认 floor 不误杀。
+
+## 分段生成（硬切）
+- 脚本 `gen_segments.sh`：2s × 7 段独立进程（递增 seed），ffmpeg concat。
+- 结果 `seg_out/final.mp4` = **16.36s / 864×480 / 392 帧 / 含音频 / 5.8 MB**。
+- 段间**硬切**（无跨段条件）。
+
+## 负结果：H3 vision encoder 三处不可得
+| 来源 | 结果 |
+|---|---|
+| 本机 modelscope 缓存 `OpenVDN--vdn-minimax-h3/snapshots/master/h3-base` | 只有 audio_vae/transformer/vae/scheduler |
+| HF `OpenVDN/vdn-minimax-h3` | **不可达（curl 000）** |
+| ModelScope `OpenVDN/vdn-minimax-h3` | h3-base 无 text_encoder；stage 目录仅 adapters/linear_branch/diffusers(Python) |
+| 本地 Qwen3-VL-4B（BF16 / int8-convrot）| `visual.pos_embed` 形状与 H3 期望**不符** |
+
+⇒ `--first-frame`/`--last-frame` 不可用 ⇒ 分段只能硬切。

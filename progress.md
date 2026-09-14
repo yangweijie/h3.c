@@ -1020,3 +1020,56 @@ VAE 解码原把整段 RGB 累积在 `final_rgb`（帧数×宽×高×3），峰�
 ### 反向提示（避免误判）
 - 「step 增加画质变好」是**质量/算力**维度（如 Phase 16 测 step7 vs step4 SSIM +54%），不是内存维度。
 - 若观察到 step 增多时 RSS 上升，几乎一定来自别处（如缓存/调度张量或系统内存压力），非 denoise 循环本身。
+
+## Session 2026-09-14/15：长时长 15s 内存墙 + 守卫 + 分段生成
+
+### 起因
+用户要求「VAE 流式化后，decode 单 chunk、int6 与 int8、864×480、15s、steps 4 的时长与峰值有无撞墙损耗」。
+
+### 过程与结论
+1. **int6/int8 路径定位**：int6=`h3_int6g128_native`；int8 预量化(h3_int8/h3_int8g64) 均缺 `condition_proj.bias`
+   → 改用 BF16 `minimax_h3_fastvideo_4step.safetensors` + 运行时 int8（用户指明）。
+2. **3s 实测**：int6/int8 均成功，VAE 单 chunk GPU 峰值 **0.654 GiB**（流式化生效）。
+3. **6s 实测（trace）**：denoise 第 1 步 footprint 10.11→**13.88 GiB**（+3.77/步）触发守卫；
+   加 `--token-reduction` 后峰值降到 13.00 完成 → 证明激活 ∝ token。
+4. **15s 单次 → 整机死机重启 ×2** → 判定硬件墙（16 GiB + swap=0）。
+5. **实现运行时守卫**（见 findings）→ 之后 6s 触发时**优雅退出，不再死机**。
+6. **分段生成**：`gen_segments.sh` 2s×7，产出 `seg_out/final.mp4`（16.36s）。
+   第 7 段曾 `Killed: 9`（系统内存保护，未死机），单独重跑成功后拼接。
+7. **跨段条件调研（负结果）**：H3 vision encoder 三处不可得 → `--first-frame` 不可用 → 段间硬切。
+
+### 本 session 改动文件
+| 文件 | 改动 |
+|---|---|
+| `h3_host.h/.c` | `h3_host_memory_guard` + `h3_host_footprint` + physical 查询；`H3_MEM_GUARD_MB`/`H3_MEM_HEADROOM_MB`/`H3_MEM_TRACE` |
+| `h3_dit.c` | include `h3_host.h`；denoise CPU/GPU 两个步循环插入守卫 |
+| `h3_video_vae.c` | include `h3_host.h`；resident/chunked 两个 chunk 循环插入守卫 |
+| `h3_memory_plan.c` | 预算 `target = min(rec×0.8, (physical−4GiB)×0.85)` |
+| `gen_segments.sh` | 新增：分段生成脚本（硬切拼接） |
+
+### 运行清单
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | INT6 3s 864×480 steps4 | ✅ wrote mp4；VAE peak 0.654 GiB |
+| 2 | INT8（BF16 4step + runtime int8）3s | ✅ wrote mp4；同 peak |
+| 3 | INT6 6s（无 tr）| ❌ 守卫触发（denoise 13.88 GiB）|
+| 4 | INT6 6s + `--token-reduction` | ✅ 完成（峰值 13.00）|
+| 5 | INT6 15s / INT8 15s | ❌ **整机死机**（两次）|
+| 6 | `gen_segments.sh`（2s×7）| ✅ `final.mp4` 16.36s |
+
+### Error Log
+| Error | Attempt | Resolution |
+|---|---|---|
+| 15s 单次死机 | 2 | 判为硬件墙 → 分段 + 守卫 |
+| int8 缺 condition_proj.bias | 1 | 改用 BF16 transformer + 运行时 int8 |
+| `--first-frame` pos_embed 不符 | 2 | 缺 H3 vision encoder → 硬切 |
+| 第 7 段 Killed:9 | 1 | 系统保护（未死机）；单独重跑成功 |
+
+### 5-Question Reboot Check
+| Question | Answer |
+|---|---|
+| Where am I? | 守卫 + 分段生成完成，`seg_out/final.mp4` 16.36s 已产出 |
+| Where am I going? | 若要段间连贯需补 H3 vision encoder；否则可用交叉溶解软化硬切 |
+| What's the goal? | 16 GiB 机产出 15s @ 864×480 |
+| What have I learned? | 16 GiB+swap=0 单次 15s 不可行；denoise 激活 ∝ token；VAE wired 不计 footprint；vision encoder 不可得 |
+| What have I done? | 守卫 + token-reduction 验证 + 分段生成 + 3/6s 实测 + 15s 死机定性 |

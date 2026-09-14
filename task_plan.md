@@ -967,3 +967,60 @@ video VAE 解码不再把整段 RGB 累积在内存：改为逐时间分片（te
 - 峰值从「整段 RGB（1080p×长视频可达数 GiB）」降到「单 chunk ≈ 0.5 GiB@1080p + VAE 权重」
 - 与分辨率/时长**解耦**：时长只影响耗时（chunk 数 × 每 chunk 解码），不影响峰值
 - **step 数增长对峰值无影响**（见 progress.md 本 session 节论证）
+
+---
+
+# ===== Task Plan（当前任务）: 长时长 15s 内存墙诊断 + 运行时守卫 + 分段生成 =====
+
+## Goal
+在 Apple M4 / **16 GiB / swap=0** 上产出 15s @ 864×480 / steps 4 的视频。
+先回答「VAE 流式化后，decode 单 chunk 的 int6/int8、同时长下峰值与时长有无撞墙」。
+
+## 最终结论
+- **单次 15s 在本机不可行（硬件墙）**：16 GiB 物理 + swap=0；denoise 激活 ∝ video token；
+  VAE decode 的 GPU wired 内存逐 chunk 累积（且**不计入进程 `phys_footprint`**）。
+- **交付**：分段硬切拼接 `seg_out/final.mp4` = **16.36s / 864×480 / 含音频 / 5.8 MB**。
+
+## Phases
+### Phase 40: 权重与量化路径定位 — complete
+- int6=`h3_int6g128_native`；int8 预量化(h3_int8 / h3_int8g64) 均缺 `condition_proj.bias`
+  → 依用户指示改用 BF16 `minimax_h3_fastvideo_4step.safetensors` + 运行时 int8。
+
+### Phase 41: 15s 崩溃诊断（3s/6s 实测取证） — complete
+- 3s：int6/int8 均成功，VAE 单 chunk GPU peak **0.654 GiB**（流式化生效）。
+- 6s：denoise 第 1 步 footprint 10.11 → **13.88 GiB**（+3.77/步）。
+- 6s + `--token-reduction`：峰值降到 13.00 → 完成。
+- 15s 单次：**整机死机重启 ×2** → 定性为硬件墙。
+
+### Phase 42: 运行时内存守卫 `h3_host_memory_guard` — complete
+- `h3_host.h/.c` 新增守卫（available + footprint 双条件）+ `h3_host_footprint` + physical 查询。
+- 插入 `h3_dit.c` denoise **CPU/GPU 两个步循环**、`h3_video_vae.c` **resident/chunked 两个 chunk 循环**。
+- `h3_memory_plan.c` 预算收紧 `min(rec×0.8,(physical−4GiB)×0.85)`。
+- 验证：6s 在 denoise 1/4 优雅退出（不再死机）；3s 默认 floor 不误杀。
+
+### Phase 43: `--token-reduction` 降激活验证 — complete
+- 6s denoise 峰值 13.88 → 13.00 GiB，使 6s 可跑完。
+
+### Phase 44: 分段生成（硬切拼接） — complete
+- `gen_segments.sh`：2s × 7 段独立进程（递增 seed），ffmpeg concat。
+- 产物 `seg_out/final.mp4` = 16.36s。
+
+### Phase 45: 跨段视觉条件调研 — complete（负结果）
+- H3 vision encoder 三处不可得 → `--first-frame` 不可用 → 段间只能硬切。
+
+## Decisions Made（本任务）
+| Decision | Rationale |
+|---|---|
+| 守卫以 **available 为主、footprint 为辅** | VAE decode 时进程 footprint 仅 ~2 GiB 而系统 available 降 6.2 GiB → GPU wired 不计 footprint，只看 footprint 会漏 |
+| plan 预算 `min(rec×0.8,(physical−4GiB)×0.85)` | Metal 建议值过于乐观；以物理内存为硬上限更安全 |
+| 段间**硬切**（无 `--first-frame`） | H3 vision encoder 三处均不可得，跨段视觉条件无法使用 |
+| 段长取 2s（56 帧） | 单段峰值 ~9.3 GiB，远离 16 GiB 墙；3s 已达 12.7 GiB 太贴边 |
+
+## Errors Encountered（本任务）
+| Error | Attempt | Resolution |
+|---|---|---|
+| 15s 单次 → **整机死机重启** ×2 | 2 | 判定硬件墙；改用 2s 分段 + 运行时守卫 |
+| int8 加载报 `condition_proj.bias` absent | 1 | int8 导出缺该张量 → 用 BF16 transformer + 运行时 int8 |
+| `--first-frame` 报 `visual.pos_embed` shape mismatch | 2 | 缺 H3 vision encoder（HF 不可达/ModelScope 无）→ 放弃 |
+| 第 7 段 `Killed: 9`(SIGKILL) | 1 | 系统内存压力保护（**未死机**）；单独重跑成功 |
+| 后台 nohup 进程被工具会话终止 | 1 | 改前台 + `tr '\r' '\n'` 实时输出 |
