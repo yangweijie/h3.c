@@ -213,6 +213,15 @@ static void convrot_unrotate_row(float *values) {
         values[k] *= (1.0f / 16.0f);
 }
 
+void h3_weight_unrotate_rows(float *values, size_t rows, size_t columns) {
+    if (!values || columns % H3_INT8_BLOCK) return;
+    for (size_t row = 0; row < rows; row++) {
+        float *row_values = values + row * columns;
+        for (size_t block = 0; block < columns; block += H3_INT8_BLOCK)
+            convrot_unrotate_row(row_values + block);
+    }
+}
+
 static uint16_t f32_to_bf16_u16(float value) {
     uint32_t bits;
     memcpy(&bits, &value, sizeof(bits));
@@ -398,6 +407,306 @@ static h3_gpu_tensor *load_f16_as_float(h3_gpu *gpu, const char *name,
              name, h3_gpu_error(gpu));
     return result;
 }
+/* --- Packed group-quantized weights (see h3_weights.h) ------------------- */
+
+static int grouped_auxiliary_name(char *out, size_t out_size, const char *name,
+                                  const char *suffix) {
+    int written = snprintf(out, out_size, "%s%s", name, suffix);
+    if (written < 0 || (size_t)written >= out_size) {
+        return 0;
+    }
+    return 1;
+}
+
+int h3_weight_grouped_spec(const h3_weight_store *store, const char *name,
+                           size_t elements, h3_grouped_spec *out,
+                           char *error, size_t error_size) {
+    if (!store || !name || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    const h3_st_header *weight_header = NULL;
+    const h3_st_tensor *weight = h3_weight_find(store, name, &weight_header);
+    if (!weight || weight->dtype != H3_DTYPE_U8) return 0;
+    char auxiliary[512];
+    if (!grouped_auxiliary_name(auxiliary, sizeof(auxiliary), name, "_scale"))
+        return 0;
+    const h3_st_header *scale_header = NULL;
+    const h3_st_tensor *scale = h3_weight_find(store, auxiliary, &scale_header);
+    if (!scale) return 0;
+    if (!grouped_auxiliary_name(auxiliary, sizeof(auxiliary), name, "_bias"))
+        return 0;
+    const h3_st_header *bias_header = NULL;
+    const h3_st_tensor *bias = h3_weight_find(store, auxiliary, &bias_header);
+    if (!bias) return 0;
+
+    if (weight->ndim != 2 || scale->ndim != 2 || bias->ndim != 2 ||
+        weight->shape[0] == 0 || weight->shape[1] == 0 ||
+        scale->shape[1] == 0) {
+        fail(error, error_size, "grouped weight %s must be rank 2", name);
+        return -1;
+    }
+    if (scale->dtype != bias->dtype ||
+        (scale->dtype != H3_DTYPE_F16 && scale->dtype != H3_DTYPE_F32) ||
+        scale->shape[0] != bias->shape[0] ||
+        scale->shape[1] != bias->shape[1]) {
+        fail(error, error_size,
+             "grouped weight %s needs matching F16/F32 scale and bias", name);
+        return -1;
+    }
+    unsigned rows = (unsigned)scale->shape[0];
+    if (elements == 0 || elements % rows) {
+        fail(error, error_size,
+             "grouped weight %s: %u accumulator rows do not divide %zu elements",
+             name, rows, elements);
+        return -1;
+    }
+    unsigned columns = (unsigned)(elements / rows);
+    if (weight->shape[0] != rows) {
+        fail(error, error_size,
+             "grouped weight %s: packed rows %llu do not match %u",
+             name, (unsigned long long)weight->shape[0], rows);
+        return -1;
+    }
+    uint64_t total_bits = weight->shape[1] * 8u;
+    if (total_bits % columns) {
+        fail(error, error_size,
+             "grouped weight %s: packed row of %llu bytes is not a whole number "
+             "of codes for %u columns", name,
+             (unsigned long long)weight->shape[1], columns);
+        return -1;
+    }
+    unsigned bits = (unsigned)(total_bits / columns);
+    if (bits != 4 && bits != 6 && bits != 8) {
+        fail(error, error_size,
+             "grouped weight %s: derived %u bits, expected 4, 6 or 8",
+             name, bits);
+        return -1;
+    }
+    unsigned accumulator_columns = (unsigned)scale->shape[1];
+    if (accumulator_columns == 0 || columns % accumulator_columns) {
+        fail(error, error_size,
+             "grouped weight %s: %u accumulator columns do not divide %u",
+             name, accumulator_columns, columns);
+        return -1;
+    }
+    unsigned group = columns / accumulator_columns;
+    if (group % 4u || group > columns) {
+        fail(error, error_size,
+             "grouped weight %s: group %u must be a multiple of 4", name, group);
+        return -1;
+    }
+    out->weight = weight;
+    out->weight_header = weight_header;
+    out->scale = scale;
+    out->scale_header = scale_header;
+    out->bias = bias;
+    out->bias_header = bias_header;
+    out->bits = bits;
+    out->group = group;
+    out->rows = rows;
+    out->columns = columns;
+    out->packed_row_bytes = weight->shape[1];
+    out->f16_accumulators = scale->dtype == H3_DTYPE_F16;
+    return 1;
+}
+
+static float grouped_accumulator(const void *base, size_t index, int f16) {
+    if (f16) return f16_to_f32(((const uint16_t *)base)[index]);
+    return ((const float *)base)[index];
+}
+
+int h3_weight_load_grouped_accumulators(const h3_grouped_spec *spec, float **out,
+                                        char *error, size_t error_size) {
+    if (!spec || !out) return 0;
+    size_t entries = (size_t)spec->rows * (spec->columns / spec->group);
+    size_t raw_size = entries * (spec->f16_accumulators ? 2u : 4u);
+    unsigned char *raw = malloc(raw_size);
+    float *values = malloc(entries * 2u * sizeof(float));
+    if (!raw || !values) {
+        free(raw);
+        free(values);
+        fail(error, error_size, "out of memory reading grouped accumulators");
+        return 0;
+    }
+    int ok = 0;
+    if (pread_bytes(spec->scale_header->path, spec->scale->file_offset, raw,
+                    raw_size)) {
+        for (size_t index = 0; index < entries; index++)
+            values[index] = grouped_accumulator(raw, index,
+                                                spec->f16_accumulators);
+        if (pread_bytes(spec->bias_header->path, spec->bias->file_offset, raw,
+                        raw_size)) {
+            for (size_t index = 0; index < entries; index++)
+                values[entries + index] =
+                    grouped_accumulator(raw, index, spec->f16_accumulators);
+            ok = 1;
+        }
+    }
+    free(raw);
+    if (!ok) {
+        free(values);
+        fail(error, error_size, "cannot read grouped accumulators");
+        return 0;
+    }
+    free(*out);
+    *out = values;
+    return 1;
+}
+
+int h3_weight_dequantize_grouped(const h3_grouped_spec *spec,
+                                 const uint8_t *packed, const void *scales,
+                                 const void *biases, size_t rows, int widened,
+                                 float *values,
+                                 char *error, size_t error_size) {
+    if (!spec || !packed || !scales || !biases || !values || rows == 0) {
+        fail(error, error_size, "invalid grouped dequantization request");
+        return 0;
+    }
+    size_t columns = spec->columns;
+    size_t group = spec->group;
+    size_t groups_per_row = columns / group;
+    int f16 = spec->f16_accumulators;
+    size_t accumulator_size = widened ? sizeof(float) : (f16 ? 2u : 4u);
+    /* Every group is a multiple of 4 codes and every packing unit is 1, 2 or 4
+     * codes wide, so a unit never straddles a group boundary. */
+    for (size_t row = 0; row < rows; row++) {
+        const uint8_t *source = packed + row * spec->packed_row_bytes;
+        float *target = values + row * columns;
+        const void *scale_row = (const uint8_t *)scales +
+                                row * groups_per_row * accumulator_size;
+        const void *bias_row = (const uint8_t *)biases +
+                               row * groups_per_row * accumulator_size;
+        size_t index = 0;
+        while (index < columns) {
+            size_t group_index = index / group;
+            float scale, bias;
+            if (widened) {
+                scale = ((const float *)scales)[row * groups_per_row + group_index];
+                bias = ((const float *)biases)[row * groups_per_row + group_index];
+            } else {
+                scale = grouped_accumulator(scale_row, group_index, f16);
+                bias = grouped_accumulator(bias_row, group_index, f16);
+            }
+            size_t limit = (group_index + 1) * group;
+            if (limit > columns) limit = columns;
+            if (spec->bits == 6u) {
+                for (; index < limit; index += 4) {
+                    const uint8_t *chunk = source + (index / 4) * 3;
+                    uint32_t word = (uint32_t)chunk[0] |
+                                    ((uint32_t)chunk[1] << 8) |
+                                    ((uint32_t)chunk[2] << 16);
+                    target[index] = (float)(word & 63u) * scale + bias;
+                    target[index + 1] = (float)((word >> 6) & 63u) * scale + bias;
+                    target[index + 2] = (float)((word >> 12) & 63u) * scale + bias;
+                    target[index + 3] = (float)((word >> 18) & 63u) * scale + bias;
+                }
+            } else if (spec->bits == 4u) {
+                for (; index < limit; index += 2) {
+                    uint8_t byte = source[index / 2];
+                    target[index] = (float)(byte & 15u) * scale + bias;
+                    target[index + 1] = (float)(byte >> 4) * scale + bias;
+                }
+            } else {
+                for (; index < limit; index++)
+                    target[index] = (float)source[index] * scale + bias;
+            }
+        }
+    }
+    return 1;
+}
+
+/* Upload a host F32 buffer as the requested tensor dtype. Shared by the packed
+ * group-quantized path; the INT8 and FP16 paths keep their own inline copies so
+ * this change stays additive. */
+static h3_gpu_tensor *upload_dequantized(h3_gpu *gpu, const char *name,
+                                         const float *values, size_t elements,
+                                         h3_dtype dtype, char *error,
+                                         size_t error_size) {
+    h3_gpu_tensor *result = NULL;
+    if (dtype == H3_DTYPE_BF16) {
+        uint16_t *packed = malloc(elements * sizeof(*packed));
+        if (!packed) {
+            fail(error, error_size, "out of memory packing %s", name);
+            return NULL;
+        }
+        for (size_t index = 0; index < elements; index++)
+            packed[index] = f32_to_bf16_u16(values[index]);
+        result = h3_gpu_tensor_from_bf16(gpu, packed, elements);
+        free(packed);
+    } else {
+        result = h3_gpu_tensor_from_f32(gpu, values, elements);
+    }
+    if (!result) {
+        fail(error, error_size, "cannot upload dequantized %s: %s", name,
+             h3_gpu_error(gpu));
+    }
+    return result;
+}
+
+static h3_gpu_tensor *load_grouped_dequantized(const h3_weight_store *store,
+                                               h3_gpu *gpu, const char *name,
+                                               size_t elements, h3_dtype dtype,
+                                               char *error, size_t error_size) {
+    h3_grouped_spec spec;
+    if (h3_weight_grouped_spec(store, name, elements, &spec, error,
+                               error_size) != 1) {
+        return NULL;
+    }
+    size_t rows = spec.rows;
+    size_t columns = spec.columns;
+    size_t groups_per_row = columns / spec.group;
+    size_t packed_bytes = (size_t)spec.packed_row_bytes * rows;
+    size_t accumulators = rows * groups_per_row;
+    size_t accumulator_size = spec.f16_accumulators ? 2u : 4u;
+    int unrotate = int8_unrotate_enabled();
+    if (unrotate && columns % H3_INT8_BLOCK) {
+        fail(error, error_size,
+             "grouped weight %s: input dim %zu is not a multiple of %d",
+             name, columns, H3_INT8_BLOCK);
+        return NULL;
+    }
+
+    uint8_t *packed = malloc(packed_bytes);
+    void *scales = malloc(accumulators * accumulator_size);
+    void *biases = malloc(accumulators * accumulator_size);
+    float *values = malloc(elements * sizeof(float));
+    if (!packed || !scales || !biases || !values) {
+        free(packed); free(scales); free(biases); free(values);
+        fail(error, error_size, "out of memory dequantizing grouped %s", name);
+        return NULL;
+    }
+    int read = pread_bytes(spec.weight_header->path, spec.weight->file_offset,
+                           packed, packed_bytes) &&
+               pread_bytes(spec.scale_header->path, spec.scale->file_offset,
+                           scales, accumulators * accumulator_size) &&
+               pread_bytes(spec.bias_header->path, spec.bias->file_offset,
+                           biases, accumulators * accumulator_size);
+    if (!read) {
+        free(packed); free(scales); free(biases); free(values);
+        fail(error, error_size, "cannot read grouped payload for %s", name);
+        return NULL;
+    }
+    int ok = h3_weight_dequantize_grouped(&spec, packed, scales, biases, rows, 0,
+                                          values, error, error_size);
+    free(packed);
+    free(scales);
+    free(biases);
+    if (!ok) {
+        free(values);
+        return NULL;
+    }
+    if (unrotate) {
+        for (size_t row = 0; row < rows; row++) {
+            float *row_values = values + row * columns;
+            for (size_t block = 0; block < columns; block += H3_INT8_BLOCK)
+                convrot_unrotate_row(row_values + block);
+        }
+    }
+    h3_gpu_tensor *result = upload_dequantized(gpu, name, values, elements,
+                                               dtype, error, error_size);
+    free(values);
+    return result;
+}
+
 /* --- end P13 ------------------------------------------------------------ */
 
 static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
@@ -409,6 +718,31 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
     if (!tensor) {
         fail(error, error_size, "required weight is absent: %s", name);
         return NULL;
+    }
+    uint64_t elements = 1;
+    for (int dimension = 0; dimension < ndim; dimension++) {
+        if (shape[dimension] && elements > UINT64_MAX / shape[dimension]) {
+            fail(error, error_size, "weight %s shape overflows", name);
+            return NULL;
+        }
+        elements *= shape[dimension];
+    }
+    if (elements > SIZE_MAX) {
+        fail(error, error_size, "weight %s is too large for this process", name);
+        return NULL;
+    }
+    /* Packed group-quantized weights are resolved before the exact-dtype check:
+     * their stored shape is the packed row length, not the logical one (see
+     * h3_weights.h). */
+    if (tensor->dtype == H3_DTYPE_U8 &&
+        (dtype == H3_DTYPE_F32 || dtype == H3_DTYPE_BF16)) {
+        h3_grouped_spec spec;
+        int status = h3_weight_grouped_spec(store, name, (size_t)elements, &spec,
+                                            error, error_size);
+        if (status < 0) return NULL;
+        if (status == 1)
+            return load_grouped_dequantized(store, gpu, name, (size_t)elements,
+                                            dtype, error, error_size);
     }
     /* P13: INT8 weights can be dequantized and FP16 weights widened on the fly
      * for callers that ask for BF16/F32. */
@@ -423,22 +757,12 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
              h3_dtype_name(dtype), ndim);
         return NULL;
     }
-    uint64_t elements = 1;
     for (int dimension = 0; dimension < ndim; dimension++) {
         if (tensor->shape[dimension] != shape[dimension]) {
             fail(error, error_size, "weight %s shape mismatch at dimension %d",
                  name, dimension);
             return NULL;
         }
-        if (shape[dimension] && elements > UINT64_MAX / shape[dimension]) {
-            fail(error, error_size, "weight %s shape overflows", name);
-            return NULL;
-        }
-        elements *= shape[dimension];
-    }
-    if (elements > SIZE_MAX) {
-        fail(error, error_size, "weight %s is too large for this process", name);
-        return NULL;
     }
     /* P13: INT8 -> BF16/F32 (dequantize + undo the ConvRot rotation). */
     if (int8_dequant)

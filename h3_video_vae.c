@@ -93,6 +93,17 @@ typedef struct {
     int streaming;
 } vae_context;
 
+static size_t tensor_bytes(h3_gpu_tensor *t) {
+    if (!t) return 0;
+    size_t item = 4;
+    switch (h3_gpu_tensor_dtype(t)) {
+        case H3_GPU_BF16: item = 2; break;
+        case H3_GPU_I8:   item = 1; break;
+        default:          item = 4; break;
+    }
+    return h3_gpu_tensor_elements(t) * item;
+}
+
 struct h3_video_vae_decoder {
     vae_context vae;
     tile_axis y_axis;
@@ -548,13 +559,25 @@ static int load_resident_weights(vae_context *vae,
  * uses run_stream_tile, which loads/frees each block per tile to trade re-reads
  * for a much smaller fixed footprint. */
 static int run_resident_tile(vae_context *vae, char *error,
-                             size_t error_size) {
+                            size_t error_size) {
     float zeros[HIDDEN];
     memset(zeros, 0, sizeof(zeros));
     h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
     if (!zero) {
         fail(error, error_size, "cannot allocate video VAE suffix token");
         return 0;
+    }
+    if (getenv("H3_PROFILE")) {
+        size_t blk = 0;
+        for (int i = 0; i < LAYERS; i++) {
+            vae_block *b = &vae->blocks[i];
+#define VB(f) blk += tensor_bytes(b->f);
+            VB(norm1) VB(qkv_w) VB(qkv_b) VB(out_w) VB(out_b) VB(scale1)
+            VB(norm2) VB(w1) VB(w1_b) VB(w2) VB(w2_b) VB(scale2)
+#undef VB
+        }
+        fprintf(stderr, "h3: [vae-debug] resident tile: total_block_bytes=%zu "
+                "patches=%u sequence=%u\n", blk, vae->patches, vae->sequence);
     }
 #define OP(call, label) do {                                                    \
     if (!gpu_op(vae, (call), error, error_size, label)) {                       \
@@ -642,6 +665,17 @@ static int run_stream_tile(vae_context *vae, char *error,
         if (!load_block(vae, index, error, error_size)) {
             h3_gpu_tensor_free(zero);
             return 0;
+        }
+        if (index == 0 && getenv("H3_PROFILE")) {
+            vae_block *b = &vae->blocks[0];
+            size_t blk = 0;
+#define VB(f) blk += tensor_bytes(b->f);
+            VB(norm1) VB(qkv_w) VB(qkv_b) VB(out_w) VB(out_b) VB(scale1)
+            VB(norm2) VB(w1) VB(w1_b) VB(w2) VB(w2_b) VB(scale2)
+#undef VB
+            fprintf(stderr, "h3: [vae-debug] stream tile: per-block_bytes=%zu "
+                    "patches=%u sequence=%u\n", blk, vae->patches,
+                    vae->sequence);
         }
         OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE transformer block");
         if (!run_block(vae, index, error, error_size)) {
@@ -1034,6 +1068,19 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
                                    error, error_size) &&
              prepare_rope(vae, error, error_size) &&
              allocate_activations(vae, error, error_size);
+        if (ok && getenv("H3_PROFILE")) {
+            size_t blk = 0;
+            for (int i = 0; i < LAYERS; i++) {
+                vae_block *b = &vae->blocks[i];
+#define VB(f) blk += tensor_bytes(b->f);
+                VB(norm1) VB(qkv_w) VB(qkv_b) VB(out_w) VB(out_b) VB(scale1)
+                VB(norm2) VB(w1) VB(w1_b) VB(w2) VB(w2_b) VB(scale2)
+#undef VB
+            }
+            fprintf(stderr, "h3: [vae-debug] load streaming=%d "
+                    "preloaded_block_bytes=%zu patches=%u sequence=%u\n",
+                    vae->streaming, blk, vae->patches, vae->sequence);
+        }
     }
     if (!ok) {
         h3_video_vae_decoder_free(decoder);
@@ -1069,6 +1116,7 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
 int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
                         h3_video_frames *output,
+                        h3_video_vae_sink sink, void *sink_opaque,
                         char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
     if (error && error_size) error[0] = '\0';
@@ -1083,10 +1131,12 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     int pixel_w = decoder->latent_w * SPATIAL_RATIO;
     size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
     size_t output_elements = (size_t)output_frames * frame_elements;
-    float *final_rgb = malloc(output_elements * sizeof(*final_rgb));
+    /* Streaming (sink != NULL) avoids retaining the whole clip: only the
+     * trailing 5-frame overlap buffer is kept. */
+    float *final_rgb = sink ? NULL : malloc(output_elements * sizeof(*final_rgb));
     float *temporal_overlap = malloc(5 * frame_elements *
                                      sizeof(*temporal_overlap));
-    if (!final_rgb || !temporal_overlap) {
+    if ((!sink && !final_rgb) || !temporal_overlap) {
         free(final_rgb);
         free(temporal_overlap);
         fail(error, error_size, "out of memory retaining decoded video frames");
@@ -1106,20 +1156,30 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                 decoded.rgb[base + index] = temporal_overlap[base + index] *
                     (1.0f - alpha) + decoded.rgb[base + index] * alpha;
         }
-        memcpy(final_rgb + (size_t)chunk * 17 * frame_elements,
-               decoded.rgb, 17 * frame_elements * sizeof(*final_rgb));
+        if (sink) {
+            if (sink(decoded.rgb, 17, pixel_h, pixel_w, sink_opaque) != 0)
+                ok = 0;
+        } else {
+            memcpy(final_rgb + (size_t)chunk * 17 * frame_elements,
+                   decoded.rgb, 17 * frame_elements * sizeof(*final_rgb));
+        }
         memcpy(temporal_overlap, decoded.rgb + 17 * frame_elements,
                5 * frame_elements * sizeof(*temporal_overlap));
         h3_video_frames_free(&decoded);
     }
+    if (ok && sink && sink(temporal_overlap, 5, pixel_h, pixel_w,
+                           sink_opaque) != 0)
+        ok = 0;
     if (ok) {
-        memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
-               temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+        if (!sink) {
+            memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
+                   temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+            output->rgb = final_rgb;
+            final_rgb = NULL;
+        }
         output->frames = output_frames;
         output->height = pixel_h;
         output->width = pixel_w;
-        output->rgb = final_rgb;
-        final_rgb = NULL;
         ok = h3_gpu_get_stats(decoder->vae.gpu, &output->gpu_stats);
     }
     free(final_rgb);
@@ -1143,6 +1203,7 @@ static int decode_chunked(const char *weight_directory,
                           const float *latent_mean, const float *latent_std,
                           int tile_pixels, int streaming,
                           h3_video_vae_progress progress, void *progress_opaque,
+                          h3_video_vae_sink sink, void *sink_opaque,
                           h3_video_frames *output, char *error,
                           size_t error_size) {
     tile_axis y_axis, x_axis;
@@ -1187,10 +1248,11 @@ static int decode_chunked(const char *weight_directory,
     int pixel_w = latent_width * SPATIAL_RATIO;
     size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
     size_t output_elements = (size_t)output_frames * frame_elements;
-    float *final_rgb = ok ? malloc(output_elements * sizeof(*final_rgb)) : NULL;
+    float *final_rgb = (ok && !sink) ? malloc(output_elements *
+                                             sizeof(*final_rgb)) : NULL;
     float *temporal_overlap = ok ? malloc(5 * frame_elements *
-                                          sizeof(*temporal_overlap)) : NULL;
-    if (ok && (!final_rgb || !temporal_overlap)) {
+                                         sizeof(*temporal_overlap)) : NULL;
+    if (ok && (!temporal_overlap || (!sink && !final_rgb))) {
         fail(error, error_size, "out of memory retaining decoded video frames");
         ok = 0;
     }
@@ -1247,20 +1309,30 @@ static int decode_chunked(const char *weight_directory,
                 decoded.rgb[base + index] = temporal_overlap[base + index] *
                     (1.0f - alpha) + decoded.rgb[base + index] * alpha;
         }
-        memcpy(final_rgb + (size_t)chunk * 17 * frame_elements,
-               decoded.rgb, 17 * frame_elements * sizeof(*final_rgb));
+        if (sink) {
+            if (sink(decoded.rgb, 17, pixel_h, pixel_w, sink_opaque) != 0)
+                ok = 0;
+        } else {
+            memcpy(final_rgb + (size_t)chunk * 17 * frame_elements,
+                   decoded.rgb, 17 * frame_elements * sizeof(*final_rgb));
+        }
         memcpy(temporal_overlap, decoded.rgb + 17 * frame_elements,
                5 * frame_elements * sizeof(*temporal_overlap));
         h3_video_frames_free(&decoded);
     }
+    if (ok && sink && sink(temporal_overlap, 5, pixel_h, pixel_w,
+                           sink_opaque) != 0)
+        ok = 0;
     if (ok) {
-        memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
-               temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+        if (!sink) {
+            memcpy(final_rgb + (size_t)chunks * 17 * frame_elements,
+                   temporal_overlap, 5 * frame_elements * sizeof(*final_rgb));
+            output->rgb = final_rgb;
+            final_rgb = NULL;
+        }
         output->frames = output_frames;
         output->height = pixel_h;
         output->width = pixel_w;
-        output->rgb = final_rgb;
-        final_rgb = NULL;
         ok = h3_gpu_get_stats(vae.gpu, &output->gpu_stats);
     }
     free(final_rgb);
@@ -1283,6 +1355,7 @@ int h3_video_vae_decode(const char *weight_directory,
                         h3_video_vae_progress progress, void *progress_opaque,
                         int streaming,
                         h3_video_frames *output,
+                        h3_video_vae_sink sink, void *sink_opaque,
                         char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
     if (error && error_size) error[0] = '\0';
@@ -1325,7 +1398,8 @@ int h3_video_vae_decode(const char *weight_directory,
                                 normalized_latent, latent_time, latent_height,
                                 latent_width, latent_mean, latent_std,
                                 tile_pixels, streaming, progress,
-                                progress_opaque, output, error, error_size);
+                                progress_opaque, sink, sink_opaque,
+                                output, error, error_size);
         if (!ok) h3_video_frames_free(output);
         return ok;
     }
@@ -1342,6 +1416,16 @@ int h3_video_vae_decode(const char *weight_directory,
         allocate_activations(&vae, error, error_size) &&
         run_decoder(&vae, progress, progress_opaque, error, error_size) &&
         unpack_frames(&vae, output, error, error_size);
+    if (ok && sink) {
+        int n = output->frames;  /* 5 (latent_time==2) or 22 */
+        if (sink(output->rgb, n, output->height, output->width,
+                 sink_opaque) != 0)
+            ok = 0;
+        else {
+            free(output->rgb);
+            output->rgb = NULL;
+        }
+    }
     if (!ok) h3_video_frames_free(output);
     cleanup(&vae);
     return ok;

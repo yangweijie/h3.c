@@ -51,6 +51,9 @@ h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
 h3_lora_tests: tests/test_lora.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_grouped_tests: tests/test_grouped_weights.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

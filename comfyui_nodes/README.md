@@ -113,7 +113,7 @@ python3 gen_comfyui_workflows.py
 ### 环境变量（进程级；节点 extra_args / 系统环境均可设）
 
 - **H3_DIT_RESIDENT_BLOCKS=N**（默认 0）：前 N 个 DiT 块常驻、其余流式，用内存换 I/O。实测 16 GB 上 wall time 几乎不降（甚至略升），因常驻块与流式路径争抢统一内存；每块约 0.7 GiB。仅在内存充裕（≥20 块能轻松放下）且磁盘是瓶颈时才有收益；16 GB 不要开。
-- **H3_VIDEO_VAE_STREAMING / --video-vae-streaming**（0|1|-1 auto，默认 auto）：0=VAE 解码器常驻（快但占 ~9 GiB，16 GB 干扰下可能 OOM），1=流式（只占 ~0.25 GiB，慢一些），-1=由内存规划器决定。
+- **H3_VIDEO_VAE_STREAMING / --video-vae-streaming**（0|1|-1 auto，默认 auto）：0=VAE 解码器常驻（快；逻辑预载 ~9 GiB 但为 F16→F32 加宽的**可驱逐**共享缓冲，并非钉死内存，实测峰值 5s@864 约 6.1 GiB、15s@864 约 7.5 GiB，16 GB 安全），1=流式（只占 ~0.25 GiB，慢一些），-1=由内存规划器决定（注：规划器据此默认选流式偏保守，16 GB 上常驻通常更优）。
 - **H3_DIT_STREAM_WORKERS / H3_DIT_STREAM_PIPELINE**：fast_stream 的底层旋钮（=2 启用分块多 worker；PIPELINE 只调重叠），一般直接用节点 fast_stream 开关。
 - **H3_PROFILE=1**：打印 I/O 字节、吞吐、未被 GPU 隐藏的读等待，性能诊断用。
 - **H3_CLIPPROJ_DIR / H3_CLIPPROJ_PROJ**：节点已通过 clipproj_dir / clipproj_proj 参数自动注入。
@@ -124,8 +124,8 @@ python3 gen_comfyui_workflows.py
 1. 默认（1/1/0/关）：精确基准。
 2. 想快：低分辨率开 fast_stream；低质量预览把 layers 降到 45/40，或把 core_reuse / reuse 调大。
 3. 质量没达标：全部回到精确（1/1/0）。
-4. 内存紧张（16 GB）：保持 video_vae_streaming 默认（流式），不要开 H3_DIT_RESIDENT_BLOCKS。
-5. 内存充裕且要榨速度：video_vae_streaming=0（常驻 VAE）+ fast_stream（低分辨率）+ 视情况 H3_DIT_RESIDENT_BLOCKS（>16 GB 且磁盘慢）。
+4. 内存紧张（16 GB）：VAE 常驻（video_vae_streaming=0）安全且更快（可驱逐，峰值 5s 约 6 GiB / 15s 约 7.5 GiB），推荐开；不要开 H3_DIT_RESIDENT_BLOCKS（常驻 DiT 块与流式路径争抢统一内存）。
+5. 要榨速度：video_vae_streaming=0（常驻 VAE，16 GB 亦安全）+ fast_stream（低分辨率）+ 视情况 H3_DIT_RESIDENT_BLOCKS（仅内存充裕且磁盘慢时）。
 
 ## Latent 子系统（生成 / 上采样 / 解码）
 

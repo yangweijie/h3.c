@@ -1173,7 +1173,39 @@ planner 算出的 5 个决策里，**2 个从未被消费**。
   → 每步只流 28 块 → 读取量 −44%。
 - 障碍：`stream_slots[2]` 是硬编码双槽轮转（h3_dit.c:218、`h3_stream_ring`），
   "部分块常驻"要改 ring 调度；且 8 GiB 常驻与 16 GB 机器的余量冲突
-  （反证：`--video-vae-streaming 0` 的 9.365 GiB VAE 常驻在同条件下 OOM 过一次）。
+  （订正：`--video-vae-streaming 0` 的 VAE 常驻逻辑预载约 9.0 GiB，但为 F16→F32 加宽的**可驱逐**共享缓冲，并非钉死内存；实测峰值 int6g128(native)@864x480 5s=6.10 GiB、int6g128(native)@512=5.13 GiB、int8g64@512=6.20 GiB，从未 OOM。原「同条件 OOM 过一次」论断在 Apple 统一内存下不成立，自动规划器据此默认选流式是在白白放弃内存/速度。注：实测所用 `native` 变体的 DiT(transformer)实为 int6-g128 量化权重（软链 → `h3_int6g128_native`），并非全精度；真正的未量化全精度模型是 `base` 变体（transformer → `h3_sys/MiniMax-H3-Convrot/FL2VA/transformer`）。各变体的 `video_vae`/`text_encoder`/`audio_vae`/`tokenizer` 均为指向系统盘的全精度软链、跨变体共享、VAE 永不量化，故 VAE 常驻/流式的内存行为在 native/int8/int6/base 下完全一致，变体间峰值差 100% 来自 DiT。15s 长时长验证(@864x480 int6g128):resident 峰值 **7.51 GiB**(8059174912 bytes),VAE 常驻逻辑预载 9.0 GiB 但进程峰值仍远低于此,168 个 chunk 全部走 resident tile 路径,无 OOM——时长从 5s 增至 15s(序列 3×)未改变 resident 更省的结论)。
+
+### 自适应 DiT 部分常驻 + 流水线解耦(2026-09-14)
+
+**问题**:15s@864x480 去噪耗时 54 分钟(DiT SSD 流式每步全量读取 36 GiB int6 权重 + CPU 反量化),且 int6 DiT 在 M4 无张量核上走纯 CPU 反量化极慢。
+
+**改动 1 — 自适应部分常驻**(h3_host.c/h3_dit.c):新增 `h3_host_available_memory()`(mach host_statistics64)查询可用物理内存,`h3_dit_resident_budget()` 按「可用内存 − 激活张量预算(1 GiB + latent 大小)」除以单块成本(保守 0.5 GiB)计算可常驻块数。`load_core()` 中若未设 `H3_DIT_RESIDENT_BLOCKS`,在 SSD 流式启用时自动触发。实测 2s 去噪从 325s(0 块常驻)降至 215s(10 块常驻),**提升 34%**。
+
+**改动 2 — 安全流水线模式**(h3.c):`--pipeline` + `--latent-out` 组合,去噪后用 `madvise(MADV_DONTNEED)` 提示 latent 缓冲区可回收(OS 可将页面回收给 VAE 权重或磁盘缓存),避免危险的 free+re-read(曾在内存压力主机上触发内核 panic)。对长序列(latent > 物理内存)可显著降低峰值 RSS。
+
+**改动 3 — 缓存 key 修复**(h3.c:1383):解码器缓存 key 加入 `video_vae_streaming`,修复交互式会话改 flag 后旧 decoder 被静默忽略的隐患。
+
+**实测对比**(int6g128@864x480,2 步):
+
+| 配置 | 常驻块 | 去噪时间 | 峰值 RSS |
+|---|---|---|---|
+| 无常驻(手动设 0) | 0 | 325s | 7.95 GiB |
+| 自适应常驻 | 10 | 215s | 7.31 GiB |
+| 自适应 + 流水线 | 10 | 215s | 7.23 GiB |
+
+**文件变更**:h3_host.h/c(内存查询)、h3_dit.c(自适应常驻)、h3.c(流水线 + key 修复)、findings.md、AGENTS.md、comfyui_nodes/README.md。
+
+### float16 latent 存储(2026-09-14)
+
+**动机**:15s@864x480 的 denoised latent(float32)约 18 GiB,超过 16 GiB 物理内存,导致 VAE 解码阶段 swap。将 latent 检查点存为 float16 可减半磁盘占用(18→9 GiB),且对最终画质无可见影响。
+
+**实现**:`h3.c` 的 `write_latent_bundle`/`read_latent_bundle` 升级为版本 3,新增 `dtype` 字段(0=f32, 1=f16),兼容旧版 2(f32)文件。`H3_LATENT_F16=1` 或 `--pipeline`(默认)写入 f16;`--latent-in` 读回时转回 f32 再送 VAE 解码。新增 `h3_f32_to_f16`/`h3_f16_to_f32` 转换函数。
+
+**质量验证**(同种子 seed=7 对比 f32/f16 latent 解码首帧):**PSNR = 45.93 dB**(远超 40 dB 阈值,像素差异 ~0.2%,肉眼无损)。
+
+**bug 修复**:初版 `h3_f32_to_f16` 进位逻辑误用 `h & 0x400` 检测尾数溢出,实际命中了指数最低位,导致所有 normal 值被放大 2×(PSNR 仅 ~20 dB)。修正为用独立 `mant10 & 0x400` 判定尾数进位并正确+1 到指数后,PSNR 恢复 45.93 dB。
+
+**注意**:f16 存储只缩小**磁盘检查点**;VAE 解码阶段仍需 f32 latent 在内存,故 15s 的 in-memory 峰值仍为 ~18 GiB f32。真正避免 15s swap 需走两进程路径(`--latent-out` 写 f16 → 独立 `--latent-in` 读 9 GiB f16 文件增量转 f32 解码),其峰值显著低于单进程内 18 GiB。流水线模式的 `madvise(DONTNEED)` 曾因清零 VAE 仍需的 latent 而危险,已移除——仅保留安全的 f16 落盘。
 
 ## 结论
 - `encoder_streaming` → **删除**（冗余，意图已天然实现）。
@@ -1224,3 +1256,230 @@ v1 无 version 字段且只有视频 → 无法区分是否含音频，故整体
   `LatentUpscaler3D` 只出现在我们改造的工作流里（且已移除）。
 - `MiniMaxH3_Convrot_Workflow.json` 变体：`output`→`VAEDecode`、
   `denoised_output`→`VAEDecodeAudio`，两路并行后 `CreateVideo` 合成。
+
+# ===== int4 / 量化感知蒸馏 调研发现（2026-09-13）=====
+
+## 度量语义（本轮最重要的一条认知）
+- `SSIM/PSNR/L2/cosine` 在「**不同权重、同提示**」下量的是**采样轨迹分歧**，不是画质。
+  扩散采样会放大任何权重扰动，步数越多分歧越大：int8-g64 的 SSIM 从 2 步 **0.891** 掉到 4 步 **0.739**，
+  而其纹理量（detail 0.0122 vs base 0.0129）与饱和度（0.0997 vs 0.0967）与基准持平 —— 即**画质没变**。
+- 正确判据（已实现在 `fastvideo_qad/scripts/ab_quant_quality.py`）：
+  | 代理 | 定义 | 诊断意义 |
+  |---|---|---|
+  | `detail` | `mean |d(luma)/dx|` | 高频结构量；**高于参考且饱和度不高于参考 = 噪点，不是纹理** |
+  | `saturation` | `mean(max−min over RGB)` | 去饱和 = 退化（只有下限，无上限） |
+  | `luma_std` | 对比度；< 0.05 说明参考本身欠采样，全部指标不可信 | 门槛 |
+- 参考性反例：int4-g64 的 SSIM 2 步 0.521 → 4 步 **0.598（反而升）**，但它仍是**退化**的
+  （2 步 detail ×1.578 判定 `grainy`；4 步 saturation ×0.857 判定 `desaturated`）。
+
+## int4-g64 PTQ 实测（源 = 旋转空间 per-row int8）
+| 方案 | 权重 relRMS | 2 步 SSIM | 4 步 SSIM | verdict |
+|---|---|---|---|---|
+| 源 per-row int8（base） | —（基准） | 1.000 | 1.000 | reference |
+| int8 affine group-64（回写 per-row int8） | 0.0052 | 0.891 | 0.739 | **preserved**（2/4 步一致） |
+| int4 affine group-64（同上） | 0.0913 | 0.521 | 0.598 | **degrades**（2 步 grainy / 4 步 desaturated） |
+- 结论：**int8-g64 可用；int4 PTQ 在无 QAT 前提下不可接受**。这与 §4 的推导一致。
+- 评测路径是**代理**：int4 → 反量化 → 重量化 per-row int8 → 现有引擎 int8 路径。
+  该代理层引入约 0.5% 底噪（int8-g64 通过它仍判 preserved），对方案差异足够灵敏。
+  **引擎目前没有 int4 加载路径**，所以代理是当前唯一可用的评测通道。
+
+## QAD / QAT 事实（FastVideo / FastMetal 侧）
+- `FastMetal-1.3B-QAD` 的精度来自 **QAT + DMD2 训练**（GB200 集群），不是格式转换。
+- FastVideo 的 QAD 配方（attn-QAT fake-quant + STE，再 DMD2）**只支持 Wan2.1**；
+  `fastvideo/train/models/minimax_h3/minimax_h3.py:73-74` 强制 `TORCH_SDPA`，H3 **无 QAT 入口**。
+- H3 在 FastVideo 只有推理期量化：MLX weight-only int8/int6/int4（affine g64）、CUDA FFN NVFP4/MXFP8。
+- `MLXQuantizationSpec.from_name` 把 group_size **硬编码 64**（`fastwan.py:66-70`）；
+  `mx.quantize` 本身接受任意 group_size。
+- 本机 anaconda env **无** gptq/awq/llm-compressor（仅 `mlx 0.32.2`）→ 误差补偿 PTQ 需自实现。
+
+## h3.c 引擎能力盘点（决定改动量）
+- `h3_safetensors.h:9-24` 已有 `H3_DTYPE_U32`（MLX 打包 int4 用得上），但无任何 U32 量化语义。
+- `h3_weights.c::load_int8_dequantized`（179-330）只处理 **I8 + `{name}_scale` F32[rows,1]**，
+  且依赖「蝶形先行、scale 后乘」的等价性（`scale * butterfly(i8) / 16`）。
+  **group 尺度会破坏该等价性**（尺度按输入维分组）→ int4 必须先解包成 float、按组乘尺度、再反旋转。
+- `h3_dit.c::convrot_unrotate_cpu`（668-710）按 `const int8_t *` 读源，输出 BF16，另带 qkv 的 `layout==1` 行重排。
+- 流式源描述 `h3_dit_stream_source` 有 `scale_path/scale_offset/scale_elements`，但**没有 zero-point 字段**。
+- 无激活 dump 钩子（只有 `H3_DEBUG_CONVROT`、`H3_DEBUG_VISION`）。
+
+## QKV 行序（踩过的坑，务必记住）
+- 源 checkpoint 的 `blocks.N.attn.qkv_proj.weight` 是 **module-major**（即 `concat(to_q,to_k,to_v)`），
+  **不是** head-interleaved。实测：`relRMS(concat, stored)=0.0056` vs `relRMS(interleave(concat), stored)=1.404`。
+- h3.c 自己会在加载时把它重排成 head-interleaved 送进 slot
+  （`h3_dit.c::convrot_unrotate_cpu`，`dst = (3*(slot%heads) + slot/heads)*head_dim + dim`）。
+- 因此**转换脚本里不需要也不允许再做一次交织**（旧 `mlx_int8_to_h3.py` 正是多做了这一层，导致 int8 与 int4 结果都崩到 SSIM≈0.46）。
+
+## 机器与卷（影响实验设计）
+- Apple M4 / 16 GiB；`recommended GPU set 11.8 GiB`；Metal 4 = yes，但 `tensorOpsEnabled` 仍只在 M5 或 `H3_VDN_INT8` 时开
+  → **本机没有 int8/int4 张量核路径，量化只省 I/O 不省计算**。
+- 顺序读：**内盘 2.31 GB/s** vs **外接 `/Volumes/data` 0.85 GB/s**（差 2.7×）。
+  权重放哪个卷直接决定 256² 流式场景 1.5× 的耗时（base 56 s vs 我在外接盘的 86 s）。
+- 内盘 `/System/Volumes/Data` 仅剩 ~2 GiB，swap 上限 2 GiB → 任何大产物必须落 `/Volumes/data`。
+
+## Phase 3a：引擎校准激活 dump 钩子 —— **已实现并验证**
+- 新增 `H3_DUMP_ACT=<dir>`（+ `H3_DUMP_ACT_ROWS` 默认 256、`H3_DUMP_ACT_LIMIT` 默认 8），
+  写在 `h3_dit.c`：结构体加 `dump_dir/dump_rows/dump_limit/dump_calls`，helper `dump_activation()`，
+  四个调用点分别对应四个矩阵的**真实输入**：
+  | 矩阵 | 输入张量 | 调用点 |
+  |---|---|---|
+  | qkv | `dit->mod_attention` [rows,5376] | AdaLN 之后 |
+  | out | `dit->attention_heads` [rows,7168] | SDPA 之后 |
+  | fc1 | `dit->mod_mlp` [rows,5376] | MLP AdaLN 之后 |
+  | fc2 | `dit->activated` [rows,14336] | SwiGLU 之后（**须 `H3_DISABLE_FUSED_MLP=1`**，融合 MLP 把中间量留在 kernel 内） |
+- **可行性关键**：`h3_gpu_submit` 会 commit **并 `waitUntilCompleted` 所有在飞命令缓冲**（h3_gpu.m:1006-1007），
+  且每个 kernel 自带 encoder → 「`submit`（刷+等）→ `read_bf16_range` → `begin`（重开链）」可在 block 内安全插入。
+  非 dump 运行在第一行 `if (!dit->dump_dir[0]) return;` 就退出，**零影响**。
+- 实测（256²/0.5s/2 步，源 checkpoint）：200 个文件、3.2 GB，每层 **1068 行**样本（2 步 × 534 token），
+  **且端到端出片正常**（钩子未破坏流水）。
+- 编译：`make CC="xcrun clang"` **0 warning / 0 error**。
+
+## Phase 3b：激活感知量化的评估 —— **决定性负结果**
+度量口径（重要修正）：**层输出误差** `err = ‖(Ŵ−W)Xᵀ‖_F / ‖WXᵀ‖_F`，而不是权重 relRMS。
+理由：权重 relRMS 与画质**非单调**（int6-g128 权重误差更差但端到端更好），
+而输出误差直接对应 `E‖(Ŵ−W)x‖²`，是量化的真实目标。
+
+### 关键诊断：ConvRot 已经把输入各向同性化了
+旋转前后每通道二阶矩的 max/min 比值（`x_rot = x_plain @ H`，因为引擎反旋转权重 ⇔ 等价于旋转激活）：
+
+| 层 | 旋转前 | 旋转后 | 改善 |
+|---|---|---|---|
+| blocks.0.mlp.fc2 | 2.67e9 | 718 | 3.7e6× |
+| blocks.1.mlp.fc2 | 9.08e8 | 62.2 | 1.5e7× |
+| blocks.0.mlp.fc1 | 7.15e4 | 73.4 | 974× |
+| blocks.0.attn.qkv | 3946.7 | 16.7 | 236× |
+| blocks.0.attn.out_proj | 5898.6 | 3165.3 | 1.9× |
+| **均值（20 个层）** | **1.86e8** | **644.9** | — |
+
+**ConvRot 一个固定的、免费的正交变换就提供了 5–7 个数量级的通道均衡——这正是 GPTQ/AWQ 赖以生效的机制。**
+
+### 后果：AWQ 在这里是**负收益**
+| 方案 | 层输出误差（20 层均值） | 权重 relRMS |
+|---|---|---|
+| int4-g64 plain | **0.05377** | 0.09094 |
+| int4-g64 + AWQ 通道缩放 | **0.06038（0.891×，恶化 12%）** | — |
+
+- 20 个层**全部**变差。机制：旋转已把输入摊平，再按 σ_j 缩放只会破坏量化误差分配。
+- **结论（仅对 AWQ/对角缩放族成立）：通道缩放式激活感知量化在本模型上是负收益。**
+- 附带收获：`plain` 的输出误差在 0.029–0.081 之间有 **2.8× 的层间差异**（不像 relRMS 那样全层齐平）
+  → **这才是混合精度需要的敏感度信号**，为 Phase 1c 提供了可用的排序依据。
+
+### 一次性 whitening —— **无效，不是有效上界**
+`quantize(W @ Σ^{1/2}) @ Σ^{-1/2}` 实测误差 **550**（plain 0.0535），差 1 万倍。
+原因：Σ 极端病态，用 `Σ^{1/2}`/`Σ^{-1/2}` 一对变换会把低能量方向的量化误差放大 `1/√λ` 倍而无界。
+→ **不能用一次性变换实现二阶目标**；二阶方法必须用序列式过程（GPTQ）从构造上处理条件数。
+
+### 旋转不变量：特征值谱
+`Σ_rot = Hᵀ Σ_plain H` 与 `Σ_plain` **相似 → 特征值完全相同**。所以：
+- ConvRot 只能均衡**对角**（这正是它 5–7 个数量级收益的来源），**无法改变特征值谱**。
+- 实测能量高度集中：99% 能量落在 **12–169 个方向**（n=1068）→ 序列式二阶方法**理论上仍有空间**。
+- 注意：n=1068 样本对 d_in=5376~14336 是严重欠定（H 秩 ≤ 1068），上述"有效秩"部分含小样本假象。
+
+## Phase 3b'：真 GPTQ —— **成功（4.36×），且踩坑记录重要**
+`gptq_probe.py`（单层判决性测试）。**第一次实现是错的**，且错法很有教育意义：
+- 我用了**完整逆矩阵** `H⁻¹`；GPTQ 必须用 **H⁻¹ 的上三角 Cholesky 因子**（`U = chol(H⁻¹).T`，
+  `H⁻¹ = UᵀU`），因为它编码了**序列消元结构**——第 j 列只对"尚未量化"的列做补偿。
+- 症状：三层的输出误差 **全部变差**（qkv 0.0387→0.0807、fc1 0.0809→0.1362、fc2 0.0753→0.0914），
+  权重 relRMS 爆到 0.19–0.32（补偿量被放大到把值推出组量化范围、触发饱和）。
+- **暴露 bug 的实验**：阻尼扫描。damp→∞ 时补偿应趋于消失、结果应收敛回 plain，
+  但实测 damp=0.01/2.0/20.0 分别给 0.0807 / 0.0828 / 0.0921，**单调变差且权重 relRMS 恒为 0.32**
+  → 说明问题不在条件数而在实现。**「极限行为应当退化到已知基线」是最有效的自检。**
+
+修正后（`blocks.0.attn.qkv_proj`，d_in=5376，n=1068）：
+
+| 方案 | 层输出误差 | 权重 relRMS |
+|---|---|---|
+| plain int4-g64 | 0.03865 | 0.09099 |
+| **GPTQ int4-g64（damp=0.01）** | **0.00886** | **0.35661** |
+| 增益 | **4.36×** | 升高 3.9× |
+
+- **权重 relRMS 升高而输出误差降低 4.36×**——GPTQ 的典型签名：牺牲权重域保真度换输出域精度。
+  这是本项目里第二次证明「权重 relRMS 不能用来判质量」（第一次是 int6-g128 vs g64）。
+- 成本实测：**729 s/层**（qkv，d_in=5376，单线程循环 + BLAS）。
+  按 `d_out·d_in²/2` 外推全部 200 层 ≈ **45 h**（fc2 单项就 ~18 h）。可按 block 并行以缩短墙钟。
+- **待解决的前提**：校准集 n=1068 ≪ d_in（最大 14336），H 严重欠定。当前 4.36× 是在欠定 Hessian 上
+  取得的，放大校准集（更多步数 × 更多 prompt）后数字会更可信、可能更优。
+
+## 环境陷阱
+- `h3` 二进制被标 `com.apple.quarantine`（`spctl -a` 判 rejected）→ gatekeeper **SIGKILL**，
+  现象是「所有命令 exit=137 且零输出」，连 `--help` 都死。修：`xattr -d com.apple.quarantine h3`。
+  排查同类问题时优先看 `xattr -l`，别先怀疑内存。
+- `/tmp` 在**内盘**（仅 ~2 GiB 空闲）→ 21 GiB 级别的 checkpoint 必须写 `/Volumes/data`，
+  否则 `SafetensorError: No space left on device`。
+
+## Phase 1a：位宽 × group size × 对称性（`quant_scheme_sweep.py`，88 s，纯权重误差）
+参考口径 = 源 checkpoint 自身的 per-row 对称 int8 反量化（即引擎今天在跑的东西），旋转空间。
+
+| 方案 | B/param | 全 DiT | vs 源 | relRMS |
+|---|---|---|---|---|
+| int4-g32-asym | 0.7500 | 13.46 GiB | −25.0% | 0.0807 |
+| int4-g64-asym（现 int4） | 0.6250 | 11.22 GiB | −37.5% | 0.0910 |
+| int4-g128-asym | 0.5625 | 10.10 GiB | −43.7% | 0.1003 |
+| int6-g32-asym | 1.0000 | 17.95 GiB | 0% | 0.0193 |
+| int6-g64-asym | 0.8750 | 15.70 GiB | −12.5% | 0.0217 |
+| int6-g128-asym | 0.8125 | 14.58 GiB | −18.8% | 0.0239 |
+| int8-g64-asym | 1.1250 | 20.19 GiB | **+12.5%（更大）** | 0.0053 |
+| int8-g128-asym | 1.0625 | 19.07 GiB | +6.2% | 0.0059 |
+
+- **对称性**：非对称（zero-point）稳定优于对称 **~11%**（int4-g64: 0.1075 sym vs 0.0910 asym）。
+  MLX `affine` 就是非对称形式 → 已有代理路径已吃到这部分收益。
+- **粒度**：int4 从 g32→g128 仅跨越 0.081↔0.100 → **靠 group size 救不了 int4**（与目标量级差 17×）。
+- **位宽**：误差约**每 bit 降 2×**（0.0910 → 0.0217 → 0.0053，各约 4×/2bit）。
+- **8 bit 以上无意义**：int8-g64（20.19 GiB）比源 per-row int8（17.95 GiB）**更大**。
+  → **int4 与 int6 是仅有的两条有效量化方向**。
+- 实现校验：扫描得 int4-g64-asym = **0.09096**，与对 MLX 官方产物的独立实测 **0.09127** 差 0.3% → 互相印证。
+
+## Phase 1a'：int6 端到端 —— **关键正面结果**
+`quantize_h3_proxy.py`（新增的代理量化器，直接从源按任意方案量化，其余张量逐字节复制）。
+
+| 变体 | 权重 relRMS | 2 步 SSIM | 2 步 ccos | 4 步 SSIM | 4 步 ccos | 4 步 detail× | 4 步 satur× | verdict |
+|---|---|---|---|---|---|---|---|---|
+| base（源 per-row int8） | — | 1.0000 | 1.000 | 1.0000 | 1.000 | 1.000 | 1.000 | reference |
+| int8-g64 | 0.0052 | 0.8906 | 0.9892 | 0.7386 | 0.8548 | 0.949 | 1.031 | preserved |
+| **int6-g64** | **0.0238** | **0.7930** | 0.9481 | **0.6698** | 0.7644 | **0.987** | **1.007** | **preserved（2/4 步一致）** |
+| int4-g64 | 0.0913 | 0.5209 | 0.6298 | 0.5977 | 0.6660 | 1.253 | 0.857 | degrades |
+
+- 拼图 `ab_report/montage_steps4_int6.png`（上→下：base / int8 / int6 / int4）：
+  **int6 行与 base 行画质等同**（毛发锐度、颜色、松枝、雪面均干净），仅轨迹不同；
+  int4 行为明显糊化 + 雪面条状伪影 + 去饱和。
+- **由此得到「preserved / degrades」边界**：落在权重 relRMS **0.024（preserved）与 0.091（degrades）之间**。
+  这把"还需要多准"从定性变成了定量：**任何新方案只要把 relRMS 压到 ~0.03 以下即大概率通过**。
+- 收益：int6-g64 = **−12.5% 字节**；int6-g128（同量级误差 0.0239）= **−18.8% 字节**。
+  这才是本任务到目前**唯一可落地的字节收益**（int8 换格式反而更大，纯 int4 质量不过关）。
+
+## Phase 1c：混合位宽探针 —— **边界不可判（重要方法学发现）**
+两个候选（`quantize_h3_proxy.py --override`，其余张量逐字节复制）：
+
+| 变体 | 配置 | 字节 | pooled relRMS | 4 步（detail× / satur×）| 2 步（detail× / satur×）|
+|---|---|---|---|---|---|
+| mixA | MLP=int4, attn=int6 | −27.5%（13.0 GiB） | 0.0577 | 1.041 / **0.887 → degrades** | 0.986 / 1.141 → preserved |
+| mixB | attn=int4, MLP=int6 | −22.5%（13.9 GiB） | 0.0576 | 1.208 / 1.091 → preserved | 1.092 / **0.944 → degrades** |
+
+- 两个候选在 2 步/4 步之间**互相翻转**；mixB@2步 仅差 **0.006** 就越过 0.95 阈值。
+- 由此标定出代理量的**跨步数波动约 ±0.15~0.25（饱和度比）**，而我原先的判定规则是在
+  远离边界的两端（relRMS 0.005→preserved / 0.091→degrades）校准的。
+- **结论：pooled relRMS ≈ 0.058 这一档目前不可判**，不能算通过。任何「<14 GiB」的结论
+  必须先做评测加固（多 seed × 多 prompt 聚合 + 报告波动），否则只是在噪声里读数。
+- 推论（指导 Phase 3）：**要突破 14 GiB，必须把 relRMS 压到 ~0.03 以下**，而不是在 0.06 附近调权重分配。
+- 另有观测：mixA/mixB 的 pooled 均值几乎相同（0.0577 / 0.0576）但 max 都是 0.0915（int4 那部分），
+  且两者 SSIM 排序（mixA 0.705 > mixB 0.644 @4步）与"哪部分用 int4"有关 →
+  MLP 用 int4 比 attn 用 int4 略好，但差距在噪声内，需 1d 加固后才能定论。
+
+## Phase 1a''：int6-g128 端到端 —— **通过（当前最优方案）**
+| 变体 | 权重 relRMS | 4 步 SSIM / ccos | 4 步 detail× / satur× | 2 步 SSIM / ccos | 2 步 detail× / satur× | verdict |
+|---|---|---|---|---|---|---|
+| base | — | 1.0000 / 1.000 | 1.000 / 1.000 | 1.0000 / 1.000 | 1.000 / 1.000 | reference |
+| int8-g64 | 0.0052 | 0.7386 / 0.8548 | 0.949 / 1.031 | 0.8906 / 0.9892 | 1.059 / 1.238 | preserved |
+| **int6-g128** | **0.0256** | **0.7048 / 0.8267** | **1.076 / 1.093** | 0.7898 / 0.9427 | **1.031 / 1.200** | **preserved（余量充裕）** |
+| int6-g64 | 0.0238 | 0.6698 / 0.7644 | 0.987 / 1.007 | 0.7930 / 0.9481 | 0.971 / 1.079 | preserved |
+
+- **结论：int6 affine group-128 可用，字节 17.95 → 14.58 GiB（−18.8%）**，画质与 base 等同
+  （`ab_report/montage_steps4_int6g128.png`：base / int8 / int6g128 / int6g64 / int4 五联对比，
+  前三者肉眼等价，int4 明显糊化去饱和）。
+- 反直觉但一致：g128 的权重误差（0.0256）**略大于** g64（0.0238），但端到端指标反而略好
+  （4 步 SSIM 0.705 vs 0.670, ccos 0.827 vs 0.764）→ **权重 relRMS 与画质不是单调关系**，
+  组粒度改变的是误差结构分布，不只是幅度。**判定必须靠端到端，不能只看 relRMS。**
+- 余量判据的重要性被这轮坐实：
+  | 方案 | 距 0.95 饱和度阈值 | 可判性 |
+  |---|---|---|
+  | int6-g128 | +15% / +26% | ✅ 可信 |
+  | int6-g64 | +8% / +14% | ✅ 可信 |
+  | mixA / mixB | −7% / −1% | ❌ 在 ±0.15~0.25 的步数波动内 → 不可判 |

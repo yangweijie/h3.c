@@ -17,6 +17,16 @@ typedef struct {
 typedef void (*h3_video_vae_progress)(int completed_blocks, int total_blocks,
                                       void *opaque);
 
+/* Streaming decode sink. Called in temporal order, once per temporal chunk
+ * (17 frames) and once for the trailing 5-frame tail, each with the chunk's
+ * F32 RGB [frames,height,width,3] in [0,1]. Return 0 to continue; return
+ * non-zero to abort the decode (the decode function then fails). When NULL,
+ * the decode functions retain the full clip in output->rgb (legacy behavior).
+ * Streaming keeps peak RAM at one chunk instead of the whole clip, which is
+ * required for long high-resolution videos. */
+typedef int (*h3_video_vae_sink)(const float *rgb_f32, int frames,
+                                 int height, int width, void *opaque);
+
 /* Number of VAE decoder transformer blocks. Must match LAYERS in
  * h3_video_vae.c; exported so the memory planner can estimate the per-block
  * resident footprint when streaming the VAE decoder (instead of hard-coding
@@ -42,6 +52,7 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
 int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
                         h3_video_frames *output,
+                        h3_video_vae_sink sink, void *sink_opaque,
                         char *error, size_t error_size);
 void h3_video_vae_decoder_free(h3_video_vae_decoder *decoder);
 
@@ -55,6 +66,7 @@ int h3_video_vae_decode(const char *weight_directory,
                         h3_video_vae_progress progress, void *progress_opaque,
                         int streaming,
                         h3_video_frames *output,
+                        h3_video_vae_sink sink, void *sink_opaque,
                         char *error, size_t error_size);
 void h3_video_frames_free(h3_video_frames *frames);
 

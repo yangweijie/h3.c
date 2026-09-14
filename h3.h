@@ -150,6 +150,11 @@ typedef struct {
     /* Decode a pre-existing latent file (written by --latent-out) straight to
      * video, skipping denoising entirely. Requires --output/-o. */
     const char *latent_in_path;
+    /* Pipeline mode: write the denoised latent to --latent-out, free the
+     * latents and all weights, then re-read from disk for VAE decode. Keeps
+     * the denoise and decode phases from competing for RAM. Requires
+     * --latent-out. */
+    int pipeline;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
@@ -162,6 +167,7 @@ typedef struct {
     .video_vae_streaming = -1, \
     .memory_plan_auto = 1, \
     .latent_out_path = NULL, .latent_in_path = NULL, \
+    .pipeline = 0, \
 }
 
 typedef struct {

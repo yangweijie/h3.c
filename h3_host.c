@@ -9,6 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <sys/sysctl.h>
+#endif
+
 static const int h3_frame_per_token[5] = {1, 4, 4, 4, 4};
 static const double h3_frame_rescale = 5.0 / 3.0;
 
@@ -644,4 +650,50 @@ int h3_euler_velocity_step(float *sample, const float *velocity, size_t count,
     for (size_t index = 0; index < count; index++)
         sample[index] += delta * velocity[index];
     return 1;
+}
+
+/* Query currently available physical memory. On macOS this returns the sum of
+ * free + inactive + purgeable pages (what the kernel would hand out without
+ * swapping). Other platforms fall back to sysinfo or return 0. */
+uint64_t h3_host_available_memory(void) {
+#if defined(__APPLE__)
+    mach_port_t host_port = mach_host_self();
+    vm_size_t page_size = 0;
+    kern_return_t kr = host_page_size(host_port, &page_size);
+    if (kr != KERN_SUCCESS || page_size == 0) return 0;
+
+    vm_statistics64_data_t vm_stats;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    kr = host_statistics64(host_port, HOST_VM_INFO64,
+                           (host_info64_t)&vm_stats, &count);
+    if (kr != KERN_SUCCESS) return 0;
+
+    uint64_t free_bytes = (uint64_t)vm_stats.free_count * page_size;
+    uint64_t inactive_bytes = (uint64_t)vm_stats.inactive_count * page_size;
+    uint64_t purgeable_bytes =
+        (uint64_t)vm_stats.purgeable_count * page_size;
+
+    return free_bytes + inactive_bytes + purgeable_bytes;
+#elif defined(__linux__)
+    long pages = sysconf(_SC_AVPHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages <= 0 || page_size <= 0) return 0;
+    return (uint64_t)pages * (uint64_t)page_size;
+#else
+    return 0;
+#endif
+}
+
+/* Estimate how many DiT blocks can be kept resident. The streaming ring needs
+ * at least 2 slots, so the tail of (active_blocks - 2) blocks is the pool we
+ * can draw from. We divide the available memory by the per-block resident cost
+ * and clamp to [0, active_blocks - 2]. A GiB-aligned safety margin is baked in
+ * by the caller passing available minus its own reservation. */
+unsigned h3_dit_resident_budget(uint64_t available, uint64_t per_block_cost,
+                                unsigned active_blocks) {
+    if (per_block_cost == 0 || active_blocks <= 2) return 0;
+    unsigned max_resident = active_blocks - 2;
+    unsigned affordable = (unsigned)(available / per_block_cost);
+    if (affordable > max_resident) affordable = max_resident;
+    return affordable;
 }

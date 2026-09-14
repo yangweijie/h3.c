@@ -46,6 +46,18 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
                                  int channels, int sample_rate,
                                  char *error, size_t error_size);
 
+/* Streaming A/V mux: open a pipe to FFmpeg, write RGB24 frames as they are
+ * produced (so the caller never holds the whole clip in RAM), then close.
+ * Functionally equivalent to h3_ffmpeg_write_av_rgb24_f32 but incremental. */
+typedef struct h3_ffmpeg_mux h3_ffmpeg_mux;
+h3_ffmpeg_mux *h3_ffmpeg_mux_open(const char *path, int width, int height,
+                                  int fps, const float *pcm, int samples,
+                                  int channels, int sample_rate,
+                                  char *error, size_t error_size);
+int h3_ffmpeg_mux_write_rgb24(h3_ffmpeg_mux *mux, const uint8_t *rgb24,
+                              int frame_count, char *error, size_t error_size);
+int h3_ffmpeg_mux_close(h3_ffmpeg_mux *mux, char *error, size_t error_size);
+
 /* Post-process a generated video with an external Real-ESRGAN ncnn-vulkan
  * binary: extract frames, upscale by `scale` (2/3/4) or to an explicit target
  * resolution, then re-mux preserving the original audio track. `target_width`

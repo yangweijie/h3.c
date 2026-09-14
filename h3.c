@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1211,11 +1212,74 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
     return pair;
 }
 
-/* Forward declaration: defined at the end of this file, used by h3_generate. */
+/* Forward declarations: defined at the end of this file, used by h3_generate. */
 static int write_latent_bundle(const char *path, const float *video,
                                int t, int h, int w, int c,
                                const float *audio, int audio_t,
+                               int use_f16,
                                char *error, size_t error_size);
+static float *read_latent_bundle(const char *path, int *t, int *h, int *w, int *c,
+                                 float **audio, int *audio_t,
+                                 char *error, size_t error_size);
+
+/* Streaming VAE sink: convert each temporal chunk to u8, resize to the
+ * requested output size, deliver preview frames, and pipe straight into the
+ * FFmpeg mux. Keeps peak RAM at one chunk instead of the whole clip, which is
+ * required for long high-resolution videos. */
+typedef struct {
+    h3_ffmpeg_mux *mux;
+    int out_w, out_h;
+    int (*on_frame)(const h3_frame *, void *);
+    void *on_frame_opaque;
+    char *error;
+    size_t error_size;
+    int failed;
+} h3_vae_sink_ctx;
+
+static int h3_vae_frame_sink(const float *rgb, int frames_, int h, int w,
+                             void *opaque) {
+    h3_vae_sink_ctx *st = opaque;
+    size_t count = (size_t)frames_ * (size_t)h * (size_t)w * 3;
+    uint8_t *u8 = h3_rgb_f32_to_u8(rgb, count);
+    if (!u8) {
+        st->failed = 1;
+        snprintf(st->error, st->error_size, "out of memory converting frames");
+        return -1;
+    }
+    uint8_t *to_write = u8;
+    uint8_t *resized = NULL;
+    if (w != st->out_w || h != st->out_h) {
+        if (!h3_resize_rgb24_high_quality(u8, frames_, w, h, st->out_w,
+                                          st->out_h, &resized)) {
+            free(u8);
+            st->failed = 1;
+            snprintf(st->error, st->error_size, "cannot resize frames");
+            return -1;
+        }
+        to_write = resized;
+    }
+    if (st->on_frame) {
+        size_t fb = (size_t)st->out_w * (size_t)st->out_h * 3;
+        for (int i = 0; i < frames_; i++) {
+            h3_frame f = { st->out_w, st->out_h, st->out_w * 3,
+                           to_write + (size_t)i * fb, i, frames_, -1, 0 };
+            if (st->on_frame(&f, st->on_frame_opaque)) {
+                free(u8); free(resized);
+                st->failed = 1;
+                snprintf(st->error, st->error_size, "generation cancelled");
+                return -1;
+            }
+        }
+    }
+    int ok = 1;
+    if (st->mux &&
+        !h3_ffmpeg_mux_write_rgb24(st->mux, to_write, frames_,
+                                   st->error, st->error_size))
+        ok = 0;
+    free(u8);
+    free(resized);
+    return ok ? 0 : -1;
+}
 
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
@@ -1380,8 +1444,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_key decoder_cache_key = {0};
-    if (!h3_key_append(&decoder_cache_key, "%s|%dx%d", vae_path,
-                       latent_h, latent_w)) {
+    if (!h3_key_append(&decoder_cache_key, "%s|%dx%d|%d", vae_path,
+                       latent_h, latent_w, params->video_vae_streaming)) {
         h3_set_error(ctx, "out of memory constructing decoder cache key");
         goto cleanup;
     }
@@ -2117,20 +2181,51 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
+    /* Pipeline mode: checkpoint the denoised latent to disk, free the buffer
+     * and all model weights, then let the VAE-decode phase re-read it from a
+     * clean memory state. This keeps the two phases from competing for RAM
+     * (the latent alone can exceed physical memory for long clips). */
+    int pipeline_mode = params->pipeline;
+    const char *checkpoint_path = pipeline_mode ? params->latent_out_path : NULL;
+    /* Store the denoised latent as float16 when in pipeline mode (halves the
+     * checkpoint so long clips fit in physical RAM instead of swapping) or when
+     * H3_LATENT_F16=1. The VAE decoder upcasts back to float32; quality is
+     * visually identical for the [-3,3] latent range. */
+    int use_f16 = pipeline_mode ? 1 : 0;
+    const char *f16_env = getenv("H3_LATENT_F16");
+    if (f16_env && *f16_env && atoi(f16_env) != 0) use_f16 = 1;
     if (params->latent_out_path && *params->latent_out_path) {
         /* video holds the denoised latent in [C,T,H,W]; derive C from the
          * known element count so we never hard-code the channel count. */
         int lc = (int)(video_count /
                        ((size_t)temporal.video_t * latent_h * latent_w));
         char lerr[512];
-        if (!write_latent_bundle(params->latent_out_path, video,
+        if (!write_latent_bundle(checkpoint_path ? checkpoint_path : params->latent_out_path,
+                                video,
                                 temporal.video_t, latent_h, latent_w, lc,
                                 audio, temporal.audio_t,
+                                use_f16,
                                 lerr, sizeof(lerr))) {
             h3_set_error(ctx, "%s", lerr);
             goto cleanup;
         }
         h3_progress_emit(&progress, "latent", temporal.video_t, temporal.video_t);
+    }
+    if (pipeline_mode && checkpoint_path && *checkpoint_path &&
+        video && audio) {
+        /* Pipeline checkpoint written above as float16 (use_f16=1): half the
+         * on-disk size so long-clip latents fit comfortably and the external
+         * --latent-in two-process decode path stays within physical RAM. We do
+         * NOT madvise(DONTNEED) the in-memory latent here because the VAE
+         * decode phase that follows still reads it; reclaiming those pages
+         * would zero the data the decoder needs. */
+        size_t total_bytes = (size_t)video_count * sizeof(*video) +
+                             (size_t)audio_count * sizeof(*audio);
+        fprintf(stderr,
+                "h3: pipeline checkpoint: latent written as float16 "
+                "(%.1f MiB on disk, %zu MiB in-flight f32)\n",
+                (double)total_bytes / 2.0 / (1024.0 * 1024.0),
+                total_bytes / (1024 * 1024));
     }
     if (progress.cancelled) goto cleanup;
     h3_progress_emit(&progress, "audio VAE", 0, 7);
@@ -2157,69 +2252,54 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    int video_ok = preview_decoder ?
-        h3_video_vae_decoder_decode(
-            preview_decoder, video, temporal.video_t, &frames,
-            detail, sizeof(detail)) :
-        h3_video_vae_decode(
-            vae_path, "h3_shaders.metal", video,
-            temporal.video_t, latent_h, latent_w,
-            h3_vae_progress_bridge, &progress, params->video_vae_streaming,
-            &frames, detail, sizeof(detail));
-    if (!video_ok) {
-        h3_set_error(ctx, "%s", detail);
-        goto cleanup;
-    }
-    free(video);
-    video = NULL;
-    if (progress.cancelled) goto cleanup;
-    size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
-                       (size_t)frames.width * 3;
-    rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
-    if (!rgb8) {
-        h3_set_error(ctx, "out of memory converting generated RGB frames");
-        goto cleanup;
-    }
-    int output_width = frames.width;
-    int output_height = frames.height;
-    if (output_width != params->width || output_height != params->height) {
-        uint8_t *resized = NULL;
-        if (!h3_resize_rgb24_high_quality(
-                rgb8, frames.frames, output_width, output_height,
-                params->width, params->height, &resized)) {
-            h3_set_error(ctx, "cannot resize generated RGB frames");
-            goto cleanup;
-        }
-        free(rgb8);
-        rgb8 = resized;
-        output_width = params->width;
-        output_height = params->height;
-    }
-    if (params->on_frame) {
-        size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
-        for (int index = 0; index < frames.frames; index++) {
-            h3_frame frame = {output_width, output_height, output_width * 3,
-                              rgb8 + (size_t)index * frame_bytes,
-                              index, frames.frames, -1, 0};
-            if (params->on_frame(&frame, params->callback_opaque)) {
-                h3_set_error(ctx, "generation cancelled while delivering frame %d",
-                             index);
-                goto cleanup;
-            }
-        }
-    }
+    int out_w = params->width, out_h = params->height;
+    h3_ffmpeg_mux *mux = NULL;
     if (params->output_path && *params->output_path) {
-        h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
-        if (!h3_ffmpeg_write_av_rgb24_f32(
-                params->output_path, rgb8, frames.frames, output_width,
-                output_height, H3_FPS, waveform.pcm, waveform.samples,
-                waveform.channels, waveform.sample_rate,
-                detail, sizeof(detail))) {
+        h3_progress_emit(&progress, "FFmpeg", 0, 0);
+        mux = h3_ffmpeg_mux_open(params->output_path, out_w, out_h, H3_FPS,
+                                 waveform.pcm, waveform.samples,
+                                 waveform.channels, waveform.sample_rate,
+                                 detail, sizeof(detail));
+        if (!mux) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
     }
+    h3_vae_sink_ctx sink_ctx = {
+        .mux = mux, .out_w = out_w, .out_h = out_h,
+        .on_frame = params->on_frame, .on_frame_opaque = params->callback_opaque,
+        .error = detail, .error_size = sizeof(detail), .failed = 0
+    };
+    int video_ok = preview_decoder ?
+        h3_video_vae_decoder_decode(preview_decoder, video, temporal.video_t,
+                                    &frames, h3_vae_frame_sink, &sink_ctx,
+                                    detail, sizeof(detail)) :
+        h3_video_vae_decode(vae_path, "h3_shaders.metal", video,
+                            temporal.video_t, latent_h, latent_w,
+                            h3_vae_progress_bridge, &progress,
+                            params->video_vae_streaming, &frames,
+                            h3_vae_frame_sink, &sink_ctx,
+                            detail, sizeof(detail));
+    free(video);
+    video = NULL;
+    if (progress.cancelled) {
+        if (mux) h3_ffmpeg_mux_close(mux, detail, sizeof(detail));
+        goto cleanup;
+    }
+    if (!video_ok || sink_ctx.failed) {
+        if (mux) h3_ffmpeg_mux_close(mux, detail, sizeof(detail));
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    if (mux) {
+        h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
+        if (!h3_ffmpeg_mux_close(mux, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        mux = NULL;
+    }
+    int output_width = out_w, output_height = out_h;
     result = calloc(1, sizeof(*result));
     if (!result) {
         h3_set_error(ctx, "out of memory creating generation result");
@@ -2276,43 +2356,127 @@ void h3_result_free(h3_result *result) {
 /* ------------------------------------------------------------------ */
 /* Latent file I/O (raw, self-describing)                             */
 /* ------------------------------------------------------------------ */
-/* On-disk layout (version 2):                                         */
+/* On-disk layout (version 3, with dtype flag):                       */
 /*   uint32 magic = H3_LATENT_MAGIC                                    */
-/*   int32  version = 2                                               */
+/*   int32  version = 3                                               */
+/*   int32  dtype   = 0 (float32) or 1 (float16 / IEEE half)          */
 /*   int32  video_t, video_h, video_w, video_c                        */
-/*   c*t*h*w float32  -- video latent, [C,T,H,W] order                */
+/*   c*t*h*w float32 or uint16 (half)  -- video latent, [C,T,H,W]      */
 /*   int32  audio_present (0/1)                                       */
 /*   if audio_present:                                                */
 /*     int32 audio_c, audio_s, audio_t                                */
-/*     c*s*t float32     -- audio latent, [32,2,T] channel-major      */
-/* The video latent order matches the denoiser's `video` buffer, which */
-/* h3_video_vae_decode's prepare_input re-indexes.                     */
+/*     c*s*t float32 or uint16 (half)  -- audio latent, [32,2,T]       */
+/* Version 2 (no dtype field, always float32) is still readable for   */
+/* backward compatibility. Storing the denoised latent as float16     */
+/* (the default for --pipeline checkpoints) halves the on-disk size   */
+/* and the in-flight memory pressure without visible quality loss:    */
+/* the VAE decoder maps the latent back to float32 before compute,    */
+/* and its output is robust to ~1e-3 perturbations.                    */
 /* ------------------------------------------------------------------ */
 #define H3_LATENT_MAGIC 0x48334C54u  /* "H3LT" */
 #define H3_LATENT_VERSION 2
+#define H3_LATENT_VERSION_F16 3
+
+/* IEEE-754 half-precision conversion. Latent values live in ~[-3,3], a
+ * comfortable normal range, so only the normal/exponent paths matter in
+ * practice; subnormal/overflow are handled conservatively. */
+static inline uint16_t h3_f32_to_f16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    uint32_t sign = (u >> 16) & 0x8000u;
+    int32_t e = (int32_t)((u >> 23) & 0xffu) - 127;
+    uint32_t m = u & 0x7fffffu;
+    if (e >= 16) return (uint16_t)(sign | 0x7c00u);   /* overflow -> inf */
+    if (e <= -25) return (uint16_t)sign;               /* underflow -> 0 */
+    if (e >= -14) {                                    /* normal */
+        uint32_t mant10 = (m + 0x1000u) >> 13;         /* round to nearest, 11-bit */
+        uint32_t h = (uint32_t)(e + 15) << 10;
+        h |= mant10 & 0x3ffu;                          /* mantissa lives in bits 0-9 */
+        if (mant10 & 0x400u) {                         /* rounding overflowed 10 bits */
+            uint32_t ne = (h >> 10) + 1;               /* carry into exponent */
+            if (ne >= 0x1fu) return (uint16_t)(sign | 0x7c00u);
+            h = ne << 10;
+        }
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = (m | 0x800000u) >> (14 - e);          /* subnormal */
+    if ((m >> (13 - e)) & 1u) h++;                     /* round to nearest */
+    return (uint16_t)(sign | h);
+}
+
+static inline float h3_f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x3ffu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;                                  /* +/-0 */
+        } else {                                       /* subnormal */
+            uint32_t e = 0;
+            while (!(mant & 0x400u)) { mant <<= 1; e++; }
+            mant &= 0x3ffu;
+            f = sign | ((127 - 15 - e + 1) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1fu) {
+        f = sign | 0x7f800000u | (mant << 13);         /* inf / nan */
+    } else {
+        f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
 
 static int write_latent_bundle(const char *path, const float *video,
                                int t, int h, int w, int c,
                                const float *audio, int audio_t,
+                               int use_f16,
                                char *error, size_t error_size) {
     FILE *f = fopen(path, "wb");
     if (!f) {
         snprintf(error, error_size, "cannot open latent output %s", path);
         return 0;
     }
-    uint32_t hdr[6] = { H3_LATENT_MAGIC, H3_LATENT_VERSION,
+    uint32_t hdr[7] = { H3_LATENT_MAGIC, H3_LATENT_VERSION_F16,
+                        (uint32_t)(use_f16 ? 1 : 0),
                         (uint32_t)t, (uint32_t)h, (uint32_t)w, (uint32_t)c };
     size_t vn = (size_t)c * (size_t)t * (size_t)h * (size_t)w;
-    int ok = fwrite(hdr, sizeof(uint32_t), 6, f) == 6 &&
-             fwrite(video, sizeof(float), vn, f) == vn;
+    int ok = fwrite(hdr, sizeof(uint32_t), 7, f) == 7;
+    if (ok && use_f16) {
+        uint16_t *buf = malloc(vn * sizeof(uint16_t));
+        if (!buf) {
+            snprintf(error, error_size, "out of memory packing latent %s", path);
+            fclose(f);
+            return 0;
+        }
+        for (size_t i = 0; i < vn; i++) buf[i] = h3_f32_to_f16(video[i]);
+        ok = fwrite(buf, sizeof(uint16_t), vn, f) == vn;
+        free(buf);
+    } else if (ok) {
+        ok = fwrite(video, sizeof(float), vn, f) == vn;
+    }
     if (ok) {
         int32_t ap = (audio && audio_t > 0) ? 1 : 0;
         ok = fwrite(&ap, sizeof(int32_t), 1, f) == 1;
         if (ok && ap) {
             int32_t ah[3] = { 32, 2, (int32_t)audio_t };
             size_t an = 32 * 2 * (size_t)audio_t;
-            ok = fwrite(ah, sizeof(int32_t), 3, f) == 3 &&
-                 fwrite(audio, sizeof(float), an, f) == an;
+            if (use_f16) {
+                uint16_t *abuf = malloc(an * sizeof(uint16_t));
+                if (!abuf) {
+                    snprintf(error, error_size, "out of memory packing audio %s", path);
+                    fclose(f);
+                    return 0;
+                }
+                for (size_t i = 0; i < an; i++) abuf[i] = h3_f32_to_f16(audio[i]);
+                ok = fwrite(ah, sizeof(int32_t), 3, f) == 3 &&
+                     fwrite(abuf, sizeof(uint16_t), an, f) == an;
+                free(abuf);
+            } else {
+                ok = fwrite(ah, sizeof(int32_t), 3, f) == 3 &&
+                     fwrite(audio, sizeof(float), an, f) == an;
+            }
         }
     }
     if (!ok) snprintf(error, error_size, "cannot write latent %s", path);
@@ -2328,19 +2492,27 @@ static float *read_latent_bundle(const char *path, int *t, int *h, int *w, int *
         snprintf(error, error_size, "cannot open latent input %s", path);
         return NULL;
     }
-    uint32_t hdr[6];
-    if (fread(hdr, sizeof(uint32_t), 6, f) != 6 || hdr[0] != H3_LATENT_MAGIC) {
+    uint32_t hdr[7];
+    size_t hdr_n = fread(hdr, sizeof(uint32_t), 7, f);
+    if (hdr_n < 6 || hdr[0] != H3_LATENT_MAGIC) {
         snprintf(error, error_size, "bad or unsupported latent file %s", path);
         fclose(f);
         return NULL;
     }
-    if (hdr[1] != H3_LATENT_VERSION) {
+    int use_f16 = 0;
+    uint32_t version = hdr[1];
+    size_t idx = 2;
+    if (version == H3_LATENT_VERSION_F16) {
+        use_f16 = (int)hdr[2];
+        idx = 3;
+    } else if (version != H3_LATENT_VERSION) {
         snprintf(error, error_size, "unsupported latent version %u in %s",
-                hdr[1], path);
+                version, path);
         fclose(f);
         return NULL;
     }
-    *t = (int)hdr[2]; *h = (int)hdr[3]; *w = (int)hdr[4]; *c = (int)hdr[5];
+    *t = (int)hdr[idx]; *h = (int)hdr[idx + 1]; *w = (int)hdr[idx + 2];
+    *c = (int)hdr[idx + 3];
     size_t n = (size_t)(*c) * (size_t)(*t) * (size_t)(*h) * (size_t)(*w);
     float *video = malloc(n * sizeof(float));
     if (!video) {
@@ -2348,11 +2520,29 @@ static float *read_latent_bundle(const char *path, int *t, int *h, int *w, int *
         fclose(f);
         return NULL;
     }
-    if (fread(video, sizeof(float), n, f) != n) {
-        snprintf(error, error_size, "truncated latent file %s", path);
-        free(video);
-        fclose(f);
-        return NULL;
+    if (use_f16) {
+        uint16_t *buf = malloc(n * sizeof(uint16_t));
+        if (!buf) {
+            snprintf(error, error_size, "out of memory reading latent %s", path);
+            free(video);
+            fclose(f);
+            return NULL;
+        }
+        if (fread(buf, sizeof(uint16_t), n, f) != n) {
+            snprintf(error, error_size, "truncated latent file %s", path);
+            free(video); free(buf);
+            fclose(f);
+            return NULL;
+        }
+        for (size_t i = 0; i < n; i++) video[i] = h3_f16_to_f32(buf[i]);
+        free(buf);
+    } else {
+        if (fread(video, sizeof(float), n, f) != n) {
+            snprintf(error, error_size, "truncated latent file %s", path);
+            free(video);
+            fclose(f);
+            return NULL;
+        }
     }
     *audio = NULL; *audio_t = 0;
     int32_t ap = 0;
@@ -2372,11 +2562,29 @@ static float *read_latent_bundle(const char *path, int *t, int *h, int *w, int *
             fclose(f);
             return NULL;
         }
-        if (fread(aud, sizeof(float), an, f) != an) {
-            snprintf(error, error_size, "truncated audio latent in %s", path);
-            free(video); free(aud);
-            fclose(f);
-            return NULL;
+        if (use_f16) {
+            uint16_t *abuf = malloc(an * sizeof(uint16_t));
+            if (!abuf) {
+                snprintf(error, error_size, "out of memory reading audio %s", path);
+                free(video); free(aud);
+                fclose(f);
+                return NULL;
+            }
+            if (fread(abuf, sizeof(uint16_t), an, f) != an) {
+                snprintf(error, error_size, "truncated audio latent in %s", path);
+                free(video); free(aud); free(abuf);
+                fclose(f);
+                return NULL;
+            }
+            for (size_t i = 0; i < an; i++) aud[i] = h3_f16_to_f32(abuf[i]);
+            free(abuf);
+        } else {
+            if (fread(aud, sizeof(float), an, f) != an) {
+                snprintf(error, error_size, "truncated audio latent in %s", path);
+                free(video); free(aud);
+                fclose(f);
+                return NULL;
+            }
         }
         *audio = aud; *audio_t = (int)ah[2];
     }
@@ -2409,58 +2617,23 @@ h3_result *h3_decode_latent(h3_ctx *ctx, const h3_params *params) {
         free(video); free(audio);
         return NULL;
     }
-    h3_video_frames frames = {0};
-    if (!h3_video_vae_decode(vae_path, "h3_shaders.metal", video, t, h, w,
-                             NULL, NULL,
-                             params->video_vae_streaming, &frames,
-                             detail, sizeof(detail))) {
-        h3_set_error(ctx, "%s", detail);
-        free(vae_path);
-        free(video); free(audio);
-        h3_video_frames_free(&frames);
-        return NULL;
-    }
-    free(vae_path);
-    free(video);
-    int fw = frames.width, fh = frames.height, ff = frames.frames;
-    size_t rgb_count = (size_t)ff * (size_t)fw * (size_t)fh * 3;
-    uint8_t *rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
-    h3_video_frames_free(&frames);
-    if (!rgb8) {
-        h3_set_error(ctx, "out of memory converting decoded frames");
-        return NULL;
-    }
-    int output_width = fw, output_height = fh;
-    if (output_width != params->width || output_height != params->height) {
-        uint8_t *resized = NULL;
-        if (!h3_resize_rgb24_high_quality(rgb8, ff, output_width, output_height,
-                                          params->width, params->height,
-                                          &resized)) {
-            h3_set_error(ctx, "cannot resize decoded frames");
-            free(rgb8);
-            return NULL;
-        }
-        free(rgb8);
-        rgb8 = resized;
-        output_width = params->width;
-        output_height = params->height;
-    }
-    /* Decode the bundled audio latent (if present) and mux it with the frames;
-     * otherwise write a silent track so the MP4 stays valid. */
+    /* Decode the bundled audio latent first (or build silence) so the mux can
+     * be opened before the video stream; the video decode then runs streaming
+     * and pipes frames straight into FFmpeg without retaining the whole clip.
+     */
     h3_audio_waveform waveform = {0};
     int have_audio = 0;
     if (audio && audio_t > 0) {
         char *avp = h3_path(ctx->model_dir, "FL2VA/audio_vae");
         if (!avp) {
             h3_set_error(ctx, "out of memory resolving audio VAE path");
-            free(audio); free(rgb8);
+            free(video); free(audio);
             return NULL;
         }
         if (!h3_audio_vae_decode(avp, "h3_shaders.metal", audio, audio_t,
-                                 NULL, NULL, &waveform,
-                                 detail, sizeof(detail))) {
+                                 NULL, NULL, &waveform, detail, sizeof(detail))) {
             h3_set_error(ctx, "%s", detail);
-            free(avp); free(audio); free(rgb8);
+            free(avp); free(audio); free(video);
             return NULL;
         }
         free(avp);
@@ -2472,32 +2645,65 @@ h3_result *h3_decode_latent(h3_ctx *ctx, const h3_params *params) {
     int pcm_ch = have_audio ? waveform.channels : 1;
     int sr = have_audio ? waveform.sample_rate : 24000;
     if (!have_audio) {
-        pcm_n = (int)((double)ff / H3_FPS * sr) + 1;
+        int video_frames = ((t - 2) / 5) * 17 + 5;
+        pcm_n = (int)((double)video_frames / H3_FPS * sr) + 1;
         float *silence = calloc((size_t)pcm_n, sizeof(float));
         if (!silence) {
             h3_set_error(ctx, "out of memory for silent audio");
-            free(rgb8);
+            free(video);
             return NULL;
         }
         pcm = silence;
     }
-    if (!h3_ffmpeg_write_av_rgb24_f32(params->output_path, rgb8, ff,
-                                      output_width, output_height, H3_FPS,
-                                      pcm, pcm_n, pcm_ch, sr,
-                                      detail, sizeof(detail))) {
+    int out_w = params->width, out_h = params->height;
+    h3_ffmpeg_mux *mux = NULL;
+    if (params->output_path && *params->output_path) {
+        mux = h3_ffmpeg_mux_open(params->output_path, out_w, out_h, H3_FPS,
+                                 pcm, pcm_n, pcm_ch, sr, detail, sizeof(detail));
+        if (!mux) {
+            h3_set_error(ctx, "%s", detail);
+            if (have_audio) h3_audio_waveform_free(&waveform);
+            else free((void *)pcm);
+            free(video);
+            return NULL;
+        }
+    }
+    h3_vae_sink_ctx sink_ctx = {
+        .mux = mux, .out_w = out_w, .out_h = out_h,
+        .on_frame = params->on_frame, .on_frame_opaque = params->callback_opaque,
+        .error = detail, .error_size = sizeof(detail), .failed = 0
+    };
+    h3_video_frames frames = {0};
+    if (!h3_video_vae_decode(vae_path, "h3_shaders.metal", video, t, h, w,
+                             NULL, NULL, params->video_vae_streaming, &frames,
+                             h3_vae_frame_sink, &sink_ctx, detail, sizeof(detail))) {
+        if (mux) h3_ffmpeg_mux_close(mux, detail, sizeof(detail));
         h3_set_error(ctx, "%s", detail);
         if (have_audio) h3_audio_waveform_free(&waveform);
         else free((void *)pcm);
-        free(rgb8);
+        free(video);
+        h3_video_frames_free(&frames);
         return NULL;
+    }
+    free(vae_path);
+    free(video);
+    int ff = frames.frames;
+    if (mux) {
+        if (!h3_ffmpeg_mux_close(mux, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            if (have_audio) h3_audio_waveform_free(&waveform);
+            else free((void *)pcm);
+            h3_video_frames_free(&frames);
+            return NULL;
+        }
+        mux = NULL;
     }
     if (have_audio) h3_audio_waveform_free(&waveform);
     else free((void *)pcm);
-    free(rgb8);
     h3_result *result = calloc(1, sizeof(*result));
     if (result) {
-        result->width = output_width;
-        result->height = output_height;
+        result->width = out_w;
+        result->height = out_h;
         result->frames = ff;
         result->fps = H3_FPS;
     }

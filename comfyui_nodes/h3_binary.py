@@ -813,7 +813,7 @@ H3_SWITCHES_DOC = """\
 
 ### extra_args（附加 CLI 参数）
 直接拼到引擎命令行，用于传节点未暴露的开关，例如：
-- `--video-vae-streaming 0`：强制 VAE 解码器常驻（快，但常驻占 ~9 GiB；16 GB 机器在干扰下可能 OOM）
+- `--video-vae-streaming 0`：强制 VAE 解码器常驻（快；逻辑预载 ~9 GiB 但为 F16→F32 加宽的**可驱逐**共享缓冲，并非钉死内存，实测峰值仅 5.1–6.2 GiB，16 GB 机器安全）
 - `--video-vae-streaming 1`：强制 VAE 流式（只占 ~0.25 GiB，慢一些）
 - 留空则由自动内存规划器决定（auto）。
 
@@ -844,8 +844,8 @@ ffmpeg / ffprobe 绝对路径覆盖。节点已自动探测 /opt/zerobrew/bin、
 1. 默认（1/1/0/关）：精确基准。
 2. 想快：低分辨率开 fast_stream；低质量预览把 layers 降到 45/40，或把 core_reuse / reuse 调大。
 3. 质量没达标：全部回到精确（1/1/0）。
-4. 内存紧张（16 GB）：保持 video_vae_streaming 默认（流式），不要开 H3_DIT_RESIDENT_BLOCKS。
-5. 内存充裕且要榨速度：video_vae_streaming=0（常驻 VAE）+ fast_stream（低分辨率）+ 视情况 H3_DIT_RESIDENT_BLOCKS（>16 GB 且磁盘慢）。
+4. 内存紧张（16 GB）：VAE 常驻（video_vae_streaming=0）安全且更快（可驱逐，峰值 ~6 GiB），推荐开；不要开 H3_DIT_RESIDENT_BLOCKS（常驻 DiT 块与流式路径争抢统一内存）。
+5. 要榨速度：video_vae_streaming=0（常驻 VAE，16 GB 亦安全）+ fast_stream（低分辨率）+ 视情况 H3_DIT_RESIDENT_BLOCKS（仅内存充裕且磁盘慢时）。
 """
 
 

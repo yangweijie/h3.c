@@ -139,4 +139,15 @@ int h3_res_step(float *output, const float *sample, const float *denoised,
 int h3_euler_velocity_step(float *sample, const float *velocity, size_t count,
                            float sigma, float sigma_next);
 
+/* Query currently available physical memory (free + inactive + purgeable) in
+ * bytes. Returns 0 if the platform does not support the query. */
+uint64_t h3_host_available_memory(void);
+
+/* Estimate how many DiT blocks can be kept resident given the available memory
+ * headroom. per_block_cost is the resident cost of one block (bytes).
+ * Returns a value in [0, active_blocks - 2] (at least 2 blocks must stay in the
+ * streaming ring). */
+unsigned h3_dit_resident_budget(uint64_t available, uint64_t per_block_cost,
+                                unsigned active_blocks);
+
 #endif

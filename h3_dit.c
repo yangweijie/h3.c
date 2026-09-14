@@ -4,9 +4,11 @@
 #include "h3_lora.h"
 #include "h3_weights.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -98,6 +100,12 @@ typedef struct {
     char scale_name[64];
     uint32_t rows;
     uint32_t columns;
+    /* Packed group-quantized source (see h3_weights.h). When set, `raw` carries
+     * codes*columns*bits/8 bytes per row instead of int8 bytes and the staged
+     * accumulators are scale/bias pairs, so the reader and consumer both take
+     * their grouped branches. */
+    int is_grouped;
+    h3_grouped_spec grouped;
 } h3_dit_stream_source;
 
 typedef struct {
@@ -156,6 +164,13 @@ struct h3_dit {
     h3_lora *lora[4];
     int lora_count;
     h3_weight_store *vdn_weights;   /* linear-branch checkpoint directory */
+    /* Phase 3 calibration dump (H3_DUMP_ACT=<dir>): writes the BF16 inputs of the
+     * four streamed matrices so the offline error-compensating quantizer can
+     * build a per-layer input Hessian.  dump_dir[0] == '\0' means disabled. */
+    char dump_dir[512];
+    unsigned dump_rows;
+    unsigned dump_limit;
+    unsigned dump_calls[H3_DIT_BLOCKS][STREAM_MATRICES];
     int vdn;
     h3_vdn_state *vdn_state;
     int keep_bf16_mlp;
@@ -709,6 +724,31 @@ static void convrot_unrotate_cpu(const int8_t *weight, const float *scales,
     }
 }
 
+/* Store already-dequantized, already-un-rotated rows as BF16 into the streamed
+ * slot, applying the same qkv row remap as convrot_unrotate_cpu (layout == 1).
+ * Kept separate so the packed group-quantized path reuses h3_weights.c's
+ * butterfly instead of growing a third copy of it. */
+static void store_unrotated_rows_bf16(const float *values, uint16_t *out,
+                                      uint32_t start_row, uint32_t rows,
+                                      uint32_t columns, uint32_t layout,
+                                      uint32_t heads, uint32_t head_dim) {
+    for (uint32_t i = 0; i < rows; i++) {
+        uint32_t row = start_row + i;
+        uint32_t dst_row = row;
+        if (layout == 1u && head_dim != 0u) {
+            uint32_t slot = row / head_dim;
+            uint32_t dim = row % head_dim;
+            uint32_t b = slot % heads;
+            uint32_t h = slot / heads;
+            dst_row = (3u * b + h) * head_dim + dim;
+        }
+        uint16_t *target = out + (size_t)dst_row * columns;
+        const float *source = values + (size_t)i * columns;
+        for (uint32_t k = 0; k < columns; k++)
+            target[k] = convrot_f32_to_bf16(source[k]);
+    }
+}
+
 static int convrot_read_weight(const char *path, void *data, size_t bytes,
                                uint64_t offset) {
     int fd = open(path, O_RDONLY);
@@ -1146,6 +1186,27 @@ static int prepare_stream_source(h3_dit *dit,
     source->rows = (uint32_t)rows;
     source->columns = (uint32_t)columns;
     source->field = field;
+    source->is_grouped = 0;
+    if (tensor->dtype == H3_DTYPE_U8) {
+        /* Packed group-quantized: the spec carries the paths, shapes and the
+         * derived bits/group, and `scale_path` is set so the pipeline keeps
+         * treating this source as "needs the consumer's dequantization step". */
+        if (h3_weight_grouped_spec(dit->weights, name, (size_t)(rows * columns),
+                                   &source->grouped, error, error_size) != 1) {
+            fail(error, error_size, "grouped streaming weight schema mismatch: %s",
+                 name);
+            return 0;
+        }
+        source->is_grouped = 1;
+        source->path = header->path;
+        source->file_offset = tensor->file_offset;
+        source->elements = (size_t)(rows * columns);
+        source->scale_path = source->grouped.scale_header->path;
+        source->scale_offset = source->grouped.scale->file_offset;
+        source->scale_elements = (size_t)source->grouped.rows *
+                                 (source->grouped.columns / source->grouped.group);
+        return 1;
+    }
     if (tensor->dtype == H3_DTYPE_I8) {
         if (tensor->ndim != 2 || tensor->shape[0] != rows ||
             tensor->shape[1] != columns || rows > SIZE_MAX / columns) {
@@ -1417,6 +1478,11 @@ typedef struct {
      * only ever reads the per-chunk copy staged in the ring. */
     const h3_dit_stream_source *scales_source;
     float *scales_cache;
+    int scales_grouped;        /* scales_cache holds scale/bias pairs */
+    /* Consumer-side scratch for packed sources: the grouped dequantizer writes
+     * floats here before the un-rotation, which then stores BF16 into the slot. */
+    float *grouped_scratch;
+    size_t grouped_scratch_elements;
     h3_stream_ring ring;
 } h3_dit_stream_worker;
 
@@ -1471,7 +1537,15 @@ static int stream_fill_slot(h3_dit_stream_worker *worker, unsigned position) {
     unsigned index = position % H3_STREAM_RING;
     const h3_dit_stream_source *source = &layer->sources[chunk->source];
     int needs_unrotate = source->scale_path != NULL;
-    size_t bytes = (size_t)chunk->rows * source->columns;
+    /* Packed sources stage codes (columns*bits/8 bytes per row) plus one
+     * (scale,bias) float pair per group per row. */
+    size_t groups_per_row = source->is_grouped
+        ? (size_t)source->grouped.columns / source->grouped.group : 1u;
+    size_t bytes = source->is_grouped
+        ? (size_t)chunk->rows * source->grouped.packed_row_bytes
+        : (size_t)chunk->rows * source->columns;
+    size_t accumulator_slots = source->is_grouped
+        ? (size_t)chunk->rows * groups_per_row * 2u : (size_t)chunk->rows;
     h3_weight_store *store = source->field == STREAM_LIN_OUT
         ? dit->vdn_weights : dit->weights;
     char error[256] = "";
@@ -1500,40 +1574,63 @@ static int stream_fill_slot(h3_dit_stream_worker *worker, unsigned position) {
                 ring->raw_capacity[index] = bytes;
             }
         }
-        if (ok && chunk->rows > ring->scale_capacity[index]) {
+        if (ok && accumulator_slots > ring->scale_capacity[index]) {
             float *grown = realloc(ring->scales[index],
-                                   (size_t)chunk->rows * sizeof(float));
+                                   accumulator_slots * sizeof(float));
             if (!grown) {
                 ok = 0;
                 snprintf(error, sizeof(error),
                          "cannot grow ConvRot scale buffer");
             } else {
                 ring->scales[index] = grown;
-                ring->scale_capacity[index] = chunk->rows;
+                ring->scale_capacity[index] = accumulator_slots;
             }
         }
-        if (ok && worker->scales_source != source) {
-            /* The scale tensor is per-row and tiny next to the weights, but a
-             * block has ~30 chunks per worker, so read it once per matrix and
-             * stage only each chunk's slice. */
+        int grouped_cache_stale = source->is_grouped
+            ? (!worker->scales_grouped || worker->scales_source != source)
+            : (worker->scales_grouped || worker->scales_source != source);
+        if (ok && grouped_cache_stale) {
+            /* The accumulator tensor is tiny next to the weights, but a block has
+             * ~30 chunks per worker, so read it once per matrix and stage only
+             * each chunk's slice. */
             free(worker->scales_cache);
             worker->scales_cache = NULL;
             worker->scales_source = NULL;
-            float *loaded = load_convrot_scale_values(store,
-                source->scale_name, source->rows, error, sizeof(error));
-            if (!loaded) ok = 0;
-            else {
-                worker->scales_cache = loaded;
-                worker->scales_source = source;
+            worker->scales_grouped = 0;
+            if (source->is_grouped) {
+                ok = h3_weight_load_grouped_accumulators(
+                    &source->grouped, &worker->scales_cache, error,
+                    sizeof(error));
+                if (ok) worker->scales_grouped = 1;
+            } else {
+                float *loaded = load_convrot_scale_values(store,
+                    source->scale_name, source->rows, error, sizeof(error));
+                if (!loaded) ok = 0;
+                else worker->scales_cache = loaded;
             }
+            if (ok) worker->scales_source = source;
         }
-        if (ok)
+        if (ok && source->is_grouped) {
+            /* Accumulators are staged as all-scales-then-all-biases so the
+             * consumer can pass two plain pointers to the dequantizer. */
+            size_t entries = (size_t)chunk->rows * groups_per_row;
+            memcpy(ring->scales[index],
+                   worker->scales_cache + (size_t)chunk->start * groups_per_row,
+                   entries * sizeof(float));
+            memcpy(ring->scales[index] + entries,
+                   worker->scales_cache + source->scale_elements +
+                       (size_t)chunk->start * groups_per_row,
+                   entries * sizeof(float));
+        } else if (ok) {
             memcpy(ring->scales[index], worker->scales_cache + chunk->start,
                    (size_t)chunk->rows * sizeof(float));
+        }
         if (ok && !convrot_read_weight(source->path, ring->raw[index], bytes,
                                        source->file_offset +
                                            (uint64_t)chunk->start *
-                                               source->columns)) {
+                                               (source->is_grouped
+                                                    ? source->grouped.packed_row_bytes
+                                                    : source->columns))) {
             ok = 0;
             snprintf(error, sizeof(error), "cannot read convrot int8 weight");
         }
@@ -1592,6 +1689,8 @@ static int stream_consume_slot(h3_dit_stream_worker *worker,
     }
     source = ring->source[index];
     needs_unrotate = ring->needs_unrotate[index];
+    size_t groups_per_row = source->is_grouped
+        ? (size_t)source->grouped.columns / source->grouped.group : 1u;
     staged_ok = ring->ok[index];
     if (!staged_ok)
         snprintf(job->error, sizeof(job->error), "%s", ring->error[index]);
@@ -1634,9 +1733,44 @@ static int stream_consume_slot(h3_dit_stream_worker *worker,
          * chunk's absolute start row drives that remap. */
         uint32_t layout = source->field == STREAM_QKV ? 1u : 0u;
         double dequant_started = stream_now();
-        convrot_unrotate_cpu(ring->raw[index], ring->scales[index], storage,
-                             chunk->start, chunk->rows, source->columns,
-                             layout, HEADS, HEAD_DIM);
+        if (source->is_grouped) {
+            /* Packed group-quantized source: unpack and dequantize into floats,
+             * un-rotate, then store. The group scale has to be applied *before*
+             * the rotation because the group boundaries (128) are not a multiple
+             * of the rotation block (256), so "butterfly then scale" does not
+             * hold here as it does for the per-row INT8 format. */
+            size_t needed = (size_t)chunk->rows * source->columns;
+            if (needed > worker->grouped_scratch_elements) {
+                float *grown = realloc(worker->grouped_scratch,
+                                       needed * sizeof(float));
+                if (!grown) {
+                    if (staging) free(staging);
+                    snprintf(job->error, sizeof(job->error),
+                             "cannot grow the grouped streaming scratch");
+                    return 0;
+                }
+                worker->grouped_scratch = grown;
+                worker->grouped_scratch_elements = needed;
+            }
+            size_t entries = (size_t)chunk->rows * groups_per_row;
+            if (!h3_weight_dequantize_grouped(
+                    &source->grouped, (const uint8_t *)ring->raw[index],
+                    ring->scales[index], ring->scales[index] + entries,
+                    chunk->rows, 1, worker->grouped_scratch, job->error,
+                    sizeof(job->error))) {
+                if (staging) free(staging);
+                return 0;
+            }
+            h3_weight_unrotate_rows(worker->grouped_scratch, chunk->rows,
+                                    source->columns);
+            store_unrotated_rows_bf16(worker->grouped_scratch, storage,
+                                      chunk->start, chunk->rows,
+                                      source->columns, layout, HEADS, HEAD_DIM);
+        } else {
+            convrot_unrotate_cpu(ring->raw[index], ring->scales[index], storage,
+                                 chunk->start, chunk->rows, source->columns,
+                                 layout, HEADS, HEAD_DIM);
+        }
         if (staging) {
             if (!h3_gpu_tensor_write_bf16(target, staging, wanted)) {
                 free(staging);
@@ -1714,6 +1848,9 @@ static int run_stream_pipeline(h3_dit_stream_worker *worker, int pipelined) {
     worker->job.error[0] = '\0';
     worker->scales_source = NULL;
     worker->scales_cache = NULL;
+    worker->scales_grouped = 0;
+    worker->grouped_scratch = NULL;
+    worker->grouped_scratch_elements = 0;
     memset(ring, 0, sizeof(*ring));
     pthread_mutex_init(&ring->mutex, NULL);
     pthread_cond_init(&ring->filled_cond, NULL);
@@ -1759,6 +1896,10 @@ static int run_stream_pipeline(h3_dit_stream_worker *worker, int pipelined) {
     free(worker->scales_cache);
     worker->scales_cache = NULL;
     worker->scales_source = NULL;
+    worker->scales_grouped = 0;
+    free(worker->grouped_scratch);
+    worker->grouped_scratch = NULL;
+    worker->grouped_scratch_elements = 0;
     pthread_cond_destroy(&ring->emptied_cond);
     pthread_cond_destroy(&ring->filled_cond);
     pthread_mutex_destroy(&ring->mutex);
@@ -2592,6 +2733,46 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
      * resident path already keeps every block. Always leave at least two
      * blocks in the ring, which is a two-slot alternation. */
     unsigned resident_budget = dit->ssd_streaming ? dit->resident_blocks : 0;
+    /* Adaptive partial residency: when the user has not pinned a count and SSD
+     * streaming is active, estimate how many blocks fit in the available
+     * memory headroom and keep those resident (dequantized once, reused across
+     * all denoising steps). This trades memory for less per-step I/O and CPU
+     * un-rotate. */
+    if (dit->ssd_streaming && resident_budget == 0) {
+        uint64_t avail = h3_host_available_memory();
+        /* Reserve headroom for activations: ~1 GiB base + the joint latent
+         * buffer (video + audio, float32) allocated just after this call in
+         * h3_generate. The latent dominates for long clips, so size it. */
+        uint64_t activation_reserve = (uint64_t)1 * 1024 * 1024 * 1024;
+        int lt = dit->latent_t, lh = dit->latent_h, lw = dit->latent_w;
+        int at = dit->audio_t;
+        if (lt > 0 && lh > 0 && lw > 0) {
+            /* Video latent: [C=16, T, H, W] float32; audio latent: [32,2,T] f32. */
+            uint64_t video_latent =
+                (uint64_t)16 * (size_t)lt * (size_t)lh * (size_t)lw * 4;
+            uint64_t audio_latent =
+                (uint64_t)32 * 2 * (size_t)(at > 0 ? at : 0) * 4;
+            activation_reserve += video_latent + audio_latent;
+        }
+        uint64_t usable = avail > activation_reserve ? avail - activation_reserve : 0;
+        /* Per-block resident cost: int8 weights dominate (~0.39 GiB on the
+         * reference M5 bf16 source, but the convrot/linear blocks vary). Use a
+     * conservative 0.5 GiB so we do not overshoot on smaller GPUs. */
+        uint64_t per_block = (uint64_t)(0.5 * 1024 * 1024 * 1024);
+        unsigned auto_resident = h3_dit_resident_budget(
+            usable, per_block, dit->active_block_count);
+        if (auto_resident > 0) {
+            resident_budget = auto_resident;
+            fprintf(stderr,
+                    "h3: adaptive DiT partial residency: %u of %u blocks "
+                    "resident (available %.1f GiB, activation reserve %.1f GiB, "
+                    "per-block %.2f GiB)\n",
+                    auto_resident, dit->active_block_count,
+                    (double)avail / (1024.0 * 1024.0 * 1024.0),
+                    (double)activation_reserve / (1024.0 * 1024.0 * 1024.0),
+                    (double)per_block / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
     if (resident_budget) {
         unsigned active = dit->active_block_count;
         unsigned limit = active > 2 ? active - 2 : 0;
@@ -3175,6 +3356,43 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
     dit->use_int8_row_fc2 = use_int8_row_fc2;
+    /* Phase 3 calibration dump.  H3_DUMP_ACT=<dir> turns it on;
+     * H3_DUMP_ACT_ROWS (default 256) caps the rows captured per call and
+     * H3_DUMP_ACT_LIMIT (default 8) caps how many calls per layer/field are
+     * appended.  Off by default: the early return in dump_activation keeps every
+     * normal run on the original code path. */
+    dit->dump_dir[0] = '\0';
+    dit->dump_rows = 256;
+    dit->dump_limit = 8;
+    {
+        const char *dump = getenv("H3_DUMP_ACT");
+        if (dump && *dump) {
+            const char *value = getenv("H3_DUMP_ACT_ROWS");
+            if (value && *value) {
+                long parsed = strtol(value, NULL, 10);
+                if (parsed > 0 && parsed <= 65536) dit->dump_rows = (unsigned)parsed;
+            }
+            value = getenv("H3_DUMP_ACT_LIMIT");
+            if (value && *value) {
+                long parsed = strtol(value, NULL, 10);
+                if (parsed > 0 && parsed <= 4096) dit->dump_limit = (unsigned)parsed;
+            }
+            if (snprintf(dit->dump_dir, sizeof(dit->dump_dir), "%s", dump) >=
+                (int)sizeof(dit->dump_dir)) {
+                dit->dump_dir[0] = '\0';
+                fail(error, error_size, "H3_DUMP_ACT path is too long");
+                goto failed;
+            }
+            if (mkdir(dit->dump_dir, 0755) != 0 && errno != EEXIST) {
+                fail(error, error_size, "H3_DUMP_ACT: cannot create %s",
+                     dit->dump_dir);
+                goto failed;
+            }
+            fprintf(stderr, "h3: calibration dump enabled -> %s "
+                    "(%u rows x %u calls per layer/field)\n", dit->dump_dir,
+                    dit->dump_rows, dit->dump_limit);
+        }
+    }
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
@@ -3708,6 +3926,55 @@ static int run_vdn_branch(h3_dit *dit, h3_dit_block *weight, uint32_t rows,
     return 1;
 }
 
+/* Calibration dump (Phase 3).  h3_gpu_submit commits *and waits for every
+ * in-flight command buffer* (h3_gpu.m), so a readback taken right before a
+ * matrix's dispatch sees exactly the activations that matrix consumes.  The
+ * chain is reopened with h3_gpu_begin because each kernel opens and closes its
+ * own encoder.  Every dump costs a GPU pipeline bubble, so this runs only in
+ * calibration passes; non-dump runs return on the first line. */
+static const char *dump_field_name(unsigned field) {
+    switch (field) {
+        case STREAM_QKV: return "qkv";
+        case STREAM_OUT: return "out";
+        case STREAM_FC1: return "fc1";
+        case STREAM_FC2: return "fc2";
+        default: return "other";
+    }
+}
+
+static void dump_activation(h3_dit *dit, unsigned layer, unsigned field,
+                            h3_gpu_tensor *tensor, uint32_t rows,
+                            uint32_t columns) {
+    if (!dit->dump_dir[0] || !tensor || !rows || !columns) return;
+    if (layer >= H3_DIT_BLOCKS || field >= STREAM_MATRICES) return;
+    if (dit->dump_calls[layer][field] >= dit->dump_limit) return;
+    uint32_t take = rows < dit->dump_rows ? rows : dit->dump_rows;
+    size_t elements = (size_t)take * columns;
+    if (elements > SIZE_MAX / sizeof(uint16_t)) return;
+    uint16_t *host = malloc(elements * sizeof(uint16_t));
+    if (!host) return;
+    int written = 0;
+    if (h3_gpu_submit(dit->gpu) &&
+        h3_gpu_tensor_read_bf16_range(tensor, 0, host, elements)) {
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%s.%02u.bin", dit->dump_dir,
+                 dump_field_name(field), layer);
+        FILE *handle = fopen(path, dit->dump_calls[layer][field] ? "ab" : "wb");
+        if (handle) {
+            written = fwrite(host, sizeof(uint16_t), elements, handle) == elements;
+            fclose(handle);
+        }
+    }
+    free(host);
+    if (!h3_gpu_begin(dit->gpu)) {
+        fprintf(stderr, "h3: cannot reopen the command chain after a calibration "
+                        "dump; disabling H3_DUMP_ACT\n");
+        dit->dump_dir[0] = '\0';
+        return;
+    }
+    if (written) dit->dump_calls[layer][field]++;
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
                      h3_dit_block *weight,
                      int attention_adaln_ready,
@@ -3733,6 +4000,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
+    dump_activation(dit, index, STREAM_QKV, dit->mod_attention, rows, HIDDEN);
     int vdn = dit->vdn && !dit->token_reduction_active;
     if (dit->int8_qkv && !vdn && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
@@ -3781,6 +4049,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
+    dump_activation(dit, index, STREAM_OUT, dit->attention_heads, rows, INNER);
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -3832,6 +4101,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
+    dump_activation(dit, index, STREAM_FC1, dit->mod_mlp, rows, HIDDEN);
     if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
@@ -3859,6 +4129,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
         OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT SwiGLU");
+        /* Only reachable with H3_DISABLE_FUSED_MLP=1: the fused MLP keeps the
+         * SwiGLU intermediate inside one kernel, so fc2's true input only exists
+         * as a separate tensor on the unfused path. */
+        dump_activation(dit, index, STREAM_FC2, dit->activated, rows, FFN);
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }

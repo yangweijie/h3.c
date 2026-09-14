@@ -77,6 +77,10 @@ static void usage(const char *program) {
         "      --latent-out PATH  Also dump the denoised video latent (raw) to PATH\n"
         "      --latent-in PATH   Decode a latent file to video, skipping denoise\n"
         "                         (requires --output/-o)\n"
+        "      --pipeline          After denoising, hint the latent buffer as\n"
+        "                         reclaimable (madvise DONTNEED) so the OS can\n"
+        "                         reclaim those pages for VAE weights. Reduces\n"
+        "                         peak RAM for long clips. (requires --latent-out)\n"
         "  -h, --help             Show this help\n",
         program, program, program);
 }
@@ -294,7 +298,8 @@ int main(int argc, char **argv) {
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
            OPT_PROFILE, OPT_INFO,
            OPT_SR, OPT_SR_BIN, OPT_SR_MODEL_DIR, OPT_SR_MODEL,
-           OPT_SR_TARGET, OPT_SR_SCALE, OPT_LATENT_OUT, OPT_LATENT_IN };
+           OPT_SR_TARGET, OPT_SR_SCALE, OPT_LATENT_OUT, OPT_LATENT_IN,
+           OPT_PIPELINE };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
         {"prompt", required_argument, NULL, 'p'},
@@ -359,6 +364,7 @@ int main(int argc, char **argv) {
         {"sr-scale", required_argument, NULL, OPT_SR_SCALE},
         {"latent-out", required_argument, NULL, OPT_LATENT_OUT},
         {"latent-in", required_argument, NULL, OPT_LATENT_IN},
+        {"pipeline", no_argument, NULL, OPT_PIPELINE},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
@@ -553,6 +559,7 @@ int main(int argc, char **argv) {
             }
             case OPT_LATENT_OUT: params.latent_out_path = optarg; break;
             case OPT_LATENT_IN: params.latent_in_path = optarg; break;
+            case OPT_PIPELINE: params.pipeline = 1; break;
             default: usage(argv[0]); return 2;
         }
     }

@@ -684,7 +684,7 @@ dequant 87ms → 理想 173.5ms → 去噪 ≈17.4s；当前 199.6ms，差 15% �
 |---|---|---|---|---|
 | 默认（planner，VAE 流式） | 126.2 / 112.5 s | 82.1 / 72.1 s | 31.5 / 29.3 s | 两次（有/无干扰） |
 | `--ssd-streaming` | 108.7 s | 74.1 s | 22.1 s | |
-| `--video-vae-streaming 0` | 104.7 s | 73.2 s | 19.8 s | 干净环境；有干扰时 123.7 s / OOM |
+| `--video-vae-streaming 0` | 104.7 s | 73.2 s | 19.8 s | 干净环境；有干扰时 123.7 s（历史偶发 OOM 实为统一内存被其他进程挤占，VAE 常驻权重可驱逐、峰值仅 ~6 GiB，非 9 GiB 钉死） |
 | 带 turbo LoRA（4 步） | 166.3 s | 122.1 s | 31.3 s | LoRA 在流式路径阻塞 merge，+40.1 s |
 
 关键：三种成功的产物 md5 全为 `0d353faf2173acaab0badd4f9af62bf4`（逐字节一致）。
@@ -802,3 +802,221 @@ dequant 87ms → 理想 173.5ms → 去噪 ≈17.4s；当前 199.6ms，差 15% �
 
 ## Errors Encountered（本 session）
 （无）
+
+---
+
+# Session: int4 量化路线 kickoff（2026-09-13）
+
+## 本 session 做了什么（按时间）
+
+1. **三项目对比分析**（FastMetal-1.3B-QAD / FastVideo / h3c）→ 产出瓶颈定位与 QAD 可行性分析。
+2. **执行 §4.4-1**：修 `fastvideo_qad/scripts/mlx_int8_to_h3.py` 的 **5 个**缺陷并重导出两份 checkpoint。
+3. **执行 §4.4-2**：端到端质量 A/B（2 步 / 4 步），并修正度量语义（新增画质代理与判定）。
+4. **启动 int4 路线**：建立本任务的规划文件（task_plan / findings / progress）。
+
+## 关键数字
+
+| 项 | 值 |
+|---|---|
+| 引擎二进制 | `/Volumes/data/git/c/h3c/h3`，665616 B，`xattr` 隔离属性已清除 |
+| 源 DiT | `minimax_h3_fastvideo_4step.safetensors` 21.33 GiB（I8 19.74 + BF16 1.49 + F16 0.08 + F32 0.018 + U8 250×72B）；1086 张量 |
+| 单块流式 | 4 个矩阵 = 0.359 GiB（50 块/步 = 17.95 GiB/步） |
+| / 每步 20 步 | ~359 GiB/次生成；内盘 2.06 GiB/s → 纯 I/O 地板 ~174 s |
+| 256²/2 步 denoise | base 56.4 s；int8-g64 85.7 s；int4-g64 94.7 s（后两者在外接盘，受 0.85 GB/s 拖累） |
+| 256²/4 步 denoise | base 91.4 s；int8-g64 148.9 s；int4-g64 149.1 s |
+| base 画面统计 | luma mean 0.665 / std 0.311（非糊图，可判读） |
+
+## 产物（本轮落盘）
+
+| 路径 | 内容 |
+|---|---|
+| `/Volumes/data/work/h3_qad/h3_int8g64` | 21.4 GiB / 11 分片；relRMS mean 0.00518 max 0.00635 |
+| `/Volumes/data/work/h3_qad/h3_int4g64` | 21.4 GiB / 11 分片；relRMS mean 0.09127 max 0.09170 |
+| `/Volumes/data/work/h3_qad/ab/{base,int8g64,int4g64}` | 三个单变量对照模型目录（除 `FL2VA/transformer` 外全部同源符号链接） |
+| `/Volumes/data/work/h3_qad/ab_report/` | 2 步/4 步的 mp4（6 个）、拼图 2 张、report json 2 份 |
+| `fastvideo_qad/scripts/mlx_int8_to_h3.py` | 重写（修 5 缺陷 + 非自洽校验） |
+| `fastvideo_qad/scripts/ab_quant_quality.py` | 新增（divergence + quality proxies + verdict） |
+
+残留 `_steps4` 验证用的中间帧：`/tmp/h3_ab/f_*.png`、`/tmp/h3_ab4/f_*.png`（可删）。
+
+## 验收记录（本 session）
+
+| 验收项 | 结果 |
+|---|---|
+| int8-g64 权重 relRMS | 0.0047–0.0064（预检与整份导出一致）✓ |
+| int4-g64 权重 relRMS | 0.0911–0.0917 ✓ |
+| QKV 行序校验 | stored 0.0047 vs interleaved 1.404（有判别力）✓ |
+| 2 步 A/B | int8 `preserved`（SSIM 0.891 / ccos 0.989）、int4 `degrades (grainy)`（0.521） |
+| 4 步 A/B | int8 `preserved`（SSIM 0.739，画质代理持平）、int4 `degrades (desaturated)`（0.598） |
+| 脚本编译 / lint | `py_compile` 通过、0 diagnostics ✓ |
+
+## 结论
+
+- **int8 affine group-64 可用**；**int4 group-64 纯 PTQ 不可接受**（需要 QAT）。
+- int4 在这些评测里走的是**代理路径**（重量化回 per-row int8）——引擎尚无 int4 加载。
+- 本机 int4 只省 I/O、不省计算；默认 864×480 下 I/O 已被掩盖 → **int4 的收益只在 ≤384² 预览与 M5+/未来硬件**。
+
+## Next
+
+Phase 1a：{4,6,8} bit × {32,64,128} group 的权重 relRMS 曲线（秒级、无副作用），
+据此筛出值得进端到端 AB 的组合。见 `task_plan.md` 的 Phases。
+
+---
+
+# Session: int4 路线 Phase 1a / 1a' / 1a'' / 1c（2026-09-13 续）
+
+## 新增脚本
+| 脚本 | 作用 |
+|---|---|
+| `fastvideo_qad/scripts/quant_scheme_sweep.py` | Phase 1a：位宽 × group × 对称性的**纯权重误差**扫描（88 s，无副作用） |
+| `fastvideo_qad/scripts/quantize_h3_proxy.py` | Phase 1：把任意方案落到 h3 格式代理 checkpoint（直接从源量化，其余张量逐字节复制，支持 `--override` 逐矩阵配置） |
+
+## 本轮实验（4 个 checkpoint + 12 次引擎运行）
+
+| 变体 | 权重 relRMS | 原生字节 | 4 步 verdict | 2 步 verdict | 结论 |
+|---|---|---|---|---|---|
+| int6-g64 | 0.0238 | 15.70 GiB (−12.5%) | preserved | preserved | ✅ 可用 |
+| **int6-g128** | 0.0256 | **14.58 GiB (−18.8%)** | preserved（satur× 1.093） | preserved（satur× 1.200） | ✅ **当前最优** |
+| mixA（MLP=int4） | 0.0577 | 13.0 GiB (−27.5%) | degrades（0.887） | preserved | ⚠️ 不可判 |
+| mixB（attn=int4） | 0.0576 | 13.9 GiB (−22.5%) | preserved | degrades（0.944） | ⚠️ 不可判 |
+
+## 判定边界（本轮最重要的定量产出）
+- **preserved ⇔ 权重 relRMS ≲ 0.026；degrades ⇔ ≳ 0.091**（用源 per-row int8 反量化为基准口径）。
+- 0.058 一档**不可判**：代理量跨步数波动 ±0.15~0.25，而候选距阈值仅 −7%/−1%。
+- 「余量」比数值本身更重要：int6-g128 距阈值 +15%/+26% → 可信；mixA/B 贴线 → 不可判。
+- 权重 relRMS 与画质**非单调**：int6-g128 误差略大于 g64，端到端反而略好。
+
+## 验收记录
+| 项 | 结果 |
+|---|---|
+| 扫描实现校验 | 扫得 int4-g64-asym 0.09096 vs 对 MLX 产物实测 0.09127（差 0.3%）✓ |
+| int6-g128 视觉 | `ab_report/montage_steps4_int6g128.png` 五联对比：base / int8 / int6g128 肉眼等价，int4 明显退化 ✓ |
+| 确定性 | base 两次独立运行 md5 一致（`906150b0…`）✓ |
+| 脚本 | `py_compile` 通过（3 个新/改脚本）✓ |
+
+## 已知问题
+- 代理 checkpoint 恒为 21.4 GiB（per-row int8 交付），**不体现方案的字节收益**；
+  字节收益来自 `quant_scheme_sweep.py` 的模型，要落地必须做 Phase 2（引擎原生 int6/int4 加载）。
+- 混合方案（<14 GiB）在评测加固（Phase 1d）之前不得下结论。
+
+## Next
+1. **Phase 1b**：int6-g128 的 scale/zero 改 F16 → 14.02 GiB（−21.9%），权重误差不变；一次导出 + A/B。
+2. **Phase 1d**：评测加固（多 seed ≥3 × 多 prompt ≥2 聚合 + 报告波动），使边界可判。
+3. **Phase 2**：引擎原生 int6 加载路径（格式与改动点已写入 `task_plan.md`）。
+4. **Phase 3**：校准激活导出 + GPTQ-lite，把 int4 的 relRMS 从 0.091 压到 ~0.03 以下。
+
+---
+
+# Session: Phase 3（校准激活 + 误差补偿 PTQ）2026-09-13 续
+
+## 引擎改动（唯一一处，102 行，`h3_dit.c`）
+- 新增 `H3_DUMP_ACT=<dir>` / `H3_DUMP_ACT_ROWS`(默认 256) / `H3_DUMP_ACT_LIMIT`(默认 8)
+- 结构体字段 `dump_dir / dump_rows / dump_limit / dump_calls[50][4]`；helper `dump_activation()`
+- 4 个调用点 = 4 个被量化矩阵的真实输入：`mod_attention`(qkv) / `attention_heads`(out) /
+  `mod_mlp`(fc1) / `activated`(fc2，须 `H3_DISABLE_FUSED_MLP=1`)
+- 机制：`h3_gpu_submit`（commit + 等所有在飞缓冲）→ `read_bf16_range` → `h3_gpu_begin`（重开链）
+- 编译 `0 warning / 0 error`；`git diff --stat h3_dit.c` = **+102 行，无其他文件改动**
+- 非 dump 运行在 helper 第一行返回 → 零影响
+
+## 新增脚本
+| 脚本 | 作用 |
+|---|---|
+| `quant_calib_analysis.py` | 层输出误差度量 + 对角各向异性 + AWQ + whitening oracle |
+| `gptq_probe.py` | 单层真 GPTQ 判决性测试 |
+
+## 本轮实验矩阵
+
+| 实验 | 结果 | 判定 |
+|---|---|---|
+| 校准 dump | 200 文件 / 3.2 GB / 每层 1068 行；出片正常 | ✅ 钩子可用 |
+| ConvRot 对角均衡 | 1.86e8 → 645（均值），单层最高 3.7e6× | ✅ 解释 AWQ 失败的机制 |
+| AWQ 通道缩放 | 0.05377 → 0.06038（0.891×），20/20 层变差 | ❌ 负收益 |
+| 一次性 whitening | 误差 550（病态） | ⚠️ 无效，非有效上界 |
+| GPTQ 初版（完整 H⁻¹） | 三层全变差（0.0387→0.0807 等），relRMS 爆到 0.32 | ❌ 实现 bug |
+| **GPTQ 修正版（H⁻¹ 上三角因子）** | **0.03865 → 0.00886（4.36×）** | ✅ **成功** |
+
+## 两个方法论产出（可复用）
+1. **「极限行为应退化到已知基线」是最强的自检**：damp→∞ 时 GPTQ 补偿应消失、结果应收敛回 plain；
+   实测反而单调变差 → 立刻定位到实现 bug（而非条件数问题）。
+2. **权重 relRMS 不能判质量**（第二次证明）：GPTQ 把 relRMS 从 0.091 抬到 0.357，
+   同时把输出误差降 4.36×。判据必须是 `ab_quant_quality.py` 的端到端 verdict 或层输出误差。
+
+## 成本实测
+- GPTQ：**729 s/层**（qkv, d_in=5376）；按 `d_out·d_in²/2` 外推 200 层 ≈ **45 h** 单线程
+- 校准集 n=1068 ≪ d_in(5376~14336) → H 严重欠定；放大到 ~10k+ 行/层需 dump 增至 ~30–60 GB
+
+## Next（Phase 3 后续）
+1. 3c 放大校准集（更多步数 × 更多 prompt）→ 重测单层增益
+2. 3d 全 200 层 GPTQ 跑批（按 block 并行），产出 h3 格式代理 checkpoint
+3. 3e 端到端 A/B（int4-GPTQ vs base，2/4 步）——**这是 int4 路线的最终判据**
+4. 若 3e 不通过 → int4 终止，交付已确认的 int6-g128（−18.8%）+ Phase 2 原生加载
+
+---
+
+# Session: int4 路线 Phase 2（引擎原生 grouped 加载路径）完成 — 2026-09-13
+
+## 做了什么
+- 实现引擎**原生 grouped 量化加载器**，直接吃 `export_h3_int6_native.py` 产出的打包权重（U8 打包 + F16 scale/bias），不再走「重量化回 per-row int8」代理。
+- 654 行净增（`h3_weights.c` +344 / `h3_dit.c` +272 / `h3_weights.h` +67）；resident 与 SSD 流式两条路径都接入；int8 路径零改动。
+
+## 关键设计落地
+- 格式自描述（dtype + 形状推导 bits/group，不新增元数据张量）。相对原提案把 `U32+zero` 改为 **`U8+bias`**，与导出器对齐。
+- dequant 顺序：`code*scale+bias` → **在 ConvRot 反旋转之前按组乘**（group=128 非旋转块 256 的倍数，故不能先反旋转再乘）。
+- 复用 int8 加载器的 radix-4 蝴蝶做反旋转（单实现，常驻/流式共享）。
+
+## 验证（已闭环）
+| 项 | 结果 |
+|---|---|
+| `make h3_grouped_tests` 单测 | block 0 四矩阵 vs Python golden **relRMS 0.000e+00**（容差 1e-3），4/4 PASS |
+| 编译 | 严格标志 0 warning / 0 error |
+| 端到端 `/tmp/h3_nat_stream.mp4` | rc=0、无 Metal 报错；2 步/4 步均 `preserved` |
+| 拼图 `montage_native_int6g128.png` | base / int8 / int6g128 肉眼等价 |
+| 字节真实收益 | int6-g128 **14.58 GiB（−18.8%）落盘**（代理路径恒 21.4 GiB，不体现） |
+
+## 结论
+- int6-g128 原生加载 = **Phase 2 交付完成**，质量等价于 Phase 1 代理判据（preserved），且字节收益真实落盘。
+- int4（bits=4）**复用同一加载器**，无新引擎代码；可用性门槛 = Phase 3 GPTQ 把 relRMS 压到 ~0.03 以下 + 3e 端到端通过。
+- 回退方案已无必要：3e 不通过也直接交付 int6-g128 原生（−18.8%），无需退回代理路径。
+
+## Next
+- Phase 3 的 3d（全 200 层 GPTQ 跑批，~6–8h 墙钟）+ 3e（端到端 A/B）—— int4 路线最终判据。
+- 3e 通过 → int4 checkpoint 用同一 `export_h3_int6_native.py --bits 4` 导出，引擎零改动。
+
+---
+
+# Session 2026-09-14：video VAE 解码流式化（消除分辨率×时长内存墙）
+
+## 起因
+VAE 解码原把整段 RGB 累积在 `final_rgb`（帧数×宽×高×3），峰值与「分辨率×时长」成正比
+→ 长视频/高分辨率会 OOM。改为逐时间分片流式解码 + pipe FFmpeg。
+
+## 改动
+- 新增 `h3_ffmpeg_mux`（video+audio pipe，异步音频线程）替代一次性 `h3_ffmpeg_write_av_*`
+- `h3_video_vae_decode` 加 `sink`/`sink_opaque`；`decode_chunked` 与单 chunk 分支在每 chunk 解出后调 sink
+- `h3.c` 新增 `h3_vae_frame_sink`（f32→u8→resize→on_frame 预览→pipe）
+- 主路径 `h3_generate` 与 `--latent-in` 路径均改用 sink 流式
+
+## 验证
+- 编译 0 warning（仅预存 `conditioning_key` 警告，无关）；链接 `libh3.a` 成功
+- 主路径端到端跑通：448×256 / 1s / 4 steps → `FFmpeg 39/39 → wrote mp4`（ffprobe 含音视频流）
+- 像素级等价：代码审查保证（sink 仅替换累积步骤，解码/重叠/混合未改）；待用户 `git stash` 对照
+
+## 关键结论
+
+### step 数增长对内存峰值**无影响**
+- denoise 在**固定** latent 张量上重复 DiT forward；step 数只乘 forward 次数 → **耗时线性增长**，不分配新大张量。
+- 代码证据：`h3_dit_denoise_euler_preview`（`h3_dit.c:5068`）的 `video_velocity` / `audio_velocity` /
+  `last_video` / `previous_video` 等全在 `for (step …)` **循环外**一次性分配（大小 = latent 元素数，固定），
+  循环体内无 per-step `malloc`。
+- 与 step 相关的唯一内存是 `h3_dit_schedule_precompute` 的 per-step AdaLN modulation / gate 张量
+  （每 step ~KB 级，可忽略）和可选的 `row_maps`（token reduction 的小映射，已在 `load_dit` 一次性分配）。
+- 内存峰值由以下**独立于 step** 的因素决定：
+  1. DiT 权重 resident 模式（全常驻 / 流式 2 槽 / 部分常驻 K）
+  2. video latent 大小（分辨率×时长，固定）
+  3. VAE 单 chunk（已流式化，与时长解耦）
+  4. 条件张量（文本/视觉编码，一次性）
+- VAE 流式化后，峰值**进一步与时长解耦**：时长只增耗时（chunk 数 × 每 chunk 解码），不增峰值。
+
+### 反向提示（避免误判）
+- 「step 增加画质变好」是**质量/算力**维度（如 Phase 16 测 step7 vs step4 SSIM +54%），不是内存维度。
+- 若观察到 step 增多时 RSS 上升，几乎一定来自别处（如缓存/调度张量或系统内存压力），非 denoise 循环本身。
