@@ -1024,3 +1024,17 @@ video VAE 解码不再把整段 RGB 累积在内存：改为逐时间分片（te
 | `--first-frame` 报 `visual.pos_embed` shape mismatch | 2 | 缺 H3 vision encoder（HF 不可达/ModelScope 无）→ 放弃 |
 | 第 7 段 `Killed: 9`(SIGKILL) | 1 | 系统内存压力保护（**未死机**）；单独重跑成功 |
 | 后台 nohup 进程被工具会话终止 | 1 | 改前台 + `tr '\r' '\n'` 实时输出 |
+
+## Next（用户指示 2026-09-15）
+1. **降分辨率测试**：下次用 **256×256** 测 15s 单次生成。
+   预估：256² 空间 token 约为 864×480 的 **16%**；15s vs 6s 帧数 ×2.5
+   → 15s@256² 的 token 总量 ≈ 864×480@6s 的 **0.4×** → 单步激活 ≈ **1.5 GiB**
+   （864×480@6s 为 3.77）→ 单次 15s 大概率可跑通。仍带 `h3_host_memory_guard` 作安全网。
+2. **段间连贯**：需补 H3 vision encoder（`h3-base/text_encoder`，含 `model.visual.*`），
+   之后把 `gen_segments.sh` 每段加 `--first-frame <上段末帧>` 即得连贯（替代硬切）。
+
+### Phase 46: 256×256 / 15s 单次生成 — complete（✅ 成功）
+- 实测：denoise 峰值 **11.43 GiB**（available 2.67 GiB）→ **未触发守卫**；
+  VAE decode footprint 1.47 GiB、available 12.64→8.42 GiB（~20 chunks，单调下降但充足）。
+- 产物 `out256_15s.mp4` = **15.08s / 256×256 / 含音频 / 659 KB**，总 **898s**，RSS 8.37 GiB，零报错。
+- **结论：低分辨率（256×256）下单次 15s 完全可行**，与 864×480 的硬件墙形成对照。

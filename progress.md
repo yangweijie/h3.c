@@ -1073,3 +1073,13 @@ VAE 解码原把整段 RGB 累积在 `final_rgb`（帧数×宽×高×3），峰�
 | What's the goal? | 16 GiB 机产出 15s @ 864×480 |
 | What have I learned? | 16 GiB+swap=0 单次 15s 不可行；denoise 激活 ∝ token；VAE wired 不计 footprint；vision encoder 不可得 |
 | What have I done? | 守卫 + token-reduction 验证 + 分段生成 + 3/6s 实测 + 15s 死机定性 |
+
+### Next（用户指示 2026-09-15）
+- 下次测试**降分辨率 256×256**（空间 token ≈ 864×480 的 16% → 预估单次 15s 可行，单步激活 ~1.5 GiB）。
+- 段间连贯需补 **H3 vision encoder**（`h3-base/text_encoder`），之后启用 `--first-frame` 替代硬切。
+
+### Phase 46: 256×256 / 15s 单次生成 — ✅ 成功
+- 命令：`./h3 -d h3_int6g128_native -p "…" --width 256 --height 256 --seconds 15 --steps 4 -o out256_15s.mp4`
+- 结果：`wrote out256_15s.mp4`；**15.08s / 256×256 / 含音频 / 659 KB**；总 **898s**，RSS 8.37 GiB，零报错。
+- 内存：denoise 峰值 **11.43 GiB**（未触发守卫）；VAE decode 1.47 GiB、available 12.64→8.42 GiB。
+- **关键结论：低分辨率下 15s 单次可行**，无需分段；分段仅在高分辨率（≥864×480）时需要。

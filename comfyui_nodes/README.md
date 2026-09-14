@@ -14,10 +14,10 @@ UNETLoader + CLIPLoader + MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo
 
 ```bash
 # 1) 编译二进制
-cd /Volumes/data/git/c/h3.c && make
+cd /Volumes/data/git/c/h3c && make
 
 # 2) 软链接到 ComfyUI（目录名用 h3_binary_nodes，与 PHP 项目的 h3_nodes 区分）
-ln -s /Volumes/data/git/c/h3.c/comfyui_nodes \
+ln -s /Volumes/data/git/c/h3c/comfyui_nodes \
       /Volumes/data/Documents/ComfyUI/custom_nodes/h3_binary_nodes
 
 # 3) 重启 ComfyUI
@@ -68,7 +68,7 @@ ln -s /Volumes/data/git/c/h3.c/comfyui_nodes \
 
 ## 前置条件
 
-1. **二进制**：`cd /Volumes/data/git/c/h3.c && make`（本包默认用同级的 `h3`）
+1. **二进制**：`cd /Volumes/data/git/c/h3c && make`（本包默认用同级的 `h3`）
 2. **ClipProj 环境**（设了之后 `FL2VA/text_encoder` 可缺失）：
    ```
    H3_CLIPPROJ_DIR=/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot

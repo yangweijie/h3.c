@@ -6,10 +6,10 @@
 
 安装（二选一）：
     # 软链接（推荐，改代码即生效）
-    ln -s /Volumes/data/git/c/h3.c/comfyui_nodes \\
+    ln -s /Volumes/data/git/c/h3c/comfyui_nodes \\
           <ComfyUI>/custom_nodes/h3_binary_nodes
     # 或复制
-    cp -r /Volumes/data/git/c/h3.c/comfyui_nodes \\
+    cp -r /Volumes/data/git/c/h3c/comfyui_nodes \\
           <ComfyUI>/custom_nodes/h3_binary_nodes
 
 > 目录名建议用 `h3_binary_nodes`，与 PHP 项目的 `h3_nodes` 区分，避免包名冲突。

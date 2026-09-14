@@ -27,7 +27,7 @@ cinematic neon city street at night
 ## 4B 侧复现命令（本机 16GB Mac 可直接跑）
 
 ```bash
-cd /Volumes/data/git/c/h3.c
+cd /Volumes/data/git/c/h3c
 python3.13 clipproj_harness.py \
   --prompts "a cat,a dog,an elephant,quantum physics,a vintage sports car,world peace,war and peace,hello world,close-up of a red fox in snowy forest,cinematic neon city street at night" \
   --inline --max-prompts 10 \
@@ -67,7 +67,7 @@ h3.c 的 32B 文本编码入口（输出即 `[tokens, 5120]` BF16，无需 ClipP
 ### 2. 一次跑出对照
 
 ```bash
-cd /Volumes/data/git/c/h3.c
+cd /Volumes/data/git/c/h3c
 python3.13 clipproj_harness.py \
   --prompts "a cat,a dog,an elephant,quantum physics,a vintage sports car,world peace,war and peace,hello world,close-up of a red fox in snowy forest,cinematic neon city street at night" \
   --inline --max-prompts 10 \

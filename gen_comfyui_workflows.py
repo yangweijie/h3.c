@@ -46,7 +46,11 @@ def _widget_names(cls):
                 names.append("control_after_generate")
     return names
 
-H3_BINARY = os.environ.get("H3_BINARY", "/Volumes/data/git/c/h3.c/h3")
+# 二进制默认路径取自节点模块的自定位常量（comfyui_nodes 的上一级），
+# 而不是硬编码绝对路径 —— 项目目录改名（h3.c → h3c）后不用再改这里。
+_HB_DEFAULT_BINARY = getattr(_hb, "_DEFAULT_BINARY", None) if _NODE_OK else None
+H3_BINARY = os.environ.get(
+    "H3_BINARY", _HB_DEFAULT_BINARY or os.path.join(PROJ, "h3"))
 MODEL_DIR = os.environ.get("H3_MODEL_DIR", "/Users/jay/h3_sys/MiniMax-H3-Convrot")
 CLIPPROJ_DIR = os.environ.get(
     "H3_CLIPPROJ_DIR", "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot")

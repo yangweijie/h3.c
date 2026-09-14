@@ -6,7 +6,7 @@ high-quality reference using SSIM/PSNR/L2, and writes a self-contained HTML repo
 with embedded frame comparisons.
 
 Usage:
-    cd /Volumes/data/git/c/h3.c/benchmark
+    cd /Volumes/data/git/c/h3c/benchmark
     python3 benchmark.py                # run full sweep + report
     python3 benchmark.py --skip-gen     # reuse existing videos, just re-score
 """
@@ -24,7 +24,7 @@ import numpy as np
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-H3_DIR = "/Volumes/data/git/c/h3.c"
+H3_DIR = "/Volumes/data/git/c/h3c"
 H3_BIN = os.path.join(H3_DIR, "h3")
 MODEL_DIR = "/Users/jay/h3_sys/MiniMax-H3-Convrot"
 # Text encoder is external (not inside FL2VA/); pointed to via env vars.
