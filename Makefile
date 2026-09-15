@@ -23,6 +23,9 @@ CLIPPROJ_PROMPT ?= A red fox walking through snow
 # Released model root for the weights-only AudioVAE end-to-end test. Point this
 # at the checkpoint tree, e.g. `make test AUDIO_VAE_MODEL=models/minimax-h3`.
 AUDIO_VAE_MODEL ?= MiniMax-H3
+# Released model root for the streamed video VAE parity test. Point this at the
+# checkpoint tree, e.g. `make test VIDEO_VAE_MODEL=models/minimax-h3`.
+VIDEO_VAE_MODEL ?= MiniMax-H3
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
@@ -189,6 +192,12 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		./h3_av_mux_test; \
 	else \
 		echo "skip: FFmpeg is not installed"; \
+	fi
+	@if test -f $(VIDEO_VAE_MODEL)/FL2VA/video_vae/source/model.safetensors && \
+	         test -f misc/fixtures/h3_vae_streaming_parity_256x256x39_f32.safetensors; then \
+		./h3_semantic_vae_test --streaming-parity $(VIDEO_VAE_MODEL)/FL2VA/video_vae/source; \
+	else \
+		echo "skip: streamed video VAE parity weights/fixture are not installed"; \
 	fi
 	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors && \
 	         test -f misc/fixtures/h3_real_video_encoder_256.safetensors; then \

@@ -27,6 +27,7 @@ import shlex
 import shutil
 import struct
 import subprocess
+import threading
 import time
 from collections import deque
 
@@ -94,7 +95,8 @@ RESOLUTION_PRESETS = _build_resolution_presets()
 RESOLUTION_CHOICES = list(RESOLUTION_PRESETS)
 
 # LoRA 名 → 推荐步数（turbo/lightning/dmd 蒸馏模型需要少步数）
-_FEW_STEP_HINTS = ("turbo", "lightning", "dmd", "lcm", "schnell")
+# lightx2v：LightX2V 类加速 LoRA（与 turbo/lightning 同属少步蒸馏模型）
+_FEW_STEP_HINTS = ("turbo", "lightning", "lightx2v", "dmd", "lcm", "schnell")
 
 
 def suggest_steps(lora: str):
@@ -167,11 +169,102 @@ def _make_video(path: str):
 
 
 def _interrupted() -> bool:
+    """当前是否有取消请求。"""
     try:
         import comfy.model_management as mm
         return bool(mm.processing_interrupted())
     except Exception:
         return False
+
+
+def _check_interrupted(proc=None):
+    """若有取消请求：先终止子进程，再抛 ComfyUI 的中断异常。
+
+    抛 InterruptProcessingException 而不是 RuntimeError —— 前端会走正常
+    取消流程，不会在工作流里留一个红叉。
+    """
+    if not _interrupted():
+        return
+    if proc is not None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        import comfy.model_management as mm
+        mm.throw_exception_if_processing_interrupted()  # 重置标志并抛出
+    except ImportError:
+        pass
+    raise RuntimeError("用户取消（已终止引擎进程）")
+
+
+# 引擎进度行形如 "load transformer core       12/50"：阶段之间用 \r 分隔，
+# 文本模式下 \r 会被翻译成换行，所以每个进度片段都是独立的一行。
+_PROGRESS_RE = re.compile(r"^(.+?)\s+(\d+)\s*/\s*(\d+)\s*$")
+
+
+class _ProgressReporter:
+    """把引擎的 `阶段 当前/总数` 进度转发到 ComfyUI 进度条。
+
+    ComfyUI 的全局进度 hook（main.hijack_progress）内部就会调用
+    throw_exception_if_processing_interrupted()，所以每次进度更新同时也是
+    一个中断检查点 —— 引擎输出密集时能秒级响应取消。
+    """
+
+    def __init__(self, tag):
+        self.tag = tag
+        self.bar = None
+        try:
+            import comfy.utils as _cu
+            self.bar = _cu.ProgressBar(1)  # total 在首个进度行到达时更新
+        except Exception:
+            self.bar = None
+
+    def feed(self, line):
+        if self.bar is None:
+            return
+        m = _PROGRESS_RE.match(line)
+        if not m:
+            return
+        cur, total = int(m.group(2)), int(m.group(3))
+        if total <= 0:  # 例如 "FFmpeg 0/0"（无参考输入时的空阶段）
+            return
+        try:
+            self.bar.update_absolute(cur, total)
+        except BaseException as exc:
+            # 中断异常必须向上抛（hook 内部会检查中断）；其它异常退化为无进度条
+            if type(exc).__name__ == "InterruptProcessingException":
+                raise
+            self.bar = None
+
+
+def _free_comfy_memory():
+    """启动子进程前释放 ComfyUI 占用的内存。
+
+    h3 是**独立进程**，与 ComfyUI 抢占同一块统一内存（Apple Silicon）。
+    --info 实测 DiT 21.4 GiB + video VAE 14.6 GiB；16 GB 机器上若 ComfyUI
+    还挂着 checkpoint，子进程很容易 OOM。可用 H3_FREE_MEMORY=0 关闭。
+    """
+    if os.environ.get("H3_FREE_MEMORY", "1").lower() in ("0", "false", "no", "off"):
+        return
+    freed = []
+    try:
+        import comfy.model_management as mm
+        mm.unload_all_models()
+        freed.append("unload_all_models")
+        mm.soft_empty_cache()
+        freed.append("soft_empty_cache")
+    except Exception as exc:
+        print(f"[H3] 提示: 释放 ComfyUI 模型失败（忽略）: {exc}")
+    try:
+        import torch
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+            freed.append("torch.mps.empty_cache")
+    except Exception:
+        pass
+    if freed:
+        print(f"[H3] 已释放 ComfyUI 内存: {', '.join(freed)}")
 
 
 def _resolve_ffmpeg_env():
@@ -211,6 +304,7 @@ def _run_engine(cmd, env_extra, tag="H3"):
     work_dir = os.path.dirname(os.path.abspath(cmd[0]))
     print(f"[{tag}] exec: {' '.join(cmd)}")
     print(f"[{tag}] cwd: {work_dir}")
+    _free_comfy_memory()
     t0 = time.time()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
@@ -218,18 +312,45 @@ def _run_engine(cmd, env_extra, tag="H3"):
     # 进度行会逐条刷新，长任务下日志可以很长；只保留尾部即可
     # （错误信息只用到最后 25 行）。
     lines = deque(maxlen=2000)
+    reporter = _ProgressReporter(tag)
+    drained = threading.Event()
+    failure = []
+
+    def _reader():
+        """后台读取：主线程一边轮询中断，一边仍能把输出实时打进日志。"""
+        try:
+            for raw in proc.stdout:
+                line = raw.rstrip()
+                if line:
+                    lines.append(line)
+                    print(f"[{tag}] {line}")
+                    reporter.feed(line)
+        except BaseException as exc:  # noqa: BLE001 - 中断异常需回传主线程
+            failure.append(exc)
+        finally:
+            drained.set()
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
     try:
-        for raw in proc.stdout:
-            line = raw.rstrip()
-            if line:
-                lines.append(line)
-                print(f"[{tag}] {line}")
-            if _interrupted():
-                proc.kill()
-                raise RuntimeError("用户取消（已终止引擎进程）")
+        while not drained.wait(0.25):
+            _check_interrupted(proc)  # 静默阶段（加载/解码/封装）也能响应取消
+        if failure:
+            raise failure[0]          # 读取线程里的中断异常在此向上抛
+        _check_interrupted(proc)
+    except BaseException:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
     finally:
+        reader.join(timeout=5)
         if proc.stdout is not None:
-            proc.stdout.close()
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
         if proc.poll() is None:
             proc.wait()
     dt = time.time() - t0
@@ -295,6 +416,17 @@ def _write_h3_latent(latent, path):
             f.write(audio.tobytes())
         else:
             f.write(struct.pack("i", 0))
+
+
+def _validate_engine_paths(binary=None, model_dir=None):
+    """校验引擎二进制与模型目录；返回错误信息或 None（通过）。"""
+    binary = binary or _DEFAULT_BINARY
+    if not os.path.isfile(binary):
+        return f"H3 引擎二进制不存在: {binary}"
+    model_dir = model_dir or _DEFAULT_MODEL_DIR
+    if not os.path.isdir(model_dir):
+        return f"模型目录不存在: {model_dir}"
+    return None
 
 
 class _H3BinaryBase:
@@ -363,9 +495,56 @@ class _H3BinaryBase:
             "binary": ("STRING", {"default": _DEFAULT_BINARY}),
             "clipproj_dir": ("STRING", {"default": _DEFAULT_CLIPPROJ_DIR}),
             "clipproj_proj": ("STRING", {"default": _DEFAULT_CLIPPROJ_PROJ}),
-            "extra_args": ("STRING", {"default": "",
-                                      "tooltip": "附加 CLI 参数（直接拼到命令行）"}),
+            "extra_args": ("STRING", {
+                "default": "",
+                "tooltip": "附加 CLI 参数（直接拼到引擎命令行）。完整清单见 "
+                           "「H3 Engine Notes」节点；常用：--video-vae-streaming 0"
+                           "（常驻 VAE，16 GB 亦安全）/ --ssd-streaming（省内存，"
+                           "非提速）/ --token-reduction / --profile（性能诊断）/ "
+                           "--render-width N --render-height N（低内部画布提速）/ "
+                           "--sr --sr-bin PATH --sr-model-dir PATH --sr-target WxH"
+                           "（Real-ESRGAN 超分）"}),
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        """排队前校验（ComfyUI 约定：True 通过，返回字符串即错误信息）。
+
+        把原先要等执行时才抛的错误提前到排队阶段，直接在节点上红字提示，
+        不必等 21 GiB 权重加载完才发现路径写错。
+        """
+        err = _validate_engine_paths(kwargs.get("binary"),
+                                     kwargs.get("model_dir"))
+        if err:
+            return err
+
+        core_reuse = kwargs.get("core_reuse") or 1
+        reuse = kwargs.get("reuse") or 1
+        if core_reuse > 1 and reuse > 1:
+            return ("core_reuse 与 reuse 不能同时 > 1（引擎硬限制：二者互斥）。"
+                    "把其中一个设回 1 即可。")
+
+        steps = kwargs.get("steps")
+        if steps is not None and not (2 <= int(steps) <= 1000):
+            return f"steps 需在 2~1000（引擎限制），当前 {steps}"
+
+        seconds = kwargs.get("seconds")
+        if seconds is not None and not (0.2 <= float(seconds) <= 15.0):
+            return f"seconds 需在 0.2~15.0，当前 {seconds}"
+
+        # 选了非 custom 预设时 width/height 会被覆盖，不必校验
+        width = kwargs.get("width")
+        height = kwargs.get("height")
+        if (width is not None and height is not None
+                and kwargs.get("resolution_preset") == CUSTOM_RESOLUTION
+                and (int(width) % MULTIPLE or int(height) % MULTIPLE)):
+            return (f"宽高需为 {MULTIPLE} 的倍数：{width}x{height}"
+                    f"（运行时会自动取整，建议直接选分辨率预设）")
+
+        prompt = kwargs.get("prompt")
+        if prompt is not None and not str(prompt).strip():
+            return "提示词为空，请输入有效 prompt"
+        return True
 
     def _resolve_inputs(self, width, height, resolution_preset,
                         steps, lora, auto_steps):
@@ -712,6 +891,12 @@ class H3_BinaryLatentDecode:
     CATEGORY = CATEGORY
     DESCRIPTION = "latent → 视频（VAE 解码；若含 h3_audio 则保留音轨）；接在 H3_BinaryLatent/Upscale 之后"
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        err = _validate_engine_paths(kwargs.get("binary"),
+                                     kwargs.get("model_dir"))
+        return err or True
+
     def decode(self, latent, width, height, model_dir=_DEFAULT_MODEL_DIR,
                binary=_DEFAULT_BINARY,
                clipproj_dir=_DEFAULT_CLIPPROJ_DIR,
@@ -763,6 +948,12 @@ class H3_BinaryInfo:
     # 「跑一下看日志」，所以必须自行声明为输出节点，否则不连线就完全不跑。
     OUTPUT_NODE = True
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        err = _validate_engine_paths(kwargs.get("binary"),
+                                     kwargs.get("model_dir"))
+        return err or True
+
     def run(self, model_dir, binary, clipproj_dir, clipproj_proj):
         if not os.path.isfile(binary):
             raise FileNotFoundError(f"H3 引擎二进制不存在: {binary}")
@@ -812,10 +1003,55 @@ H3_SWITCHES_DOC = """\
 适用：低分辨率批量出图时打开。
 
 ### extra_args（附加 CLI 参数）
-直接拼到引擎命令行，用于传节点未暴露的开关，例如：
+直接拼到引擎命令行，用于传节点未暴露的开关。完整清单见下一节，常用：
 - `--video-vae-streaming 0`：强制 VAE 解码器常驻（快；逻辑预载 ~9 GiB 但为 F16→F32 加宽的**可驱逐**共享缓冲，并非钉死内存，实测峰值仅 5.1–6.2 GiB，16 GB 机器安全）
 - `--video-vae-streaming 1`：强制 VAE 流式（只占 ~0.25 GiB，慢一些）
+- `--ssd-streaming`：DiT 层从 SSD 流式（省内存，**不是**提速手段）
+- `--profile`：打印分阶段 Metal 计时与分配数据
 - 留空则由自动内存规划器决定（auto）。
+
+## 引擎 CLI 参数（节点未暴露，经 extra_args 传入）
+
+### 提速 / 画质
+| 参数 | 说明 |
+|---|---|
+| `--token-reduction` | 在中间 DiT 块内配对视频 token，更快，但可能改变构图 |
+| `--render-width N` `--render-height N` | 用更低的内部画布跑 DiT/VAE，再放大到输出尺寸（512² 输出常用 `384x384`） |
+| `--use-int8-row-fc2` | M5 上更快的 int8 FC2（每个 FC2 行一个激活 scale）。精度比分组 int8 略低；实测完整 denoise forward 快约 2.6%，四步 fox/surfer 与基线 SSIM 0.919 / 0.828 |
+| `--linear-branch DIR` | VDN-H3 linear-branch 检查点（混合注意力）。**不能**与 `--ssd-streaming` 同用 |
+| `--use-reference-rope` | 关闭原生 256 RoPE 自适应 |
+
+### 内存
+| 参数 | 说明 |
+|---|---|
+| `--ssd-streaming` | 原始 BF16 DiT 层从 SSD 流式读取。16 GB 上把 DiT 常驻存储从 ~36.5 GiB 降到 ~2 GiB，代价是慢（512² 约 +84%）。内存规划器在 16/24 GB 上通常已自动处理，不必手动加 |
+| `--video-vae-streaming N` | 0=常驻（快，~9 GiB 可驱逐）；1=流式（~0.25 GiB，慢）；默认 auto |
+| `--pipeline` | denoise 后把 latent 缓冲标为可回收（madvise DONTNEED），长片段降峰值内存。需配合 `--latent-out`（节点内部已用） |
+
+### 超分（Real-ESRGAN）
+需先准备 `realesrgan-ncnn-vulkan`。
+| 参数 | 说明 |
+|---|---|
+| `--sr` | 开启超分 |
+| `--sr-bin PATH` | realesrgan 可执行文件所在目录 |
+| `--sr-model-dir PATH` | 模型目录 |
+| `--sr-model NAME` | 模型名（默认 realesrgan-x4plus） |
+| `--sr-target WxH` | 目标分辨率；是内部尺寸的 2–4 倍整数倍时走精确倍率，否则先 ×4 再用 ffmpeg 缩放到目标 |
+| `--sr-scale N` | 未指定 `--sr-target` 时的倍率 2/3/4（默认 4） |
+
+内部低分辨率须为 32 的倍数。例：`--width 512 --height 288 --sr --sr-bin /tmp/h3_realesrgan --sr-model-dir /tmp/h3_realesrgan/models --sr-target 1280x720`。
+
+### 调试 / 复现
+| 参数 | 说明 |
+|---|---|
+| `--profile` | 分阶段 Metal 计时与分配数据 |
+| `--frames-dir PATH` | 额外把生成的帧写成 PPM |
+| `--show` `--zoom N` | 终端逐帧预览（需 Kitty/Ghostty）。**ComfyUI 下无意义**，且会常驻一个预览 VAE（约 +10 GiB），不要开 |
+| `--use-slower-*` | 一系列强制走参考慢路径的开关（`bf16-mlp`、`bf16-qkv`、`unfused-int8-inputs`、`scalar-qkv-rms`、`grouped-quantizer` 等），用于数值复现与对照，正常不用 |
+
+### 节点已占用（不要重复传）
+`--width --height --seconds --steps --seed --lora --layers --reuse --core-reuse -d -p -o --latent-out --latent-in --first-frame --last-frame --ref-*`。
+特别注意：`--frames` 与 `--seconds` **互斥**，节点固定传 `--seconds`，所以不要再传 `--frames`。
 
 ## 环境变量（进程级，节点 extra_args / 系统环境均可设）
 
@@ -828,6 +1064,18 @@ H3_SWITCHES_DOC = """\
 ### H3_DIT_STREAM_WORKERS / H3_DIT_STREAM_PIPELINE
 即 fast_stream 的底层旋钮（=2 启用分块多 worker；PIPELINE 只调重叠）。一般直接用节点的 fast_stream 开关即可。
 
+### H3_TOKEN_REDUCTION=1（及子参数）
+等价于 `--token-reduction`。另有 `H3_TOKEN_REDUCTION_BLOCKS`（作用块范围）、`H3_TOKEN_REDUCTION_EARLY`、`H3_TOKEN_REDUCTION_SCALE` 调强度。
+
+### H3_MEM_GUARD_MB / H3_MEM_HEADROOM_MB / H3_MEM_TRACE=1
+自动内存规划器的守卫值(MB) / 预留量(MB) / 规划跟踪输出。默认由规划器自己决定，只在内存紧张时才需要调。
+
+### H3_ZERO_COPY_WEIGHTS=1
+权重零拷贝，省一次拷贝（省内存），但会改变读取带宽特征。
+
+### H3_DIT_COMMAND_BLOCKS=N
+GPU command buffer 分块数，影响 Metal 提交粒度。
+
 ### H3_PROFILE=1
 打印 I/O 字节、吞吐、未被 GPU 隐藏的读等待，用于性能诊断。
 
@@ -839,6 +1087,9 @@ ffmpeg / ffprobe 绝对路径覆盖。节点已自动探测 /opt/zerobrew/bin、
 
 ### H3_BINARY / H3_MODEL_DIR
 二进制与模型路径。节点已默认读取，也可在 binary / model_dir 参数覆盖。
+
+### 内部调优开关（不建议动）
+源码里还有上百个 `H3_DISABLE_*`、`H3_INT8_*`、`H3_NAX_*`、`H3_BENCH_*`，是 kernel 级 A/B 与数值复现用的（例如 `H3_DISABLE_COOP_QKV`、`H3_INT8_ACTIVATION_CLIP`、`H3_MPS_GQA`）。改动通常只会变慢或改变数值，除非正在复现某个具体问题，否则不要设。
 
 ## 调参优先级（在节点里）
 1. 默认（1/1/0/关）：精确基准。

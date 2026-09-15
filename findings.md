@@ -1566,3 +1566,181 @@ v1 无 version 字段且只有视频 → 无法区分是否含音频，故整体
 **反直觉结论**：int8 权重严格更大（BF16 4step 22.9 GB / 预量化 int8-g64 更比源 +12.5%），
 但 **adaptive residency 只常驻 8 块**（int6 为 9 块）——单块更大 ⇒ 同 available 下常驻块数更少
 ⇒ **常驻内存更低**，抵消权重劣势并略快（−45s）。**16 GiB 上 int8(BF16+runtime) 比 int6 native 更划算。**
+
+# ===== video VAE 重复加载实测 + DiT GPU 侧剖析 (2026-09-15/16) =====
+
+## 一、VAE 的 146s 在哪：同一份权重被读了 24 次
+
+### 取证（864×480×56 / steps 2）
+| 证据 | 值 |
+|---|---|
+| `[vae-debug] stream tile` 打印次数 | **24**（= 8 tiles × 3 chunks）|
+| `per-block_bytes` | 268.6 MB（36 块 = 9.67 GB/次遍历）|
+| 预期总读量 | 24 × 9.67 GB = **232.0 GB** |
+| profile `alloc` | **216.520 GiB = 232.5 GB**（吻合 99.8%）|
+
+```
+video VAE decoder  wall=242.837s  wait=96.700s  root-gpu=22.272s
+242.837 − 96.700 = 146.1s ← CPU 侧搬权重，占该阶段 60%
+```
+
+### 结构根因
+```c
+// decoder_decode_chunk（tile 在【外层】）
+for (tile_y) for (tile_x) {
+    prepare_input(...);
+    run_stream_tile(...);   // ← 内部 load 全部 36 块，跑完即 free
+}
+// run_stream_tile
+for (index = 0; index < LAYERS; index++) { load_block(index); run_block(); free_block(); }
+```
+
+原注释的判断是错的：
+> "Serial decode is correct; the lost overlap only marginally slows the VAE stage."
+
+实测 I/O+CPU 146s vs GPU 96.7s —— **不是 marginal，是 60%**。
+
+## 二、block-major 重构：为什么只需要一份 hidden
+
+### 依赖分析（决定可行性的关键）
+- `run_block` 只读写 `hidden/norm/qkv/query/key/value/heads/branch/ff1/activated` + rope。
+  **不碰 `latent` / `post` / `patch_hidden`**。
+- `unpack_frame_range` 只读 `projected`。
+
+⇒ 每个 tile 的进展状态**只用一份 `hidden`** 就能完整表达，不需要保留整个激活栈。
+
+| 量 | 值 |
+|---|---|
+| 每状态 = `sequence × HIDDEN × 4` | 2028 × 2048 × 4 = **16.6 MB** |
+| 864×480 每 chunk（8 tiles） | 133 MB |
+| 864×480 跨 chunk（3×8=24） | **400 MB**（实测 peak 0.654 → 1.025 GiB）|
+
+### 三级路径（自动选择，无开关）
+| 路径 | 条件 | load_block 次数 |
+|---|---|---|
+| **cross-chunk** | `streaming && chunks×tiles×seq×HIDDEN×4 ≤ 1 GiB` | **36** |
+| per-chunk | 同上但超限 | 108 |
+| per-tile | resident 或更小预算 | 864 |
+
+`states` 上限 1 GiB ≈ 64 个状态 ≈ 22.9 MB 预算/状态。触发回退的规模：
+>8s 的 864×480（11×8=88）或 1080p（3×40=120）。
+
+### 逐字节无损的论证与实测
+每 tile 的块执行顺序（0→35）完全不变，只是把"tile 间交错"改为"块间交错"；
+中间状态通过设备内 `h3_gpu_copy_f32` 存取，不经过主机。实测：
+
+```
+864×480×56/2 步，跨 chunk vs 原始 baseline
+SSIM Y:1.000000 (inf)  PSNR inf     ← 逐字节一致
+```
+
+对照：`H3_VAE_TILE_PIXELS=512`（改 tile 几何）虽然也省 90s，但 **SSIM 0.854 / PSNR 26.7 dB，有损**。
+
+### 实现陷阱
+1. **两条 decode 入口都要改**。`h3.c:2273` 是三元表达式：
+   `preview_decoder ? h3_video_vae_decoder_decode(...) : h3_video_vae_decode(...)`。
+   只改 `decoder_decode_chunk` 时实测 `stream chunk calls: 0`——实际走的是 `decode_chunked`。
+2. **copy 必须与 pack 同处一个命令缓冲**。放在 `submit` 之后会静默失败（`exit=1` 且错误信息为空，
+   因为 `h3_gpu_error()` 返回空串）。
+
+## 三、DiT 性能测量的两个陷阱
+
+### 陷阱 1：自适应驻留使 A/B 不可复现
+```c
+// h3_dit.c:2742
+if (dit->ssd_streaming && resident_budget == 0) {
+    uint64_t avail = h3_host_available_memory();   // ← 运行时系统可用内存
+    ... auto_resident = h3_dit_resident_budget(usable, per_block=0.5GiB, ...);
+```
+| 运行 | `available` | 常驻块 | peak |
+|---|---|---|---|
+| baseline | 4.3 GiB | 6 | 6.560 GiB |
+| tile512 | 4.4 GiB | 6 | 6.560 GiB |
+| resident 尝试 | 6.1 GiB | 10 | 9.431 GiB |
+| `--layers 45`（未钉住）| 5.7 GiB | 9 | **11.120 GiB → swap → 314s 假数据** |
+
+⇒ **测 DiT 必须 `export H3_DIT_RESIDENT_BLOCKS=6`**（设 `0` 无效——`resident_budget == 0` 正是自适应触发条件）。
+钉住后四次运行 peak 稳定在 6.096~6.099 GiB。
+
+### 陷阱 2：`--reuse` 在低步数下无意义
+`--reuse 2` 评估首尾 + 每个间隔。steps=2 时无可跳之步 → 75.468s ≈ base 75.015s（+0.6%）。
+必须在真实步数（20）下测，才看到 −45.9%。
+
+## 四、DiT A/B 实测（864×480×22，钉住 6 块）
+
+| 配置 | 2 步 | 20 步 | vs base | SSIM(All) | PSNR |
+|---|---|---|---|---|---|
+| base | 75.015s | 775.689s | — | — | — |
+| `--layers 45` | 67.838s | — | −9.6% | 0.807 | 19.23 |
+| `--token-reduction` | 49.076s | — | −34.6% | 0.822 | 18.63 |
+| `--reuse 2` | 75.468s | 419.618s | −45.9% | 0.745 | 19.25 |
+| combo | 44.149s | **273.959s** | **−64.7%** | 0.643 | 14.54 |
+
+**收益与代价都是乘积叠加**：`0.55(reuse) × 0.90(layers) × 0.654(tr) = 0.324`（−67.6%），实测 −64.7%。
+dispatch 交叉验证：base `linear=4000`（20 步×50 块×4 个 linear）→ `reuse 2` 的 `2200` 证明**只跑了 11 次前向**。
+
+### 画质：数值差但目视不崩
+`base vs combo` 的 SSIM 0.643 / PSNR 14.54 dB 看着很糟，但 `/tmp/s20cmp_{base,combo}.png`
+目视：**狐狸结构完整、毛发清晰、背景正常**，差异是**运动相位偏移**（帧 1 位置/朝向不完全一致）。
+逐像素 SSIM 对运动相位极敏感，会把这个放大成很差的分数。
+
+⇒ 本质是"**换一条同样合理的生成轨迹**"，不是 artifact。`--reuse` 是时间外推，必然改变轨迹。
+
+## 五、权重 I/O 与分辨率无关（决定优化方向翻转）
+
+DiT 每读一遍权重矩阵的字节数**与激活大小无关**：
+
+| 配置 | 每次评估 I/O | 耗时 @0.997 GiB/s |
+|---|---|---|
+| `--layers 50` | ~16.0 GiB | ~16.0s |
+| `--layers 45` | ~14.4 GiB | ~14.4s |
+
+验证：576×320/10 步/combo = `6 次评估 × 14.4 = 86.4s`，**实测 86.741s**。
+
+| 场景 | denoise wall | GPU wait | SSD stream | unhidden wait |
+|---|---|---|---|---|
+| 864×480, 20步, base | 775.689s | 774.664s | 335.4s | 0.010s |
+| 864×480, 20步, combo | 273.959s | 273.038s | 160.5s | 0.590s |
+| **576×320, 10步, combo** | **92.256s** | 58.880s | 86.741s | **33.227s** |
+
+⇒ **降分辨率后 I/O 反超 GPU**（`unhidden wait` 0.010 → 33.227s）。
+计算量降 55.6%，时间只降 33%：`864×480` 同配置估 137s → 576×320 实测 92.3s。
+
+| 场景 | 瓶颈 | 有效 | 无效 |
+|---|---|---|---|
+| ≥864×480 | GPU 计算 | `--token-reduction` | — |
+| ≤576×320 | **权重 I/O** | `--layers`、`--reuse` | **`--token-reduction`** |
+
+### 注：`root-gpu` 字段不可信
+同一配置下它还报过 0.298s / 0.400s / 121.995s，与 `wait` 完全不成比例。
+README 自述它 "can omit child buffers scheduled internally by MPSGraph"。**以 `wait` 为准**。
+
+## 六、三条外部路线对本机的适用性（调研结论）
+
+| 路线 | 判定 | 理由 |
+|---|---|---|
+| **FREE**（arXiv 2511.20390，CVPR2026 Findings）| 部分/不适用 | draft-verify 的收益来自 batch 并行填满 GPU 空闲；本机长序列单步已 compute bound（`wait` 775s vs I/O 335s），batch-K 验证 ≈ K× 耗时。且本仓库已有同思路的 `H3_FB_CACHE`（零阶重放） |
+| **A-SelecT** | 不适用 | 解决的是 DiT 作判别式特征提取器时选时间步，不是生成。且"选时间步子集"这条路 README 已记录走过并否决（linear base grid 胜出）|
+| **Chimera** | 等权重 | 混合线性注意力的**算子已就绪**（`--linear-branch` + vdn cholesky/triinv/window kernels），卡在社区权重。且本机 `--linear-branch` 与 `--ssd-streaming` 互斥 → 需更大内存 |
+
+### 附带发现：`H3_FB_CACHE` 在本机不可用
+```c
+// h3_dit.c:3223
+ dit->fb_cache = !ssd_streaming && fb_cache && *fb_cache && strcmp(fb_cache, "0");
+```
+注释说明原因：SSD 流式的前取环形缓冲假设每个 block 都按顺序消费，中途跳出会失同步。
+而 16 GiB 必然 `ssd_streaming=1` ⇒ 该开关恒被忽略、复用率恒为 0。
+
+## 七、GGUF / 量化路线的实测否定
+
+- **仓库无 GGUF reader**（全仓 grep `gguf` 为空）。要走 GGUF 需自写 k-quant 反量化 kernel；
+  而引擎**已支持预量化流式读取**（`h3_dit.c:1737` 的 `source->is_grouped`），
+  转成 group-quantized safetensors 即可，**零 C 代码改动**。
+- **GGUF 本身不压缩**——省 I/O 靠位宽（bit/weight），不靠容器。
+- **但现有量化产物全是 int8**：`h3_int4g64`/`h3_int6g128`/`h3_int8g64` 三个目录
+  dtype 分布、每张量字节数、目录总大小**完全一致**，`qkv_proj.weight [21504,5376]` 实测
+  **8.00 bits/weight**，取值域 −127..127（252 个不同值）。
+  ⇒ `int4g64` 未实现；int6 若按 1 byte/weight 存放则**对 I/O 零收益**。
+- **量化质量代价实测**（`ab_report/report_steps4.json`）：int6g128(实为 int8) vs BF16
+  → SSIM 0.705 / PSNR 17.47 dB。**H3 对量化敏感**。
+- 在 compute bound 下，量化省 I/O 换不回时间；只有在 ≤576×320 档才有意义。

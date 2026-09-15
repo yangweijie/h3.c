@@ -1038,3 +1038,110 @@ video VAE 解码不再把整段 RGB 累积在内存：改为逐时间分片（te
   VAE decode footprint 1.47 GiB、available 12.64→8.42 GiB（~20 chunks，单调下降但充足）。
 - 产物 `out256_15s.mp4` = **15.08s / 256×256 / 含音频 / 659 KB**，总 **898s**，RSS 8.37 GiB，零报错。
 - **结论：低分辨率（256×256）下单次 15s 完全可行**，与 864×480 的硬件墙形成对照。
+
+# ===== Task Plan（当前任务）: video VAE 跨 chunk 权重复用 + DiT GPU 侧剖析 =====
+
+## Goal
+承接 256×256/15s 之后的性能线，两个独立目标：
+1. **VAE**：消除 `run_stream_tile` 每 tile 重读整份 VAE 权重的浪费（要求无损、逐字节可验证）。
+2. **DiT**：在 16 GiB M4（**无 M5 TensorOps/int8 路径**）上量化各加速开关的真实收益，
+   并解决"DiT 性能测量不可复现"的问题。
+
+## 最终结论
+- **VAE 跨 chunk 复用完成：242.8s → 103.5s（−57.4%），SSIM 1.000000/inf = 逐字节无损**。
+  两条 decode 入口（`decode_chunked` / `h3_video_vae_decoder_decode`）均已接入，**默认开启、无开关**。
+- **DiT 是 compute bound，I/O 被完全隐藏**（20 步 base：wall 775.7s vs SSD stream 335.4s，
+  `unhidden wait 0.010s`）。
+- **权重 I/O 与分辨率无关**：每次真实评估固定读 ~14.4 GiB（layers 45）→ 低分辨率下 I/O 反超 GPU
+  （576×320：GPU 58.9s vs I/O 86.7s，`unhidden wait` 0.010→33.227s）。
+- 方法论发现：**DiT 自适应驻留必须钉住**（`H3_DIT_RESIDENT_BLOCKS`），否则测量全部失效。
+
+## Phases
+### Phase 47: VAE 权重重复加载定位 — complete
+- 实测 `run_stream_tile` 被调用 **24 次**（8 tiles × 3 chunks），每次完整读 36 块（268.6 MB/块）。
+- 累计 `alloc=216.520 GiB` ↔ 24 × 9.67 GB = 232.0 GB（吻合 99.8%）。
+- CPU 侧 146.1s = `242.837 − 96.700(GPU wait)` → **60% 的 VAE 阶段在搬权重**。
+- 代码注释自述"lost overlap only marginally slows"的判断是**错的**（实测 60%）。
+
+### Phase 48: block-major 重构（per-chunk 粒度） — complete
+- 抽出 `pack_hidden` / `finish_hidden`；新增 `run_stream_chunk`：块循环提到外层，
+  每块加载一次、对全部 tile 各跑一遍。
+- 关键实现约束：`h3_gpu_copy_f32` 必须与 `pack_hidden` 在**同一命令缓冲**内（首次漏了导致空错误退出）。
+- 结果：864 → **108 次 load**，242.8 → **116.5s**，SSIM 1.0。
+
+### Phase 49: 跨 chunk 复用（36 次 load，理论下限） — complete
+- `decode_chunked` 先打包全部 chunk 的 states（3×8=24 个，400 MB）→ 一次块遍历 →
+  再按原顺序 finish/stitch（时间融合有 chunk 间依赖，未动）。
+- 结果：**103.5s（−57.4%）**，alloc 216.5 → 9.784 GiB，peak 0.654 → 1.025 GiB，submissions 912 → 84。
+- 1 GiB states 上限 + 两级回退（per-chunk → per-tile）。
+
+### Phase 50: resident decoder 路径同步 + 测试补齐 — complete
+- `decoder_decode_chunk` 加 `states` 参数（NULL = 原行为）；`h3_video_vae_decoder_decode` 接入跨 chunk。
+- 该路径 CLI 不可达（`preview_denoise` 需真终端、`h3_terminal_detect()` 非交互返回 NONE；
+  `model_cache_enabled` 无 CLI 调用者）→ 用测试覆盖。
+- 新增 `tests/test_semantic_vae.c --streaming-parity` + 合成 fixture；
+  `Makefile` 加 `VIDEO_VAE_MODEL` 变量 + 测试钩子。
+- 验证：**两条流式路径逐字节一致**（`memcmp` 整帧）。
+
+### Phase 51: DiT GPU 侧 A/B — complete
+- 踩坑：自适应驻留漂移（peak 6.1~11.1 GiB）→ 首轮 A/B 得到 **314s 假数据 + 一次 OOM**。
+- 钉住 `H3_DIT_RESIDENT_BLOCKS=6` 后 peak 稳定 6.096~6.099 GiB，数据才可比。
+
+### Phase 52: 分辨率 vs 瓶颈翻转 — complete
+- 576×320/10 步/combo：`unhidden wait` 0.010s → **33.227s**，I/O 反超 GPU。
+
+## DiT A/B 实测（864×480×22，`H3_DIT_RESIDENT_BLOCKS=6`）
+| 配置 | 2 步 | 20 步 | vs base |
+|---|---|---|---|
+| base | 75.015s | 775.689s | — |
+| `--layers 45` | 67.838s (−9.6%) | — | — |
+| `--token-reduction` | 49.076s (−34.6%) | — | — |
+| `--reuse 2` | 75.468s（2 步下无效，无步可跳） | **419.618s** | **−45.9%** |
+| combo（三者叠加） | 44.149s (−41.1%) | **273.959s** | **−64.7%** |
+
+dispatch 交叉验证：base `linear=4000`（20×50×4）；`reuse 2` → `2200`（**只跑 11 次前向**）；combo → `1980`（11×45×4）。
+
+## 每步评估的 I/O 下限（分辨率无关）
+| 配置 | 每次评估 | 耗时 @0.997 GiB/s |
+|---|---|---|
+| `--layers 50` | ~16.0 GiB | ~16.0s |
+| `--layers 45` | ~14.4 GiB | ~14.4s |
+| `--layers 40` | ~12.8 GiB | ~12.8s |
+
+10 步 + `--reuse 2` = 6 次评估 → 86.4s，**实测 86.741s**（吻合）。
+
+## Decisions Made（本任务）
+| Decision | Rationale |
+|---|---|
+| 跨 chunk **默认开启、无开关** | 触发条件纯运行时判定（streaming + states ≤ 1 GiB），与 `--video-vae-streaming` 正交 |
+| states 上限 **1 GiB** | 16 GiB 机器余量；超限回退 per-chunk（仍比 per-tile 快 8 倍） |
+| 保留 per-tile 路径 | 作为 ≥1080p / 长视频（>8s）的回退 |
+| 放弃 `H3_VAE_TILE_PIXELS=512` | block-major 后 load 次数与 tile 数无关，而 512 让 GPU wait +20s |
+| DiT 侧不引入新开关 | `--token-reduction/--layers/--reuse` 已覆盖，且三者均为有损 |
+
+## Errors Encountered（本任务）
+| Error | Attempt | Resolution |
+|---|---|---|
+| `stream chunk calls: 0`（新路径未生效） | 1 | 实际走 `decode_chunked` 而非 `decoder_decode_chunk`，**两条入口都要改** |
+| 首个 tile 后 `exit=1`、`h3:` 后错误信息为空 | 1 | `h3_gpu_copy_f32` 被放在 `submit` 之后 → 移入同一命令缓冲 |
+| `--layers 45` 跑出 314s（应 −10%） | 1 | 自适应驻留漂移 + swap → 钉住 `H3_DIT_RESIDENT_BLOCKS=6` |
+| `--token-reduction` `exit=137`（OOM） | 1 | 同上 |
+| `--show` 无法触发 resident 路径 | 3 | `h3_terminal_detect()` 非交互返回 NONE（`script` 造 pty 亦无效）→ 改用测试覆盖 |
+| `--render-width 432×240` 被拒 | 1 | 非 32 倍数；合法档位仅 288×160 / 576×320 / 864×480 |
+| `h3_semantic_vae_test` 缺 fixture | 1 | 生成合成 latent（parity 测试只需路径一致，不需 MLX 真值） |
+
+## 本轮改动文件
+| 文件 | 改动 |
+|---|---|
+| `h3_video_vae.c` | 净 +~400 行：`pack_hidden`/`finish_hidden`/`pack_chunk_states`/`finish_chunk_states`/`run_stream_chunk`；`decode_chunk_streaming` 重写；`decode_chunked` + `h3_video_vae_decoder_decode` 接入跨 chunk |
+| `tests/test_semantic_vae.c` | +56 行，`--streaming-parity` |
+| `Makefile` | +9 行，`VIDEO_VAE_MODEL` 变量 + 测试钩子 |
+| `misc/fixtures/h3_vae_streaming_parity_256x256x39_f32.safetensors` | 新增（合成 latent，seed 20260916） |
+
+## Next
+1. **DiT 侧决策**：三开关均有损。combo 画质 PSNR 14.54 dB（vs base）、SSIM 0.643，
+   但**目视结构完整、仅运动相位偏移**（`/tmp/s20cmp_*.png`）。保守选项：
+   `--reuse 1 --token-reduction --layers 45`（−41%，无跨步外推）。
+2. **1 GiB states 上限**：长视频（>8s）/1080p 会回退到 per-chunk，可考虑放宽或按可用内存自适应。
+3. **低分辨率 I/O bound**：576×320 档已贴住 I/O 下限（86.7s），进一步只能动 `--layers`/`--reuse`，
+   `--token-reduction` 在此档基本无效。

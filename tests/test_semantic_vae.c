@@ -99,9 +99,65 @@ static void test_resident_preview(const char *model_root) {
     puts("ok: resident VAE preview and final decode are byte-identical");
 }
 
+/* Streaming parity: the resident decoder object and the one-shot entry point
+ * must produce exactly the same frames when both stream. This is the coverage
+ * for the cross-chunk block-major path inside h3_video_vae_decoder_decode,
+ * which the CLI cannot reach (it needs preview_denoise or a model cache). A
+ * synthetic latent suffices because only path agreement is asserted here, not
+ * any MLX reference. */
+static void test_streaming_parity(const char *weights,
+                                  const char *fixture_path) {
+    enum {
+        TEST_T = 12,
+        TEST_FRAMES = 39,
+        TEST_LATENTS = 24 * TEST_T * LATENT_H * LATENT_W,
+        TEST_PIXELS = 3 * TEST_FRAMES * HEIGHT * WIDTH
+    };
+    char error[512];
+    h3_st_header fixture;
+    if (!h3_st_read_header(fixture_path, &fixture, error, sizeof(error)))
+        die(error);
+    float *latent = load_f32(&fixture, "x.latent", TEST_LATENTS);
+    h3_video_frames ordinary;
+    if (!h3_video_vae_decode(weights, "h3_shaders.metal", latent,
+                             TEST_T, LATENT_H, LATENT_W, progress, NULL, 1,
+                             &ordinary, NULL, NULL, error, sizeof(error)))
+        die(error);
+    if (ordinary.frames != TEST_FRAMES || ordinary.height != HEIGHT ||
+        ordinary.width != WIDTH)
+        die("streamed VAE returned the wrong shape");
+    h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
+        weights, "h3_shaders.metal", LATENT_H, LATENT_W,
+        progress, NULL, 1, error, sizeof(error));
+    if (!decoder) die(error);
+    h3_video_frames resident;
+    if (!h3_video_vae_decoder_decode(
+            decoder, latent, TEST_T, &resident, NULL, NULL,
+            error, sizeof(error))) die(error);
+    if (resident.frames != ordinary.frames ||
+        resident.height != ordinary.height ||
+        resident.width != ordinary.width ||
+        memcmp(resident.rgb, ordinary.rgb,
+               (size_t)TEST_PIXELS * sizeof(*resident.rgb)))
+        die("resident streamed decode differs from the one-shot streamed path");
+    h3_video_frames_free(&resident);
+    h3_video_frames_free(&ordinary);
+    h3_video_vae_decoder_free(decoder);
+    h3_st_free_header(&fixture);
+    free(latent);
+    puts("ok: resident and one-shot streamed VAE decodes are byte-identical");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--resident-preview")) {
         test_resident_preview(argc > 2 ? argv[2] : "MiniMax-H3");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--streaming-parity")) {
+        test_streaming_parity(
+            argc > 2 ? argv[2] : "MiniMax-H3/FL2VA/video_vae/source",
+            argc > 3 ? argv[3] :
+                "misc/fixtures/h3_vae_streaming_parity_256x256x39_f32.safetensors");
         return 0;
     }
     const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";

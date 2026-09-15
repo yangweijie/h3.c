@@ -617,10 +617,49 @@ static int run_resident_tile(vae_context *vae, char *error,
     return 1;
 }
 
-/* Streaming tiled decode: exactly like run_resident, each transformer block is
- * loaded, run, then freed immediately, so only ~1 block is resident at a time.
- * Used when the decoder is opened with streaming=1 to avoid the ~9 GiB fixed
- * VAE footprint. */
+/* Build the block stack's input hidden state for whichever tile currently sits
+ * in vae->latent: latent embedding, the register tokens, and the single zero
+ * suffix token. Shared by the per-tile and block-major streamed paths. */
+static int pack_hidden(vae_context *vae, const h3_gpu_tensor *zero,
+                       char *error, size_t error_size) {
+#define OP(call, label) do {                                                    \
+    if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
+} while (0)
+    OP(h3_gpu_linear_f32(vae->gpu, vae->post, vae->latent, vae->post_w,
+        vae->post_b, vae->patches, LATENT_CHANNELS, LATENT_CHANNELS),
+       "streamed video VAE post-quant projection");
+    OP(h3_gpu_linear_f32(vae->gpu, vae->patch_hidden, vae->post, vae->embed_w,
+        vae->embed_b, vae->patches, LATENT_CHANNELS, HIDDEN),
+       "streamed video VAE latent embedding");
+    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden, 0, vae->patch_hidden, 0,
+        (size_t)vae->patches * HIDDEN), "pack streamed video VAE patches");
+    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
+        (size_t)vae->patches * HIDDEN, vae->registers, 0,
+        REGISTERS * HIDDEN), "pack streamed video VAE registers");
+    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
+        (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
+       "pack streamed video VAE suffix");
+#undef OP
+    return 1;
+}
+
+/* Final LayerNorm plus output projection for the tile currently in vae->hidden;
+ * leaves that tile's patch rows in vae->projected for the caller to unpack. */
+static int finish_hidden(vae_context *vae, char *error, size_t error_size) {
+    if (!gpu_op(vae, h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
+            vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
+            error, error_size, "streamed video VAE output LayerNorm"))
+        return 0;
+    return gpu_op(vae, h3_gpu_linear_f32(vae->gpu, vae->projected, vae->norm,
+            vae->proj_w, vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
+            error, error_size, "streamed video VAE output projection");
+}
+
+/* Per-tile streaming decode: exactly like run_resident, each transformer block
+ * is loaded, run, then freed immediately, so only ~1 block is resident at a
+ * time. Used when the decoder is opened with streaming=1 to avoid the ~9 GiB
+ * fixed VAE footprint. This walks the whole 36-block stack once per tile;
+ * run_stream_chunk amortizes that across the tiles of a chunk instead. */
 static int run_stream_tile(vae_context *vae, char *error,
                            size_t error_size) {
     float zeros[HIDDEN];
@@ -636,20 +675,10 @@ static int run_stream_tile(vae_context *vae, char *error,
     }                                                                           \
 } while (0)
     OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE decoder");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->post, vae->latent, vae->post_w,
-        vae->post_b, vae->patches, LATENT_CHANNELS, LATENT_CHANNELS),
-       "streamed video VAE post-quant projection");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->patch_hidden, vae->post, vae->embed_w,
-        vae->embed_b, vae->patches, LATENT_CHANNELS, HIDDEN),
-       "streamed video VAE latent embedding");
-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden, 0, vae->patch_hidden, 0,
-        (size_t)vae->patches * HIDDEN), "pack streamed video VAE patches");
-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
-        (size_t)vae->patches * HIDDEN, vae->registers, 0,
-        REGISTERS * HIDDEN), "pack streamed video VAE registers");
-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
-        (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
-       "pack streamed video VAE suffix");
+    if (!pack_hidden(vae, zero, error, error_size)) {
+        h3_gpu_tensor_free(zero);
+        return 0;
+    }
     /* Serial VAE decode: load -> run -> free each block. The async prefetch path
      * was removed because its worker thread touched the shared vae->gpu while the
      * main thread held an open command buffer, racing and crashing. Serial decode
@@ -687,15 +716,58 @@ static int run_stream_tile(vae_context *vae, char *error,
         free_block(&vae->blocks[index]);
     }
     OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE output");
-    OP(h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
-        vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
-       "streamed video VAE output LayerNorm");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->projected, vae->norm, vae->proj_w,
-        vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
-       "streamed video VAE output projection");
+    if (!finish_hidden(vae, error, error_size)) {
+        h3_gpu_tensor_free(zero);
+        return 0;
+    }
     OP(h3_gpu_submit(vae->gpu), "submit streamed video VAE decoder");
     h3_gpu_tensor_free(zero);
 #undef OP
+    return 1;
+}
+
+/* Block-major streaming decode over a set of packed hidden states: each decoder
+ * block is loaded once and applied to every state, which cuts weight re-reads
+ * from states * LAYERS down to LAYERS. Callers pass one chunk's worth of tiles,
+ * or every chunk's when they can afford to hold them all. The per-state
+ * arithmetic is identical to run_stream_tile, so the decoded frames match that
+ * path byte for byte. */
+static int run_stream_chunk(vae_context *vae, int state_count,
+                            h3_gpu_tensor **states, char *error,
+                            size_t error_size) {
+    size_t state_elements = (size_t)vae->sequence * HIDDEN;
+    for (int index = 0; index < LAYERS; index++) {
+        if (!load_block(vae, index, error, error_size)) return 0;
+        if (index == 0 && getenv("H3_PROFILE")) {
+            vae_block *b = &vae->blocks[0];
+            size_t blk = 0;
+#define VB(f) blk += tensor_bytes(b->f);
+            VB(norm1) VB(qkv_w) VB(qkv_b) VB(out_w) VB(out_b) VB(scale1)
+            VB(norm2) VB(w1) VB(w1_b) VB(w2) VB(w2_b) VB(scale2)
+#undef VB
+            fprintf(stderr, "h3: [vae-debug] stream chunk: per-block_bytes=%zu "
+                    "states=%d patches=%u sequence=%u\n", blk, state_count,
+                    vae->patches, vae->sequence);
+        }
+        if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
+                    "begin streamed video VAE transformer block"))
+            return 0;
+        for (int state = 0; state < state_count; state++) {
+            if (!gpu_op(vae, h3_gpu_copy_f32(vae->gpu, vae->hidden, 0,
+                        states[state], 0, state_elements), error, error_size,
+                        "restore streamed video VAE tile state"))
+                return 0;
+            if (!run_block(vae, index, error, error_size)) return 0;
+            if (!gpu_op(vae, h3_gpu_copy_f32(vae->gpu, states[state], 0,
+                        vae->hidden, 0, state_elements), error, error_size,
+                        "save streamed video VAE tile state"))
+                return 0;
+        }
+        if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
+                    "submit streamed video VAE block"))
+            return 0;
+        free_block(&vae->blocks[index]);
+    }
     return 1;
 }
 
@@ -951,10 +1023,135 @@ static int stitch_tiles(float **tiles, const tile_axis *y_axis,
     return 1;
 }
 
+/* Pack one chunk's per-tile hidden states into `states`, which the caller has
+ * already sized to the tile count. The embedding buffers are reused per tile,
+ * so each tile's state is copied out inside the same command buffer as its
+ * prep. Split out from decode_chunk_streaming so decode_chunked can pack every
+ * chunk first and then walk the block stack only once for the whole clip. */
+static int pack_chunk_states(vae_context *vae,
+                             const float *normalized_latent,
+                             int latent_time, int full_h, int full_w, int chunk,
+                             const float *mean, const float *deviation,
+                             const tile_axis *y_axis, const tile_axis *x_axis,
+                             h3_gpu_tensor **states,
+                             char *error, size_t error_size) {
+    const size_t state_elements = (size_t)vae->sequence * HIDDEN;
+    float zeros[HIDDEN];
+    memset(zeros, 0, sizeof(zeros));
+    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    int ok = 0;
+    if (!zero) {
+        fail(error, error_size, "cannot allocate video VAE suffix token");
+        return 0;
+    }
+    for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
+        for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
+            int index = tile_y * x_axis->count + tile_x;
+            float *input = extract_latent_tile(
+                normalized_latent, latent_time, full_h, full_w, chunk * 5,
+                y_axis->starts[tile_y] / SPATIAL_RATIO,
+                x_axis->starts[tile_x] / SPATIAL_RATIO,
+                CHUNK_LATENT_TIME, vae->latent_h, vae->latent_w,
+                error, error_size);
+            if (!input) goto done;
+            free_tensor(&vae->latent);
+            int prepared = prepare_input(vae, input, mean, deviation, error,
+                                         error_size);
+            free(input);
+            if (!prepared) goto done;
+            if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
+                        "begin streamed video VAE tile prep")) goto done;
+            if (!pack_hidden(vae, zero, error, error_size)) goto done;
+            if (!gpu_op(vae, h3_gpu_copy_f32(vae->gpu, states[index], 0,
+                        vae->hidden, 0, state_elements), error, error_size,
+                        "save streamed video VAE tile state")) goto done;
+            if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
+                        "submit streamed video VAE tile prep")) goto done;
+        }
+    ok = 1;
+done:
+    h3_gpu_tensor_free(zero);
+    return ok;
+}
+
+/* Finish and unpack one chunk's tiles from the states pack_chunk_states left
+ * behind: the LayerNorm/projection tail plus the patch unpack per tile. */
+static int finish_chunk_states(vae_context *vae, h3_gpu_tensor **states,
+                               int selected_frame, const tile_axis *y_axis,
+                               const tile_axis *x_axis, float **tiles,
+                               char *error, size_t error_size) {
+    const size_t state_elements = (size_t)vae->sequence * HIDDEN;
+    for (int tile_y = 0; tile_y < y_axis->count; tile_y++)
+        for (int tile_x = 0; tile_x < x_axis->count; tile_x++) {
+            int index = tile_y * x_axis->count + tile_x;
+            if (!gpu_op(vae, h3_gpu_begin(vae->gpu), error, error_size,
+                        "begin streamed video VAE tile output"))
+                return 0;
+            if (!gpu_op(vae, h3_gpu_copy_f32(vae->gpu, vae->hidden, 0,
+                        states[index], 0, state_elements), error, error_size,
+                        "restore streamed video VAE tile state"))
+                return 0;
+            if (!finish_hidden(vae, error, error_size)) return 0;
+            if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,
+                        "submit streamed video VAE tile output"))
+                return 0;
+            h3_video_frames tile;
+            memset(&tile, 0, sizeof(tile));
+            if (selected_frame >= 0 ?
+                    !unpack_frame_range(vae, selected_frame, 1, &tile,
+                                        error, error_size) :
+                    !unpack_frames(vae, &tile, error, error_size))
+                return 0;
+            tiles[index] = tile.rgb;
+        }
+    return 1;
+}
+
+/* Block-major streaming decode of a single chunk, shared by both decode entry
+ * points: pack every tile's hidden state, walk the block stack once for all of
+ * them, then finish and unpack each tile. The caller only routes here when the
+ * VAE streams and the retained state fits the budget it checked. */
+static int decode_chunk_streaming(vae_context *vae,
+                                  const float *normalized_latent,
+                                  int latent_time, int full_h, int full_w,
+                                  int chunk, int selected_frame,
+                                  const float *mean, const float *deviation,
+                                  const tile_axis *y_axis,
+                                  const tile_axis *x_axis,
+                                  int tile_count, float **tiles,
+                                  char *error, size_t error_size) {
+    const size_t state_elements = (size_t)vae->sequence * HIDDEN;
+    h3_gpu_tensor **states = calloc((size_t)tile_count, sizeof(*states));
+    int ok = 0;
+    if (!states) {
+        fail(error, error_size, "out of memory retaining video VAE tile states");
+        return 0;
+    }
+    for (int index = 0; index < tile_count; index++) {
+        states[index] = h3_gpu_tensor_new_f32(vae->gpu, state_elements);
+        if (!states[index]) {
+            fail(error, error_size, "cannot allocate video VAE tile state");
+            goto done;
+        }
+    }
+    ok = pack_chunk_states(vae, normalized_latent, latent_time, full_h, full_w,
+                           chunk, mean, deviation, y_axis, x_axis, states,
+                           error, error_size) &&
+         run_stream_chunk(vae, tile_count, states, error, error_size) &&
+         finish_chunk_states(vae, states, selected_frame, y_axis, x_axis,
+                             tiles, error, error_size);
+done:
+    for (int index = 0; index < tile_count; index++)
+        if (states[index]) h3_gpu_tensor_free(states[index]);
+    free(states);
+    return ok;
+}
+
 static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
                                 const float *normalized_latent,
                                 int latent_time, int chunk,
                                 int selected_frame,
+                                h3_gpu_tensor **states,
                                 h3_video_frames *output,
                                 char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
@@ -971,40 +1168,60 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
         return 0;
     }
     int frame_count = selected_frame >= 0 ? 1 : FIRST_CHUNK_FRAMES;
+    /* Retaining one hidden state per tile lets the block stack be walked once
+     * for the whole chunk. Cap that at 1 GiB and otherwise fall back to the
+     * per-tile path, which re-reads the weights but holds a single state. */
+    size_t state_bytes = (size_t)tile_count * (size_t)decoder->vae.sequence *
+                         HIDDEN * sizeof(float);
     int ok = 1;
-    for (int tile_y = 0; tile_y < decoder->y_axis.count && ok; tile_y++)
-        for (int tile_x = 0; tile_x < decoder->x_axis.count && ok; tile_x++) {
-            float *input = extract_latent_tile(
-                normalized_latent, latent_time, decoder->latent_h,
-                decoder->latent_w, chunk * 5,
-                decoder->y_axis.starts[tile_y] / SPATIAL_RATIO,
-                decoder->x_axis.starts[tile_x] / SPATIAL_RATIO,
-                CHUNK_LATENT_TIME, decoder->vae.latent_h,
-                decoder->vae.latent_w, error, error_size);
-            if (!input) {
-                ok = 0;
-                break;
+    if (states) {
+        /* The caller already packed this chunk's states and walked the block
+         * stack once for every chunk. */
+        ok = finish_chunk_states(&decoder->vae, states, selected_frame,
+                                 &decoder->y_axis, &decoder->x_axis, tiles,
+                                 error, error_size);
+    } else if (decoder->vae.streaming && state_bytes <= ((size_t)1 << 30)) {
+        ok = decode_chunk_streaming(&decoder->vae, normalized_latent,
+                                    latent_time, decoder->latent_h,
+                                    decoder->latent_w, chunk, selected_frame,
+                                    decoder->latent_mean, decoder->latent_std,
+                                    &decoder->y_axis, &decoder->x_axis,
+                                    tile_count, tiles, error, error_size);
+    } else {
+        for (int tile_y = 0; tile_y < decoder->y_axis.count && ok; tile_y++)
+            for (int tile_x = 0; tile_x < decoder->x_axis.count && ok; tile_x++) {
+                float *input = extract_latent_tile(
+                    normalized_latent, latent_time, decoder->latent_h,
+                    decoder->latent_w, chunk * 5,
+                    decoder->y_axis.starts[tile_y] / SPATIAL_RATIO,
+                    decoder->x_axis.starts[tile_x] / SPATIAL_RATIO,
+                    CHUNK_LATENT_TIME, decoder->vae.latent_h,
+                    decoder->vae.latent_w, error, error_size);
+                if (!input) {
+                    ok = 0;
+                    break;
+                }
+                free_tensor(&decoder->vae.latent);
+                ok = prepare_input(&decoder->vae, input,
+                                   decoder->latent_mean, decoder->latent_std,
+                                   error, error_size) &&
+                     (decoder->vae.streaming
+                        ? run_stream_tile(&decoder->vae, error, error_size)
+                        : run_resident_tile(&decoder->vae, error, error_size));
+                free(input);
+                if (!ok) break;
+                h3_video_frames tile;
+                memset(&tile, 0, sizeof(tile));
+                ok = selected_frame >= 0 ?
+                    unpack_frame_range(&decoder->vae, selected_frame, 1, &tile,
+                                       error, error_size) :
+                    unpack_frames(&decoder->vae, &tile, error, error_size);
+                if (ok) {
+                    int index = tile_y * decoder->x_axis.count + tile_x;
+                    tiles[index] = tile.rgb;
+                }
             }
-            free_tensor(&decoder->vae.latent);
-            ok = prepare_input(&decoder->vae, input,
-                               decoder->latent_mean, decoder->latent_std,
-                               error, error_size) &&
-                 (decoder->vae.streaming
-                    ? run_stream_tile(&decoder->vae, error, error_size)
-                    : run_resident_tile(&decoder->vae, error, error_size));
-            free(input);
-            if (!ok) break;
-            h3_video_frames tile;
-            memset(&tile, 0, sizeof(tile));
-            ok = selected_frame >= 0 ?
-                unpack_frame_range(&decoder->vae, selected_frame, 1, &tile,
-                                   error, error_size) :
-                unpack_frames(&decoder->vae, &tile, error, error_size);
-            if (ok) {
-                int index = tile_y * decoder->x_axis.count + tile_x;
-                tiles[index] = tile.rgb;
-            }
-        }
+    }
     if (ok) ok = stitch_tiles(tiles, &decoder->y_axis, &decoder->x_axis,
                               frame_count, output, error, error_size);
     for (int index = 0; index < tile_count; index++) free(tiles[index]);
@@ -1108,7 +1325,7 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
     int global_frame = chunk * 17 + local_frame;
     if (global_frame >= output_frames) global_frame = output_frames - 1;
     int ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
-                                  chunk, local_frame, output,
+                                  chunk, local_frame, NULL, output,
                                   error, error_size);
     if (ok) *output_frame_index = global_frame;
     return ok;
@@ -1144,15 +1361,62 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
         return 0;
     }
     int ok = 1;
+    /* Cross-chunk weight reuse, mirroring decode_chunked: holding every chunk's
+     * tile states lets the block stack be walked once for the whole clip. */
+    int tile_count = decoder->y_axis.count * decoder->x_axis.count;
+    const size_t state_elements = (size_t)decoder->vae.sequence * HIDDEN;
+    size_t state_count = (size_t)chunks * (size_t)tile_count;
+    size_t states_bytes = state_count * state_elements * sizeof(float);
+    int cross_chunk = decoder->vae.streaming &&
+                      states_bytes <= ((size_t)1 << 30);
+    h3_gpu_tensor **states = NULL;
+    if (cross_chunk) {
+        states = calloc(state_count, sizeof(*states));
+        if (!states) {
+            fail(error, error_size, "out of memory retaining video VAE states");
+            ok = 0;
+        }
+        for (size_t index = 0; ok && index < state_count; index++) {
+            states[index] = h3_gpu_tensor_new_f32(decoder->vae.gpu,
+                                                  state_elements);
+            if (!states[index]) {
+                fail(error, error_size, "cannot allocate video VAE tile state");
+                ok = 0;
+            }
+        }
+        for (int chunk = 0; ok && chunk < chunks; chunk++) {
+            if (!h3_host_memory_guard("video VAE decode", error, error_size)) {
+                ok = 0;
+                break;
+            }
+            ok = pack_chunk_states(
+                &decoder->vae, normalized_latent, latent_time,
+                decoder->latent_h, decoder->latent_w, chunk,
+                decoder->latent_mean, decoder->latent_std, &decoder->y_axis,
+                &decoder->x_axis,
+                states + (size_t)chunk * (size_t)tile_count, error,
+                error_size);
+        }
+        if (ok)
+            ok = run_stream_chunk(&decoder->vae, (int)state_count, states,
+                                  error, error_size);
+        if (ok && getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: resident video VAE cross-chunk reuse: %d "
+                    "chunks x %d tiles, %d block passes\n", chunks, tile_count,
+                    LAYERS);
+    }
     for (int chunk = 0; chunk < chunks && ok; chunk++) {
         h3_video_frames decoded;
         memset(&decoded, 0, sizeof(decoded));
-        if (!h3_host_memory_guard("video VAE decode", error, error_size)) {
+        if (!cross_chunk &&
+            !h3_host_memory_guard("video VAE decode", error, error_size)) {
             ok = 0;
             break;
         }
-        ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
-                                  chunk, -1, &decoded, error, error_size);
+        ok = decoder_decode_chunk(
+            decoder, normalized_latent, latent_time, chunk, -1,
+            states ? states + (size_t)chunk * (size_t)tile_count : NULL,
+            &decoded, error, error_size);
         if (!ok) break;
         if (chunk) for (int frame = 0; frame < 5; frame++) {
             float alpha = (float)frame / 5.0f;
@@ -1189,6 +1453,11 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     }
     free(final_rgb);
     free(temporal_overlap);
+    if (states) {
+        for (size_t index = 0; index < state_count; index++)
+            if (states[index]) h3_gpu_tensor_free(states[index]);
+        free(states);
+    }
     if (!ok) h3_video_frames_free(output);
     return ok;
 }
@@ -1261,8 +1530,50 @@ static int decode_chunked(const char *weight_directory,
         fail(error, error_size, "out of memory retaining decoded video frames");
         ok = 0;
     }
+    /* Cross-chunk weight reuse: holding every chunk's tile states lets the block
+     * stack be walked once for the whole clip instead of once per chunk, which
+     * divides the weight re-reads by the chunk count again. Falls back to the
+     * per-chunk path when that state would exceed the budget. */
+    const size_t state_elements = (size_t)vae.sequence * HIDDEN;
+    size_t states_bytes = (size_t)chunks * (size_t)tile_count *
+                          state_elements * sizeof(float);
+    size_t state_count = (size_t)chunks * (size_t)tile_count;
+    int cross_chunk = ok && vae.streaming && states_bytes <= ((size_t)1 << 30);
+    h3_gpu_tensor **states = NULL;
+    if (cross_chunk) {
+        states = calloc(state_count, sizeof(*states));
+        if (!states) {
+            fail(error, error_size, "out of memory retaining video VAE states");
+            ok = 0;
+        }
+        for (size_t index = 0; ok && index < state_count; index++) {
+            states[index] = h3_gpu_tensor_new_f32(vae.gpu, state_elements);
+            if (!states[index]) {
+                fail(error, error_size, "cannot allocate video VAE tile state");
+                ok = 0;
+            }
+        }
+        for (int chunk = 0; ok && chunk < chunks; chunk++) {
+            if (!h3_host_memory_guard("video VAE decode", error, error_size)) {
+                ok = 0;
+                break;
+            }
+            ok = pack_chunk_states(&vae, normalized_latent, latent_time,
+                                   latent_height, latent_width, chunk,
+                                   latent_mean, latent_std, &y_axis, &x_axis,
+                                   states + (size_t)chunk * (size_t)tile_count,
+                                   error, error_size);
+        }
+        if (ok)
+            ok = run_stream_chunk(&vae, (int)state_count, states, error,
+                                  error_size);
+        if (ok && getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: video VAE cross-chunk reuse: %d chunks x %d "
+                    "tiles, %d block passes\n", chunks, tile_count, LAYERS);
+    }
     for (int chunk = 0; chunk < chunks && ok; chunk++) {
-        if (!h3_host_memory_guard("video VAE decode", error, error_size)) {
+        if (!cross_chunk &&
+            !h3_host_memory_guard("video VAE decode", error, error_size)) {
             ok = 0;
             break;
         }
@@ -1272,34 +1583,48 @@ static int decode_chunked(const char *weight_directory,
             ok = 0;
             break;
         }
-        for (int tile_y = 0; tile_y < y_axis.count && ok; tile_y++)
-            for (int tile_x = 0; tile_x < x_axis.count && ok; tile_x++) {
-                float *input = extract_latent_tile(normalized_latent,
-                    latent_time, latent_height, latent_width, chunk * 5,
-                    y_axis.starts[tile_y] / SPATIAL_RATIO,
-                    x_axis.starts[tile_x] / SPATIAL_RATIO,
-                    CHUNK_LATENT_TIME, vae.latent_h, vae.latent_w,
-                    error, error_size);
-                if (!input) {
-                    ok = 0;
-                    break;
+        size_t state_bytes = (size_t)tile_count * state_elements *
+                             sizeof(float);
+        if (cross_chunk) {
+            ok = finish_chunk_states(
+                &vae, states + (size_t)chunk * (size_t)tile_count, -1, &y_axis,
+                &x_axis, tiles, error, error_size);
+        } else if (vae.streaming && state_bytes <= ((size_t)1 << 30)) {
+            ok = decode_chunk_streaming(&vae, normalized_latent, latent_time,
+                                        latent_height, latent_width, chunk, -1,
+                                        latent_mean, latent_std, &y_axis,
+                                        &x_axis, tile_count, tiles,
+                                        error, error_size);
+        } else {
+            for (int tile_y = 0; tile_y < y_axis.count && ok; tile_y++)
+                for (int tile_x = 0; tile_x < x_axis.count && ok; tile_x++) {
+                    float *input = extract_latent_tile(normalized_latent,
+                        latent_time, latent_height, latent_width, chunk * 5,
+                        y_axis.starts[tile_y] / SPATIAL_RATIO,
+                        x_axis.starts[tile_x] / SPATIAL_RATIO,
+                        CHUNK_LATENT_TIME, vae.latent_h, vae.latent_w,
+                        error, error_size);
+                    if (!input) {
+                        ok = 0;
+                        break;
+                    }
+                    free_tensor(&vae.latent);
+                    ok = prepare_input(&vae, input, latent_mean, latent_std,
+                                       error, error_size) &&
+                         (vae.streaming
+                            ? run_stream_tile(&vae, error, error_size)
+                            : run_resident_tile(&vae, error, error_size));
+                    free(input);
+                    if (!ok) break;
+                    h3_video_frames tile;
+                    memset(&tile, 0, sizeof(tile));
+                    ok = unpack_frames(&vae, &tile, error, error_size);
+                    if (ok) {
+                        int index = tile_y * x_axis.count + tile_x;
+                        tiles[index] = tile.rgb;
+                    }
                 }
-                free_tensor(&vae.latent);
-                ok = prepare_input(&vae, input, latent_mean, latent_std,
-                                   error, error_size) &&
-                     (vae.streaming
-                        ? run_stream_tile(&vae, error, error_size)
-                        : run_resident_tile(&vae, error, error_size));
-                free(input);
-                if (!ok) break;
-                h3_video_frames tile;
-                memset(&tile, 0, sizeof(tile));
-                ok = unpack_frames(&vae, &tile, error, error_size);
-                if (ok) {
-                    int index = tile_y * x_axis.count + tile_x;
-                    tiles[index] = tile.rgb;
-                }
-            }
+        }
         h3_video_frames decoded;
         memset(&decoded, 0, sizeof(decoded));
         if (ok) ok = stitch_tiles(tiles, &y_axis, &x_axis,
@@ -1346,6 +1671,11 @@ static int decode_chunked(const char *weight_directory,
     }
     free(final_rgb);
     free(temporal_overlap);
+    if (states) {
+        for (size_t index = 0; index < state_count; index++)
+            if (states[index]) h3_gpu_tensor_free(states[index]);
+        free(states);
+    }
     cleanup(&vae);
     tile_axis_free(&y_axis); tile_axis_free(&x_axis);
     return ok;
