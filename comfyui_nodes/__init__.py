@@ -20,7 +20,8 @@
 3. R2V 需安装 `Ref2VA/` 权重。
 """
 from .h3_binary import (H3_BinaryT2V, H3_BinaryR2V, H3_BinaryInfo, H3_BinaryNote,
-                         H3_BinaryLatent, H3_BinaryLatentUpscale, H3_BinaryLatentDecode)
+                        H3_BinaryLatent, H3_BinaryLatentUpscale, H3_BinaryLatentDecode,
+                        H3_BinaryLatentRefine)
 
 NODE_CLASS_MAPPINGS = {
     "H3_BinaryT2V": H3_BinaryT2V,
@@ -30,6 +31,7 @@ NODE_CLASS_MAPPINGS = {
     "H3_BinaryLatent": H3_BinaryLatent,
     "H3_BinaryLatentUpscale": H3_BinaryLatentUpscale,
     "H3_BinaryLatentDecode": H3_BinaryLatentDecode,
+    "H3_BinaryLatentRefine": H3_BinaryLatentRefine,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -40,6 +42,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3_BinaryLatent": "H3 Engine Latent (C binary)",
     "H3_BinaryLatentUpscale": "H3 Latent Upscale",
     "H3_BinaryLatentDecode": "H3 Latent Decode (C binary)",
+    "H3_BinaryLatentRefine": "H3 Latent Refine (C binary)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

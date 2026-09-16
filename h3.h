@@ -150,6 +150,12 @@ typedef struct {
     /* Decode a pre-existing latent file (written by --latent-out) straight to
      * video, skipping denoising entirely. Requires --output/-o. */
     const char *latent_in_path;
+    /* Together with --latent-in: treat that latent as a clean img2img starting
+     * point instead of decoding it -- re-noise it to this sigma and run
+     * --steps denoising passes from there. This is the refine half of a
+     * "generate small, upscale the latent, refine" pipeline. 0 (the default)
+     * keeps the plain decode behaviour. */
+    float refine_sigma;
     /* Pipeline mode: write the denoised latent to --latent-out, free the
      * latents and all weights, then re-read from disk for VAE decode. Keeps
      * the denoise and decode phases from competing for RAM. Requires
@@ -166,7 +172,7 @@ typedef struct {
     .core_reuse = 1, \
     .video_vae_streaming = -1, \
     .memory_plan_auto = 1, \
-    .latent_out_path = NULL, .latent_in_path = NULL, \
+    .latent_out_path = NULL, .latent_in_path = NULL, .refine_sigma = 0.0f, \
     .pipeline = 0, \
 }
 

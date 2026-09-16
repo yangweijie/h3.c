@@ -1221,6 +1221,75 @@ static int write_latent_bundle(const char *path, const float *video,
 static float *read_latent_bundle(const char *path, int *t, int *h, int *w, int *c,
                                  float **audio, int *audio_t,
                                  char *error, size_t error_size);
+/* --refine-sigma: seed the denoiser from that bundle instead of pure noise.
+ * Reads the clean latent written by --latent-out, checks its shape against the
+ * requested canvas, then re-noises it with the rectified-flow interpolation
+ * x = (1 - sigma) * clean + sigma * noise. The noise is drawn from the same
+ * per-modality RNG streams the plain path uses, so a fixed seed stays
+ * reproducible. */
+static int h3_seed_refine_latents(const h3_params *params,
+                                  float *video, size_t video_count,
+                                  float *audio, size_t audio_count,
+                                  char *error, size_t error_size) {
+    int t = 0, h = 0, w = 0, c = 0, audio_t = 0;
+    float *clean_audio = NULL;
+    float *clean_video = read_latent_bundle(params->latent_in_path, &t, &h, &w,
+                                            &c, &clean_audio, &audio_t,
+                                            error, error_size);
+    if (!clean_video) return 0;
+    const size_t clean_video_count =
+        (size_t)c * (size_t)t * (size_t)h * (size_t)w;
+    const size_t clean_audio_count =
+        clean_audio && audio_t > 0
+            ? (size_t)2 * (size_t)32 * (size_t)audio_t : 0;
+    const float sigma = params->refine_sigma;
+    float *noise = NULL;
+    h3_rng rng;
+    int ok = 0;
+    if (clean_video_count != video_count) {
+        snprintf(error, error_size,
+                 "refine latent holds %zu video elements but this canvas needs "
+                 "%zu; write it with --latent-out at the same size",
+                 clean_video_count, video_count);
+        goto done;
+    }
+    noise = malloc(video_count * sizeof(*noise));
+    if (!noise) {
+        snprintf(error, error_size, "out of memory seeding the refine latent");
+        goto done;
+    }
+    h3_rng_seed(&rng, params->seed);
+    h3_rng_fill_normal(&rng, noise, video_count);
+    for (size_t index = 0; index < video_count; index++)
+        video[index] = (1.0f - sigma) * clean_video[index] +
+                       sigma * noise[index];
+    free(noise);
+    noise = NULL;
+    if (clean_audio_count == audio_count) {
+        noise = malloc(audio_count * sizeof(*noise));
+        if (!noise) {
+            snprintf(error, error_size, "out of memory seeding refine audio");
+            goto done;
+        }
+        h3_rng_seed(&rng, params->seed);
+        h3_rng_fill_normal(&rng, noise, audio_count);
+        for (size_t index = 0; index < audio_count; index++)
+            audio[index] = (1.0f - sigma) * clean_audio[index] +
+                           sigma * noise[index];
+    } else {
+        h3_rng_seed(&rng, params->seed);
+        h3_rng_fill_normal(&rng, audio, audio_count);
+        fprintf(stderr, "h3: refine latent carries no matching audio track "
+                "(%zu vs %zu elements); starting audio from pure noise\n",
+                clean_audio_count, audio_count);
+    }
+    ok = 1;
+done:
+    free(noise);
+    free(clean_video);
+    free(clean_audio);
+    return ok;
+}
 
 /* Streaming VAE sink: convert each temporal chunk to u8, resize to the
  * requested output size, deliver preview frames, and pipe straight into the
@@ -2042,7 +2111,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    if (params->refine_sigma > 0.0f) {
+        if (!h3_refine_schedule_build(params->refine_sigma, params->steps,
+                                      &sigmas)) {
+            h3_set_error(ctx, "cannot construct the refine sigma schedule");
+            goto cleanup;
+        }
+    } else if (!h3_serving_schedule_build(params->steps, &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
@@ -2159,11 +2234,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     /* The released server initializes each modality from a separate generator
      * carrying the same requested seed. */
-    h3_rng video_rng, audio_rng;
-    h3_rng_seed(&video_rng, params->seed);
-    h3_rng_seed(&audio_rng, params->seed);
-    h3_rng_fill_normal(&video_rng, video, video_count);
-    h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    if (params->refine_sigma > 0.0f) {
+        if (!h3_seed_refine_latents(params, video, video_count, audio,
+                                    audio_count, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+    } else {
+        h3_rng video_rng, audio_rng;
+        h3_rng_seed(&video_rng, params->seed);
+        h3_rng_seed(&audio_rng, params->seed);
+        h3_rng_fill_normal(&video_rng, video, video_count);
+        h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    }
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,

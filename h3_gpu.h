@@ -290,6 +290,20 @@ int h3_gpu_conv3d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t kernel_depth, uint32_t kernel_height,
                       uint32_t kernel_width, uint32_t stride_depth,
                       uint32_t stride_height, uint32_t stride_width);
+/* Padded / grouped Conv3d with unit stride. groups == input_channels selects
+ * the depthwise form (weight [C, 1, kd, kh, kw]); padding preserves the volume,
+ * which both the 3x3x3 resampling blocks and the depthwise temporal kernel
+ * need. The entry point above cannot express either (padding 0, groups 1). */
+int h3_gpu_conv3d_pad_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *bias, uint32_t batch,
+                          uint32_t depth, uint32_t height, uint32_t width,
+                          uint32_t input_channels, uint32_t output_channels,
+                          uint32_t kernel_depth, uint32_t kernel_height,
+                          uint32_t kernel_width, uint32_t pad_depth,
+                          uint32_t pad_height, uint32_t pad_width,
+                          uint32_t groups);
 int h3_gpu_vae_encoder_group_norm_silu_f32(
                       h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
@@ -297,6 +311,22 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t depth, uint32_t height, uint32_t width,
                       uint32_t channels, uint32_t groups, float epsilon);
+/* The same GroupNorm without the fused SiLU, for the latent resampler's
+ * output normalization (which feeds a modulation instead of an activation).
+ * Geometry and layout match the fused entry point above. */
+int h3_gpu_group_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *bias, uint32_t batch,
+                          uint32_t depth, uint32_t height, uint32_t width,
+                          uint32_t channels, uint32_t groups, float epsilon);
+/* out[r][c] = in[r][c] * (1 + scale[c]) + shift[c] over a row-major
+ * [rows, channels] tensor. */
+int h3_gpu_channel_scale_shift_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                                   const h3_gpu_tensor *input,
+                                   const h3_gpu_tensor *scale,
+                                   const h3_gpu_tensor *shift,
+                                   uint32_t rows, uint32_t channels);
 
 /* Portable BF16 storage path. Arithmetic accumulates in F32 and rounds at
  * operation boundaries, matching the released checkpoint's compute dtype. */

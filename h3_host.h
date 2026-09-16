@@ -114,6 +114,12 @@ double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
+/* Same shifted curve as h3_serving_schedule_build, but starting at
+ * start_sigma instead of 1.0. Used to refine a clean latent (img2img /
+ * hires-fix after a latent upscale): the caller re-noises the latent to
+ * start_sigma and then runs `evaluations` passes to zero. */
+int h3_refine_schedule_build(float start_sigma, int evaluations,
+                             h3_sigma_schedule *schedule);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);
@@ -132,6 +138,17 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
                                  int input_width, int input_height,
                                  int output_width, int output_height,
                                  uint8_t **output);
+
+/* Bilinear spatial resize of an NCDHW float volume, one plane per
+ * (channel, frame). Matches PyTorch's
+ * F.interpolate(mode="trilinear", align_corners=False) for the case the H3
+ * latent upscaler uses: the temporal extent is left untouched, so the
+ * trilinear kernel degenerates to bilinear per frame. Returns 0 on invalid
+ * geometry. */
+int h3_resize_bilinear_f32(const float *source, int channels, int frames,
+                           int source_height, int source_width,
+                           float *destination, int destination_height,
+                           int destination_width);
 
 int h3_res_step(float *output, const float *sample, const float *denoised,
                 const float *old_denoised, size_t count,

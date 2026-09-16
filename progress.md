@@ -1166,3 +1166,153 @@ VAE 解码原把整段 RGB 累积在 `final_rgb`（帧数×宽×高×3），峰�
 1. DiT 侧：三开关均有损；保守选项 `--reuse 1 --token-reduction --layers 45`（−41%，无跨步外推）。
 2. 1 GiB states 上限在长视频（>8s）/1080p 会回退，可放宽或按可用内存自适应。
 3. 低分辨率档已贴 I/O 下限，进一步只能动 `--layers`/`--reuse`。
+
+---
+
+# Session 2026-09-16 → 17：两阶段管线打通 + 新权重实测
+
+## 起因
+延续「Latent Upscaler 接入」任务：阶段 A（`--refine-sigma`）已完成，需验证两阶段收益，
+并决定是否投入 B4（把放大器搬进 h3c，~350–400 行 C）。
+
+## 完成
+
+### B 阶段原语（B1–B3 全部完成）
+| 子项 | 内容 | 状态 |
+|---|---|---|
+| B1 | `h3_gpu_conv3d_pad_f32`（padding + groups） | ✅ |
+| B2 | `h3_resize_bilinear_f32`（CPU，对 PyTorch 参考值逐点吻合） | ✅ 41 项新测试 |
+| B3 | `h3_gpu_group_norm_f32`（无 SiLU）+ `h3_gpu_channel_scale_shift_f32` | ✅ |
+
+`make` 零 error，`./h3_tests` → **1829 checks**（1768 → 41[phase A] → +19[bilinear]）。
+
+**关键转折**：B3 最大的未知数（GroupNorm）发现仓库已有 `h3_gpu_vae_encoder_group_norm_silu_f32`，
+正是 NDHWC 的 `GroupNorm(groups,C)+SiLU`。B3 只剩"去掉 SiLU 的变体 + 逐通道仿射"。
+
+### 格式桥（`h3_latent_bridge.py`）
+- f32 往返**逐字节一致**；f16 精确半尺寸（65260 = 28+60480+16+4736）
+- 实现细节：h3c writer **恒写 version 3**（即使 f32），按 v2 写会差 4 字节
+
+### ComfyUI 桥接（发现既有节点 + 修 3 个 bug + 加 1 个节点）
+- 仓库 `comfyui_nodes` 是**软链**到 `<ComfyUI>/custom_nodes/h3_binary_nodes`
+- 修 `_read_h3_latent`（v2+v3 / f32+f16）
+- 修 `_write_h3_latent`（v2 → v3，4 字节错位）
+- 修放大器的 `h3_audio` 丢失（第三方节点 1 行补丁）
+- **新增 `H3_BinaryLatentRefine`**（带 `prompt`；引擎要 `-p` 才走去噪）
+- 新增 `gen_h3_two_stage_workflow.py` → 两份 UI 工作流
+
+### 端到端实跑（ComfyUI HTTP API，无人工干预）
+启动 ComfyUI → `/object_info` 取 schema → `POST /prompt` → 轮询 `/history`：
+- 变体 A（①→②→Refine）640×384 ✅ 产出 mp4
+- 变体 B（①→②→Decode）640×384 ✅ 产出 mp4 + 音轨
+- **`h3_audio` 穿过放大器：相关系数 +1.0000，rms 逐位相同**
+
+### 阶段 1（1280×704 / 640×352 render / 121 帧 / 5 步）
+DiT 721.4s + video VAE 174.9s ≈ **15.2 min**；latent `[C=24,T=37,H=22,W=40]`。
+放大器（真实模型）`40×22 → 80×44, T=37` 实测 **60.9s**。
+
+## 关键结论
+
+### 1. 放大器不是瓶颈
+CPU/fp32 前向：小尺寸 2.44s，1280×704 时 60.9s。
+⇒ **B4 的收益只剩"去掉 ComfyUI 依赖"，性价比存疑**（此前估计"十几到几十分钟"是错的）。
+
+### 2. 内存墙 —— 这条路的天花板
+| 配置 | tokens | 结果 |
+|---|---|---|
+| render 640×352, 121帧 | 32,560 | ✅ |
+| render 1280×704, 22帧 | 24,640 | ✅ |
+| **render 1280×704, 121帧** | **130,240** | ❌ 系统重启 |
+
+**直接全分辨率生成是同一个 token 数 ⇒ 同样跑不动。**
+⇒ "两阶段 vs 直接"在 1280×704/5s 上不成立；可行的是变体 B（放大后直接解码）。
+
+### 3. 自适应驻留毁测量（最严重的一次测量错误）
+steps=4 报 422s，钉住 `H3_DIT_RESIDENT_BLOCKS=1` 后重测为 **91s（差 4.6×）**。
+受控 A/B：常驻 1 块 34.4s / 2.29GiB vs 常驻 11 块 50.6s / 9.46GiB。
+**多常驻反而更慢**（争抢统一内存）。⇒ 所有性能测量必须钉住。
+
+### 4. int8 VAE 省磁盘不省内存
+磁盘 14.6 → 2.95 GiB，但运行时反量化成 F32 常驻，**peak 仍 9.365 GiB**。
+
+### 5. 8step 蒸馏模型必须走 8 步
+2步/4步/8步 SSIM 标尺：2步 vs 8步 = 0.581 ≈ 无关生成 0.551。
+耗时公式 `22.5s + 17.1s × steps`，且**纯 I/O bound**（denoise 时间 ≈ SSD 时间）。
+
+## Error Log
+| Error | Attempt | Resolution |
+|---|---|---|
+| `truncated audio latent` | 1 | `_write_h3_latent` 改写 v3（reader 恒吃 28B） |
+| `--refine-sigma needs a prompt (-p)` | 1 | refine 节点补 `prompt` 输入 + 空值硬报错 |
+| 放大器丢 `h3_audio` | 1 | 保留 LATENT 字典附加键 |
+| `missing required model file` | 1 | 工作流 `binary` 指向已不存在的 `.../h3.c/h3` |
+| 系统重启（OOM） | 1 | 130,240 tokens；改用变体 B 或降时长 |
+| steps=4 报 422s（错误数据） | 2 | 未钉驻留块数；钉住后 91s |
+| `exec_command` 不存在 | 1 | 正确工具名 `execute_command` |
+| zsh `$VAR` 不分词 | 1 | 多 flag 不用变量承载 |
+| `pkill -f "ComfyUI/main.py"` 无效 | 1 | 用 `lsof -ti:8188` |
+| 命令超 8000 字节 | 1 | 先写脚本文件再执行 |
+| `/tmp` 被重启清空 | — | 中间产物丢失，改用 `/Volumes/data` 存关键产出 |
+
+## 5-Question Reboot Check
+| Question | Answer |
+|---|---|
+| Where am I? | 两阶段链路**已跑通并验证**；B4 因内存墙发现而降级 |
+| Where am I going? | 等用户目视确认变体 B 画质 → 决定走 A/B 还是做 B4 |
+| What's the goal? | 用便宜的低分辨率步替代昂贵的高分辨率步 |
+| What have I learned? | 放大器不是瓶颈；token 上限 ~30k；自适应驻留毁测量；int8 不省内存 |
+| What have I done? | B1–B3 完成；桥接 + 3 bug 修复 + 1 新节点；两份工作流并实跑；新权重标定 |
+
+## Next
+1. 打开 `h3_two_stage_upscale_decode.json` 目视确认画质（唯一能出 1280×704/5s 的路线）
+2. 若 OK → 用它生产，B4 无限期搁置
+3. 若要 B4 → 先补 `B4d`（对 PyTorch 逐点对拍）
+4. 所有后续测量加 `H3_DIT_RESIDENT_BLOCKS=1`
+5. 新权重生产建议 `--steps 8`
+
+---
+
+## 2026-09-17 收尾：变体 B 全尺寸验收 + 工作流副本同步
+
+### 用户验收
+实跑 `h3_two_stage_upscale_decode.json`（变体 B，全尺寸）→ 产出成功，
+**用户结论：效果可以接受**。
+
+```
+output/video/h3_upscale_decode_00001_.mp4
+  1280×704 / 124 帧 / 含音轨 / 4.1 MB
+  帧内对比度 std=74.9   相邻帧差=4.62      → 真实画面 + 有运动
+  音轨 rms=0.00089（噪声失败案例 0.486，低 546×）→ 真实音频
+  音轨 5.18s ≈ 124帧@24fps = 5.17s        → 音视频长度对齐
+```
+
+⇒ **B4（把放大器搬进 h3c）无限期搁置**：链路已能出目标尺寸且画质可接受，
+B4 唯一剩余收益是"去掉 ComfyUI 依赖"，不值 350–400 行 C。
+⇒ `steps=4` 保留（用户确认可接受）。
+
+### 工作流副本同步（差点提交错版本）
+生成器同一份 dict 写两处，理论上应一致，但 `cmp` 失败 → **ComfyUI 前端重写过文件**。
+
+| | 仓库副本 | ComfyUI 版 |
+|---|---|---|
+| 变体 A ① steps | 2 | **4**（用户改） |
+| 变体 B ① steps | 20 | **4**（用户改） |
+
+其余差异（`codec`/`filename_prefix`/note `text`）只是前端把位置数组归一化成命名值。
+
+**若直接提交会静默丢掉这次编辑。** 已处理：
+1. 用 ComfyUI 版覆盖仓库副本（保住编辑）
+2. 生成器默认值对齐 steps=4，补 `control_after_generate`、SaveVideo/Note 的 `widgets_values_named`
+3. **修掉根因**：生成器原会静默覆盖两处（过程中一度冲掉用户 ComfyUI 版，已从备份恢复）；
+   改为默认跳过已存在文件，覆盖需 `--force`
+4. 格式统一为缩进（变体 B 原是单行 0 换行的紧凑 JSON）
+
+最终：两份 754 / 686 行，仓库版 == ComfyUI 版 == 生成器语义输出。
+前端的 `extra.ds`（画布缩放平移状态）完整保留。
+
+`make` ✓，`./h3_tests` → 1829 checks。
+
+### 教训
+- **JSON 生成类工具必须防覆盖**：生成物会被下游（前端）重写并携带用户编辑，
+  "重新生成"等于丢数据。默认 skip + 显式 `--force` 才安全。
+- **提交前检查生成物是否被下游改过**，不能假设"生成器写的就是最新的"。

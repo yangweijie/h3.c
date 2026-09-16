@@ -367,6 +367,13 @@ def _read_h3_latent(path):
     返回 {"samples": [1,C,T,H,W], "h3_audio": [32,2,T_audio] 或 None}。
     h3_audio 是 H3 原生音频 latent（channel-major [32,2,T]），由
     H3_BinaryLatentDecode 透传给引擎做音频 VAE 解码，从而保留音轨。
+
+    两种头部都要认（C: h3.c:2442-2461）：
+      v2: magic, version, t, h, w, c                      —— 恒 float32，数据偏移 24
+      v3: magic, version, dtype, t, h, w, c               —— dtype 0=f32 / 1=f16，偏移 28
+    引擎现在**一律写 v3**，即使内容是 float32（`--latent-out` 即如此），
+    所以原先只认 v2 的解析会对所有当前产物抛「版本不支持」；
+    即便绕过版本检查，按 v2 的偏移也会把 dtype 当成 t 读。
     """
     import numpy as np
     import torch
@@ -376,22 +383,37 @@ def _read_h3_latent(path):
     if magic != _H3_LATENT_MAGIC:
         raise RuntimeError(
             f"latent 文件魔数错误: {path}（不是 h3 --latent-out 产物）")
-    if version != 2:
+    if version == 2:
+        dtype_flag = 0
+        t, h, w, c = struct.unpack_from("iiii", data, 8)
+        off = 24
+    elif version == 3:
+        dtype_flag, t, h, w, c = struct.unpack_from("iiiii", data, 8)
+        off = 28
+    else:
         raise RuntimeError(
-            f"latent 文件版本不支持: {path}（期望 v2，得到 v{version}）")
-    t, h, w, c = struct.unpack_from("iiii", data, 8)
-    off = 24
+            f"latent 文件版本不支持: {path}（期望 v2/v3，得到 v{version}）")
+    if dtype_flag not in (0, 1):
+        raise RuntimeError(
+            f"latent 文件 dtype 标记异常: {path}（得到 {dtype_flag}）")
+    sample_dtype = np.float32 if dtype_flag == 0 else np.float16
+
+    def _take(count, reshape):
+        nonlocal off
+        values = np.frombuffer(data, dtype=sample_dtype, count=count, offset=off)
+        off += count * sample_dtype().itemsize
+        # f16 一律升到 f32：下游 VAE 解码与引擎的 latent 输入都按 float32 处理
+        return np.asarray(values, dtype=np.float32).reshape(reshape)
+
     vn = c * t * h * w
-    arr = np.frombuffer(data, dtype=np.float32, count=vn, offset=off).reshape(c, t, h, w)
-    off += vn * 4
+    arr = _take(vn, (c, t, h, w))
     (ap,) = struct.unpack_from("i", data, off)
     off += 4
     audio = None
     if ap:
         ac, a_stereo, at = struct.unpack_from("iii", data, off)
         off += 12
-        an = ac * a_stereo * at
-        audio = np.frombuffer(data, dtype=np.float32, count=an, offset=off).reshape(ac, a_stereo, at)
+        audio = _take(ac * a_stereo * at, (ac, a_stereo, at))
     tensor = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0)  # [1,C,T,H,W]
     return {"samples": tensor, "h3_audio": audio}
 
@@ -407,7 +429,13 @@ def _write_h3_latent(latent, path):
     audio = latent.get("h3_audio")
     audio = np.ascontiguousarray(audio, dtype=np.float32) if audio is not None else None
     with open(path, "wb") as f:
-        f.write(struct.pack("IIiiii", _H3_LATENT_MAGIC, 2, t, h, w, c))
+        # 必须写 v3（多一个 dtype 字段），不能写 v2。引擎的 reader 无条件
+        # fread 7 个字（28 字节）当头部（C: h3.c:2578），只在 version==3 时
+        # 才把 idx 挪到 3；写 v2 会让读指针比视频数据起点多走 4 字节，整段
+        # 视频错位，4 字节的错位再一路传到音频块（ap 读到音频头的首字段而
+        # 误判为「有音频」，音频长度取到音频数据的头 4 字节当整数），最终
+        # 报 "truncated audio latent"。引擎自己的 writer 也因此恒写 v3。
+        f.write(struct.pack("IIiiiii", _H3_LATENT_MAGIC, 3, 0, t, h, w, c))
         f.write(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
         if audio is not None:
             at = int(audio.shape[-1])  # [32,2,T]
@@ -924,6 +952,153 @@ class H3_BinaryLatentDecode:
                 f"H3 latent 解码失败 (rc={rc})\n--- 日志尾部 ---\n{tail}")
         size_mb = os.path.getsize(out_path) / 1024 / 1024
         print(f"[H3] 解码完成: {out_path} ({size_mb:.2f} MB)")
+        return (_make_video(out_path), out_path)
+
+
+# 引擎的时长→帧数→latent 时间长度换算（C: h3_host.c:22-33）。只在节点里做预校验：
+# 引擎真正的检查发生在 21 GiB 权重加载之后，提前算一遍能省掉一次白等。
+_H3_FPS = 24
+
+
+def _align_frames(requested: int) -> int:
+    """请求帧数 → 引擎实际采用的帧数（对齐到 5+17k）。"""
+    value = max(5, int(requested))
+    remainder = (value - 5) % 17
+    if remainder:
+        value += 17 - remainder
+    return value
+
+
+def _video_latent_t(frames: int) -> int:
+    """对齐后的帧数 → 视频 latent 的时间长度。"""
+    if frames <= 5:
+        return 2
+    return ((frames - 5) // 17) * 5 + 2
+
+
+class H3_BinaryLatentRefine:
+    """全分辨率 refine（两阶段管线的第二阶段）：--latent-in + --refine-sigma。
+
+    与 H3_BinaryLatentDecode 的区别：那个只解码（跳过去噪）；本节点把 latent 按
+    refine_sigma 重新加噪后跑 steps 步去噪，即
+    「低分辨率生成 → 潜空间放大 → 全分辨率精修」的最后一步。
+
+    音频：LATENT 字典里的 h3_audio 会被 _write_h3_latent 写进 latent 包，引擎据此
+    用**同一个 sigma** 重新加噪音频并与视频联合去噪，音视频一致性得以保持。
+    若 h3_audio 缺失，引擎会警告并改用单位正态噪声初始化音频——而 schedule 从
+    refine_sigma 起步，σ=1 的噪声属于分布外输入，结果是一段明显更响的噪声音轨，
+    且**加步数救不回来**。所以务必让 h3_audio 活着传到这里。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT", {"tooltip": "放大后的 latent（须含 h3_audio）"}),
+            # 引擎只在给了 -p 时才走去噪路径，否则打印
+            # "--refine-sigma needs a prompt (-p) to denoise" 并退化成纯解码。
+            "prompt": ("STRING", {
+                "multiline": True, "default": "",
+                "tooltip": "与第一阶段相同的提示词；缺了它引擎会退化成纯解码（不精修）"}),
+            "width": ("INT", {"default": 1280, "min": 64, "max": 2048, "step": 32,
+                              "tooltip": "输出宽 = 潜空间放大后的目标宽"}),
+            "height": ("INT", {"default": 704, "min": 64, "max": 2048, "step": 32}),
+            "seconds": ("FLOAT", {"default": 8.0, "min": 0.2, "max": 15.0, "step": 0.5,
+                                  "tooltip": "必须与第一阶段一致：它决定 token 网格，"
+                                             "不一致引擎会报元素数不匹配"}),
+            "steps": ("INT", {"default": 4, "min": 2, "max": 1000,
+                              "tooltip": "refine 步数。这是从 refine_sigma 起步的短程，"
+                                         "4~6 步通常足够；实测加到 12 步保真度不再变化"}),
+            "refine_sigma": ("FLOAT", {
+                "default": 0.4, "min": 0.05, "max": 1.0, "step": 0.05,
+                "tooltip": "保真 / 修正的权衡。实测（vs 第一阶段画面）：0.05→0.95、"
+                           "0.1→0.92、0.2→0.89、0.4→0.87、0.6→0.84；作为参照，"
+                           "画面未变是 0.99，换种子重新生成是 0.84。"
+                           "即 0.6 以上基本等于重新生成，0.3~0.5 是可用区间"}),
+            "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+            "model_dir": ("STRING", {"default": _DEFAULT_MODEL_DIR}),
+            "binary": ("STRING", {"default": _DEFAULT_BINARY}),
+            "clipproj_dir": ("STRING", {"default": _DEFAULT_CLIPPROJ_DIR}),
+            "clipproj_proj": ("STRING", {"default": _DEFAULT_CLIPPROJ_PROJ}),
+            "extra_args": ("STRING", {"default": "",
+                                      "tooltip": "附加 CLI 参数，如 --profile"}),
+        }}
+
+    RETURN_TYPES = ("VIDEO", "STRING")
+    RETURN_NAMES = ("video", "video_path")
+    FUNCTION = "refine"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("latent + refine_sigma → 全分辨率精修视频（两阶段管线第二阶段）；"
+                   "h3_audio 随 latent 透传以保留音轨")
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        return _validate_engine_paths(kwargs.get("binary"),
+                                      kwargs.get("model_dir")) or True
+
+    def refine(self, latent, prompt, width, height, seconds, steps, refine_sigma,
+               seed, model_dir=_DEFAULT_MODEL_DIR, binary=_DEFAULT_BINARY,
+               clipproj_dir=_DEFAULT_CLIPPROJ_DIR,
+               clipproj_proj=_DEFAULT_CLIPPROJ_PROJ, extra_args=""):
+        if not os.path.isfile(binary):
+            raise FileNotFoundError(
+                f"H3 引擎二进制不存在: {binary}\n"
+                f"请先在 h3.c 目录执行 `make`，或用 binary 参数/环境变量 H3_BINARY 指定")
+        if not (prompt and prompt.strip()):
+            raise ValueError(
+                "提示词为空：引擎需要 -p 才会走 refine 路径，否则会打印 "
+                "'--refine-sigma needs a prompt (-p) to denoise' 并退化成纯解码"
+                "（等于第二阶段的精修完全没发生）。请填与第一阶段相同的提示词。")
+        samples = latent["samples"]
+        if samples.dim() != 5:
+            raise ValueError(
+                f"latent samples 需为 [B,C,T,H,W]，得到 {tuple(samples.shape)}")
+
+        # 预校验几何：引擎要的是「latent 元素数 == 画布+时长推出的 token 网格」，
+        # 但它在加载完 21 GiB 权重之后才检查。
+        _, c, t, h, w = samples.shape
+        expected_t = _video_latent_t(_align_frames(round(float(seconds) * _H3_FPS)))
+        expected = (c, expected_t, height // 16, width // 16)
+        if (t, h, w) != expected[1:]:
+            print(f"[H3] 警告: latent 形状 (C={c},T={t},H={h},W={w}) 与 "
+                  f"{width}x{height} + {seconds}s 推出的 "
+                  f"(C={expected[0]},T={expected[1]},H={expected[2]},W={expected[3]}) "
+                  f"不一致，引擎大概率会报元素数不匹配。检查 seconds 是否与第一阶段相同、"
+                  f"以及 width/height 是否为放大后的目标尺寸。")
+        if latent.get("h3_audio") is None:
+            print("[H3] 警告: latent 里没有 h3_audio —— 引擎会用单位正态噪声重新生成"
+                  "音频（schedule 从 refine_sigma 起步，σ=1 属分布外输入），结果是一段"
+                  "明显更响的噪声音轨且加步数救不回来。请把第一阶段的 latent 也接到"
+                  "本节点，或确认中间的放大节点保留了 h3_audio。")
+
+        out_dir = os.path.abspath(os.path.join(_comfy_temp_dir(), "h3_binary_out"))
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = int(time.time() * 1000)
+        latent_path = os.path.join(out_dir, f"refine_{stamp}.bin")
+        out_path = os.path.join(out_dir, f"h3_refine_{stamp}.mp4")
+        _write_h3_latent(latent, latent_path)
+        cmd = [binary, "-d", model_dir, "-p", prompt.strip(),
+               "--latent-in", latent_path,
+               "--width", str(width), "--height", str(height),
+               "--seconds", f"{float(seconds):g}",
+               "--steps", str(steps), "--seed", str(seed),
+               "--refine-sigma", f"{float(refine_sigma):g}",
+               "-o", out_path]
+        if extra_args:
+            try:
+                cmd += shlex.split(extra_args)
+            except ValueError as exc:
+                raise ValueError(
+                    f"extra_args 解析失败（引号不配对？）: {extra_args}") from exc
+        rc, log = _run_engine(cmd,
+                              {"H3_CLIPPROJ_DIR": clipproj_dir,
+                               "H3_CLIPPROJ_PROJ": clipproj_proj},
+                              tag="H3_REFINE")
+        if rc != 0 or not os.path.isfile(out_path):
+            tail = "\n".join(log.splitlines()[-25:])
+            raise RuntimeError(
+                f"H3 refine 失败 (rc={rc})\n--- 日志尾部 ---\n{tail}")
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        print(f"[H3] refine 完成: {out_path} ({size_mb:.2f} MB)")
         return (_make_video(out_path), out_path)
 
 

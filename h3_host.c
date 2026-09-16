@@ -171,6 +171,35 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+int h3_refine_schedule_build(float start_sigma, int evaluations,
+                             h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 1 || evaluations > H3_MAX_STEPS ||
+        !(start_sigma > 0.0f) || start_sigma > 1.0f)
+        return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = evaluations;
+    /* Invert sigma = shift*b/(1+(shift-1)*b) for b at sigma = start_sigma, so
+     * the refine curve keeps the released shape and merely begins partway
+     * along it. Each modality re-solves against its own shift, which makes
+     * both start at the requested sigma. */
+    const float shift_v = (float)H3_VIDEO_SIGMA_SHIFT;
+    const float shift_a = (float)H3_AUDIO_SIGMA_SHIFT;
+    float base_v = start_sigma / (shift_v - start_sigma * (shift_v - 1.0f));
+    float base_a = start_sigma / (shift_a - start_sigma * (shift_a - 1.0f));
+    if (!(base_v > 0.0f) || base_v > 1.0f ||
+        !(base_a > 0.0f) || base_a > 1.0f)
+        return 0;
+    for (int index = 0; index <= evaluations; index++) {
+        float ramp = 1.0f - (float)index / (float)evaluations;
+        float bv = base_v * ramp, ba = base_a * ramp;
+        schedule->video[index] = shift_v * bv / (1.0f + (shift_v - 1.0f) * bv);
+        schedule->audio[index] = shift_a * ba / (1.0f + (shift_a - 1.0f) * ba);
+    }
+    schedule->video[evaluations] = 0.0f;
+    schedule->audio[evaluations] = 0.0f;
+    return 1;
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;
@@ -607,6 +636,61 @@ int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,
 
 static double h3_phi1(double value) {
     return expm1(value) / value;
+}
+
+int h3_resize_bilinear_f32(const float *source, int channels, int frames,
+                           int source_height, int source_width,
+                           float *destination, int destination_height,
+                           int destination_width) {
+    if (!source || !destination || channels < 1 || frames < 1 ||
+        source_height < 1 || source_width < 1 ||
+        destination_height < 1 || destination_width < 1)
+        return 0;
+    const float scale_y = (float)source_height / (float)destination_height;
+    const float scale_x = (float)source_width / (float)destination_width;
+    const size_t source_plane = (size_t)source_height * (size_t)source_width;
+    const size_t destination_plane =
+        (size_t)destination_height * (size_t)destination_width;
+    for (int channel = 0; channel < channels; channel++)
+        for (int frame = 0; frame < frames; frame++) {
+            const float *source_pixels = source +
+                ((size_t)channel * (size_t)frames + (size_t)frame) *
+                source_plane;
+            float *destination_pixels = destination +
+                ((size_t)channel * (size_t)frames + (size_t)frame) *
+                destination_plane;
+            for (int y = 0; y < destination_height; y++) {
+                /* PyTorch's half-pixel mapping, evaluated in double and then
+                 * narrowed exactly as area_pixel_compute_source_index does:
+                 * negatives clamp to zero for the non-cubic modes, and the
+                 * neighbour index saturates at the last row. */
+                float sy = (float)((double)scale_y * ((double)y + 0.5) - 0.5);
+                if (sy < 0.0f) sy = 0.0f;
+                int y0 = (int)sy;
+                if (y0 > source_height - 1) y0 = source_height - 1;
+                const int y1 = y0 < source_height - 1 ? y0 + 1 : y0;
+                const float ly = sy - (float)y0;
+                const float *row0 =
+                    source_pixels + (size_t)y0 * (size_t)source_width;
+                const float *row1 =
+                    source_pixels + (size_t)y1 * (size_t)source_width;
+                float *out = destination_pixels +
+                    (size_t)y * (size_t)destination_width;
+                for (int x = 0; x < destination_width; x++) {
+                    float sx =
+                        (float)((double)scale_x * ((double)x + 0.5) - 0.5);
+                    if (sx < 0.0f) sx = 0.0f;
+                    int x0 = (int)sx;
+                    if (x0 > source_width - 1) x0 = source_width - 1;
+                    const int x1 = x0 < source_width - 1 ? x0 + 1 : x0;
+                    const float lx = sx - (float)x0;
+                    const float top = row0[x0] + (row0[x1] - row0[x0]) * lx;
+                    const float bottom = row1[x0] + (row1[x1] - row1[x0]) * lx;
+                    out[x] = top + (bottom - top) * ly;
+                }
+            }
+        }
+    return 1;
 }
 
 int h3_res_step(float *output, const float *sample, const float *denoised,

@@ -705,6 +705,97 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
     }
 }
 
+struct channel_scale_shift_args {
+    uint rows;
+    uint channels;
+};
+
+/* GroupNorm without the fused activation. The latent resampler applies SiLU on
+ * the way into a block (in_layers / TemporalConv.norm) but not before its
+ * output normalization, where the normalized tensor is modulated by an
+ * AdaLN-style per-channel scale and shift instead. Reduction layout matches
+ * h3_vae_encoder_group_norm_silu_f32: NDHWC with one threadgroup per
+ * batch x depth x group, reusing that kernel's argument struct verbatim. */
+kernel void h3_group_norm_f32(
+                            device const float *input [[buffer(0)]],
+                            device const float *weight [[buffer(1)]],
+                            device const float *bias [[buffer(2)]],
+                            device float *output [[buffer(3)]],
+                            constant vae_encoder_norm_args &args [[buffer(4)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 thread_position [[thread_position_in_threadgroup]],
+                            uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint rows = args.batch * args.depth * args.groups;
+    if (row >= rows) return;
+    uint channels_per_group = args.channels / args.groups;
+    uint group_index = row % args.groups;
+    uint temporal_plane = row / args.groups;
+    uint elements = args.height * args.width * channels_per_group;
+    threadgroup float reductions[256];
+    float local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        local += input[source];
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = reductions[0] / float(elements);
+    local = 0.0f;
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t source = ((size_t)temporal_plane * args.height * args.width +
+                         spatial) * args.channels + channel;
+        float centered = input[source] - mean;
+        local = fma(centered, centered, local);
+    }
+    reductions[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threadgroup_size.x / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(elements) + args.epsilon);
+    for (uint index = tid; index < elements; index += threadgroup_size.x) {
+        uint spatial = index / channels_per_group;
+        uint channel = group_index * channels_per_group +
+                       index % channels_per_group;
+        size_t destination =
+            ((size_t)temporal_plane * args.height * args.width + spatial) *
+            args.channels + channel;
+        output[destination] =
+            (input[destination] - mean) * inverse * weight[channel] +
+            bias[channel];
+    }
+}
+
+/* out[r][c] = in[r][c] * (1 + scale[c]) + shift[c], the modulation the
+ * resampler's blocks apply to their normalized output. Encode the scale as the
+ * released embedding layer produces it (a raw additive term), not as a
+ * multiplicative gain. */
+kernel void h3_channel_scale_shift_f32(
+                            device const float *input [[buffer(0)]],
+                            device const float *scale [[buffer(1)]],
+                            device const float *shift [[buffer(2)]],
+                            device float *output [[buffer(3)]],
+                            constant channel_scale_shift_args &args [[buffer(4)]],
+                            uint index [[thread_position_in_grid]]) {
+    if (index >= args.rows * args.channels) return;
+    uint channel = index % args.channels;
+    output[index] = input[index] * (1.0f + scale[channel]) + shift[channel];
+}
+
 struct weight_norm_args {
     uint outer;
     uint inner;

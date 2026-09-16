@@ -1,0 +1,755 @@
+{
+ "id": "h3-two-stage-pipeline",
+ "revision": 0,
+ "last_node_id": 5,
+ "last_link_id": 3,
+ "nodes": [
+  {
+   "id": 2,
+   "type": "MinimaxH3LatentUpscaler3D",
+   "pos": [
+    560,
+    220
+   ],
+   "size": [
+    300,
+    250
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "latent",
+     "name": "latent",
+     "type": "*",
+     "link": 1
+    },
+    {
+     "localized_name": "model_name",
+     "name": "model_name",
+     "type": "COMBO",
+     "widget": {
+      "name": "model_name"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "mode",
+     "name": "mode",
+     "type": "COMFY_DYNAMICCOMBO_V3",
+     "widget": {
+      "name": "mode"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "width",
+     "name": "mode.width",
+     "type": "INT",
+     "widget": {
+      "name": "mode.width"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "height",
+     "name": "mode.height",
+     "type": "INT",
+     "widget": {
+      "name": "mode.height"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "align",
+     "name": "align",
+     "type": "INT",
+     "widget": {
+      "name": "align"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "enable_temporal_chunking",
+     "name": "enable_temporal_chunking",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "enable_temporal_chunking"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "force_unload",
+     "name": "force_unload",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "force_unload"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "device",
+     "name": "device",
+     "type": "COMBO",
+     "widget": {
+      "name": "device"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "precision",
+     "name": "precision",
+     "type": "COMBO",
+     "widget": {
+      "name": "precision"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "latent",
+     "name": "latent",
+     "type": "*",
+     "links": [
+      2
+     ]
+    }
+   ],
+   "title": "② 潜空间放大（CPU）",
+   "properties": {
+    "Node name for S&R": "MinimaxH3LatentUpscaler3D"
+   },
+   "widgets_values": [
+    "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+    "target dimensions",
+    640,
+    384,
+    32,
+    false,
+    true,
+    "cpu",
+    "fp32"
+   ],
+   "widgets_values_named": {
+    "model_name": "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+    "mode": "target dimensions",
+    "mode.width": 640,
+    "mode.height": 384,
+    "align": 32,
+    "enable_temporal_chunking": false,
+    "force_unload": true,
+    "device": "cpu",
+    "precision": "fp32"
+   }
+  },
+  {
+   "id": 3,
+   "type": "H3_BinaryLatentRefine",
+   "pos": [
+    560,
+    480
+   ],
+   "size": [
+    430,
+    400
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "latent",
+     "name": "latent",
+     "type": "LATENT",
+     "link": 2
+    },
+    {
+     "localized_name": "prompt",
+     "name": "prompt",
+     "type": "STRING",
+     "widget": {
+      "name": "prompt"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "width",
+     "name": "width",
+     "type": "INT",
+     "widget": {
+      "name": "width"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "height",
+     "name": "height",
+     "type": "INT",
+     "widget": {
+      "name": "height"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "seconds",
+     "name": "seconds",
+     "type": "FLOAT",
+     "widget": {
+      "name": "seconds"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "steps",
+     "name": "steps",
+     "type": "INT",
+     "widget": {
+      "name": "steps"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "refine_sigma",
+     "name": "refine_sigma",
+     "type": "FLOAT",
+     "widget": {
+      "name": "refine_sigma"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "seed",
+     "name": "seed",
+     "type": "INT",
+     "widget": {
+      "name": "seed"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "model_dir",
+     "name": "model_dir",
+     "type": "STRING",
+     "widget": {
+      "name": "model_dir"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "binary",
+     "name": "binary",
+     "type": "STRING",
+     "widget": {
+      "name": "binary"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "clipproj_dir",
+     "name": "clipproj_dir",
+     "type": "STRING",
+     "widget": {
+      "name": "clipproj_dir"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "clipproj_proj",
+     "name": "clipproj_proj",
+     "type": "STRING",
+     "widget": {
+      "name": "clipproj_proj"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "extra_args",
+     "name": "extra_args",
+     "type": "STRING",
+     "widget": {
+      "name": "extra_args"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "video",
+     "name": "video",
+     "type": "VIDEO",
+     "links": [
+      3
+     ]
+    },
+    {
+     "localized_name": "video_path",
+     "name": "video_path",
+     "type": "STRING",
+     "links": null
+    }
+   ],
+   "title": "③ 全分辨率精修（注意内存）",
+   "properties": {
+    "Node name for S&R": "H3_BinaryLatentRefine"
+   },
+   "widgets_values": [
+    "A red fox walks through fresh snow in a pine forest.",
+    640,
+    384,
+    0.5,
+    2,
+    0.4,
+    42,
+    "fixed",
+    "/Users/jay/h3_sys/MiniMax-H3-Convrot",
+    "/Volumes/data/git/c/h3c/h3",
+    "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot",
+    "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3",
+    ""
+   ],
+   "widgets_values_named": {
+    "prompt": "A red fox walks through fresh snow in a pine forest.",
+    "width": 640,
+    "height": 384,
+    "seconds": 0.5,
+    "steps": 2,
+    "refine_sigma": 0.4,
+    "seed": 42,
+    "control_after_generate": "fixed",
+    "model_dir": "/Users/jay/h3_sys/MiniMax-H3-Convrot",
+    "binary": "/Volumes/data/git/c/h3c/h3",
+    "clipproj_dir": "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot",
+    "clipproj_proj": "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3",
+    "extra_args": ""
+   }
+  },
+  {
+   "id": 4,
+   "type": "SaveVideo",
+   "pos": [
+    1050,
+    520
+   ],
+   "size": [
+    320,
+    290
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "视频",
+     "name": "video",
+     "type": "VIDEO",
+     "link": 3
+    },
+    {
+     "localized_name": "文件名前缀",
+     "name": "filename_prefix",
+     "type": "STRING",
+     "widget": {
+      "name": "filename_prefix"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "格式",
+     "name": "format",
+     "type": "COMFY_DYNAMICCOMBO_V3",
+     "widget": {
+      "name": "format"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "codec",
+     "name": "format.codec",
+     "type": "COMFY_DYNAMICCOMBO_V3",
+     "widget": {
+      "name": "format.codec"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "编码器",
+     "name": "codec",
+     "shape": 7,
+     "type": "COMFY_DYNAMICCOMBO_V3",
+     "widget": {
+      "name": "codec"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "video",
+     "name": "video",
+     "type": "VIDEO",
+     "links": null
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveVideo"
+   },
+   "widgets_values": [
+    "video/h3_two_stage",
+    "auto",
+    "auto",
+    "auto"
+   ],
+   "widgets_values_named": {
+    "filename_prefix": "video/h3_two_stage",
+    "format": "auto",
+    "format.codec": "auto",
+    "codec": "auto"
+   }
+  },
+  {
+   "id": 5,
+   "type": "MarkdownNote",
+   "pos": [
+    -65.70973181967753,
+    1022.1712014642981
+   ],
+   "size": [
+    690,
+    560
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "说明 / 注意事项",
+   "properties": {
+    "Node name for S&R": "MarkdownNote"
+   },
+   "widgets_values": [
+    "# H3 两阶段管线（变体 A）：低分生成 → 潜空间放大 → **全分辨率精修**\n\n`H3_BinaryLatent` → `MinimaxH3LatentUpscaler3D` → `H3_BinaryLatentRefine` → `SaveVideo`\n\n## 三个尺寸怎么填（三个节点会显示成同一个数，这是正常的）\n\n| 节点 | 字段 | 含义 |\n|---|---|---|\n| ① | `width` / `height` | 低分首轮的**输出视频**尺寸 |\n| ① | `extra_args` 里的 `--render-width/--render-height` | **内部画布 ← 真正的「低分辨率」旋钮** |\n| ② | `mode.width` / `mode.height` | 放大的**目标像素**尺寸 |\n| ③ | `width` / `height` | 最终输出尺寸 |\n\n硬约束：\n\n- **② 必须等于 ③**：放大器输出的 latent 直接决定 ③ 的 token 网格，对不上引擎报元素数不匹配。\n- **① 的 `render-*` 与 ① 的输出同宽高比，且是 32 的倍数**（取输出的一半最省）。\n\n## h3_audio 必须传下来\n\n`H3_BinaryLatent` 把音频 latent 放在 LATENT 字典的 `h3_audio` 键。\n下游节点靠它保留音轨：\n\n- 变体 A 的 `H3_BinaryLatentRefine` 用它按**同一个 `refine_sigma`** 重新加噪音频并与\n  视频联合去噪，音视频一致性才成立。若它丢失，引擎会改用单位正态噪声（σ=1）初始化，\n  而 schedule 从 `refine_sigma` 起步 —— 分布外输入，结果是**明显更响的噪声音轨，\n  且加步数救不回来**。\n- 变体 B 的 `H3_BinaryLatentDecode` 直接用它做音频 VAE 解码；丢了则退化为静音。\n\n（放大器节点原先只返回 `{\"samples\": ...}` 会丢掉这个键，本仓库已修。）\n\n## refine_sigma 的取舍（实测，对比第一阶段画面）\n\n| `refine_sigma` | 0.05 | 0.1 | 0.2 | 0.4 | 0.6 |\n|---|---|---|---|---|---|\n| SSIM vs 第一阶段 | 0.95 | 0.92 | 0.89 | 0.87 | 0.84 |\n\n参照标尺：画面未变 = 0.99，换种子重新生成 = 0.84。\n**0.3~0.5 是可用区间**；0.6 以上基本等于重新生成。\n\n## 内存信封（16 GB 机器实测）\n\nDiT 激活 ≈ 空间位置数 × T；**超过约 30k tokens 就会撑爆内存**。\n（实测 32,560 tokens 跑通；130,240 tokens 导致系统重启。）\n\n`tokens = (输出宽/16) × (输出高/16) × T`，`T` 由 `seconds` 决定（引擎按 24fps 换算后\n对齐到 `5+17k` 帧，latent 时间长度为 `T = 5k+2`）：\n\n| `seconds` | 0.5 | 1.0 | 2.0 | 3.0 | 5.0 |\n|---|---|---|---|---|---|\n| 帧数 | 22 | 39 | 56 | 73 | 124 |\n| latent T | 7 | 12 | 17 | 22 | 37 |\n\n| 最终输出 | 空间 | 0.5s | 1s | 2s | 5s |\n|---|---|---|---|---|---|\n| 640x384 | 960 | 6,720 | 11,520 | 16,320 | 35,520 ⚠ |\n| 1024x576 | 2,304 | 16,128 | 27,648 | 39,168 ⚠ | 85,248 ❌ |\n| 1280x704 | 3,520 | 24,640 | 42,240 ⚠ | 59,840 ❌ | 130,240 ❌ |\n\n⚠ 接近上限，❌ 会崩。\n\n## 本变体的问题\n\n③ 会在**全分辨率**下跑 DiT，因此受上面的 token 上限约束 —— 想清楚目标尺寸再配。\n**要出 1280x704 / 5 秒请改用变体 B**（`h3_two_stage_upscale_decode.json`）。\n\n## 耗时参考（640x384 / 0.5s / 2 步，实测）\n\n| 阶段 | 耗时 |\n|---|---|\n| ① 低分生成 | 57.9s |\n| ② 潜空间放大（CPU，345M 参数） | 2.4s（1280x704 时 60.9s） |\n| ③ 全分辨率精修 | 87.4s |\n"
+   ],
+   "widgets_values_named": {
+    "text": "# H3 两阶段管线（变体 A）：低分生成 → 潜空间放大 → **全分辨率精修**\n\n`H3_BinaryLatent` → `MinimaxH3LatentUpscaler3D` → `H3_BinaryLatentRefine` → `SaveVideo`\n\n## 三个尺寸怎么填（三个节点会显示成同一个数，这是正常的）\n\n| 节点 | 字段 | 含义 |\n|---|---|---|\n| ① | `width` / `height` | 低分首轮的**输出视频**尺寸 |\n| ① | `extra_args` 里的 `--render-width/--render-height` | **内部画布 ← 真正的「低分辨率」旋钮** |\n| ② | `mode.width` / `mode.height` | 放大的**目标像素**尺寸 |\n| ③ | `width` / `height` | 最终输出尺寸 |\n\n硬约束：\n\n- **② 必须等于 ③**：放大器输出的 latent 直接决定 ③ 的 token 网格，对不上引擎报元素数不匹配。\n- **① 的 `render-*` 与 ① 的输出同宽高比，且是 32 的倍数**（取输出的一半最省）。\n\n## h3_audio 必须传下来\n\n`H3_BinaryLatent` 把音频 latent 放在 LATENT 字典的 `h3_audio` 键。\n下游节点靠它保留音轨：\n\n- 变体 A 的 `H3_BinaryLatentRefine` 用它按**同一个 `refine_sigma`** 重新加噪音频并与\n  视频联合去噪，音视频一致性才成立。若它丢失，引擎会改用单位正态噪声（σ=1）初始化，\n  而 schedule 从 `refine_sigma` 起步 —— 分布外输入，结果是**明显更响的噪声音轨，\n  且加步数救不回来**。\n- 变体 B 的 `H3_BinaryLatentDecode` 直接用它做音频 VAE 解码；丢了则退化为静音。\n\n（放大器节点原先只返回 `{\"samples\": ...}` 会丢掉这个键，本仓库已修。）\n\n## refine_sigma 的取舍（实测，对比第一阶段画面）\n\n| `refine_sigma` | 0.05 | 0.1 | 0.2 | 0.4 | 0.6 |\n|---|---|---|---|---|---|\n| SSIM vs 第一阶段 | 0.95 | 0.92 | 0.89 | 0.87 | 0.84 |\n\n参照标尺：画面未变 = 0.99，换种子重新生成 = 0.84。\n**0.3~0.5 是可用区间**；0.6 以上基本等于重新生成。\n\n## 内存信封（16 GB 机器实测）\n\nDiT 激活 ≈ 空间位置数 × T；**超过约 30k tokens 就会撑爆内存**。\n（实测 32,560 tokens 跑通；130,240 tokens 导致系统重启。）\n\n`tokens = (输出宽/16) × (输出高/16) × T`，`T` 由 `seconds` 决定（引擎按 24fps 换算后\n对齐到 `5+17k` 帧，latent 时间长度为 `T = 5k+2`）：\n\n| `seconds` | 0.5 | 1.0 | 2.0 | 3.0 | 5.0 |\n|---|---|---|---|---|---|\n| 帧数 | 22 | 39 | 56 | 73 | 124 |\n| latent T | 7 | 12 | 17 | 22 | 37 |\n\n| 最终输出 | 空间 | 0.5s | 1s | 2s | 5s |\n|---|---|---|---|---|---|\n| 640x384 | 960 | 6,720 | 11,520 | 16,320 | 35,520 ⚠ |\n| 1024x576 | 2,304 | 16,128 | 27,648 | 39,168 ⚠ | 85,248 ❌ |\n| 1280x704 | 3,520 | 24,640 | 42,240 ⚠ | 59,840 ❌ | 130,240 ❌ |\n\n⚠ 接近上限，❌ 会崩。\n\n## 本变体的问题\n\n③ 会在**全分辨率**下跑 DiT，因此受上面的 token 上限约束 —— 想清楚目标尺寸再配。\n**要出 1280x704 / 5 秒请改用变体 B**（`h3_two_stage_upscale_decode.json`）。\n\n## 耗时参考（640x384 / 0.5s / 2 步，实测）\n\n| 阶段 | 耗时 |\n|---|---|\n| ① 低分生成 | 57.9s |\n| ② 潜空间放大（CPU，345M 参数） | 2.4s（1280x704 时 60.9s） |\n| ③ 全分辨率精修 | 87.4s |\n"
+   },
+   "color": "#432",
+   "bgcolor": "#653"
+  },
+  {
+   "id": 1,
+   "type": "H3_BinaryLatent",
+   "pos": [
+    70,
+    120
+   ],
+   "size": [
+    430,
+    600
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [
+    {
+     "localized_name": "first_frame",
+     "name": "first_frame",
+     "shape": 7,
+     "type": "IMAGE",
+     "link": null
+    },
+    {
+     "localized_name": "last_frame",
+     "name": "last_frame",
+     "shape": 7,
+     "type": "IMAGE",
+     "link": null
+    },
+    {
+     "localized_name": "prompt",
+     "name": "prompt",
+     "type": "STRING",
+     "widget": {
+      "name": "prompt"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "width",
+     "name": "width",
+     "type": "INT",
+     "widget": {
+      "name": "width"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "height",
+     "name": "height",
+     "type": "INT",
+     "widget": {
+      "name": "height"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "resolution_preset",
+     "name": "resolution_preset",
+     "type": "COMBO",
+     "widget": {
+      "name": "resolution_preset"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "seconds",
+     "name": "seconds",
+     "type": "FLOAT",
+     "widget": {
+      "name": "seconds"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "steps",
+     "name": "steps",
+     "type": "INT",
+     "widget": {
+      "name": "steps"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "seed",
+     "name": "seed",
+     "type": "INT",
+     "widget": {
+      "name": "seed"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "lora",
+     "name": "lora",
+     "type": "STRING",
+     "widget": {
+      "name": "lora"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "auto_steps",
+     "name": "auto_steps",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "auto_steps"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "model_dir",
+     "name": "model_dir",
+     "type": "STRING",
+     "widget": {
+      "name": "model_dir"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "output_path",
+     "name": "output_path",
+     "type": "STRING",
+     "widget": {
+      "name": "output_path"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "core_reuse",
+     "name": "core_reuse",
+     "type": "INT",
+     "widget": {
+      "name": "core_reuse"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "reuse",
+     "name": "reuse",
+     "type": "INT",
+     "widget": {
+      "name": "reuse"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "layers",
+     "name": "layers",
+     "type": "INT",
+     "widget": {
+      "name": "layers"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "fast_stream",
+     "name": "fast_stream",
+     "type": "BOOLEAN",
+     "widget": {
+      "name": "fast_stream"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "binary",
+     "name": "binary",
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "binary"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "clipproj_dir",
+     "name": "clipproj_dir",
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "clipproj_dir"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "clipproj_proj",
+     "name": "clipproj_proj",
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "clipproj_proj"
+     },
+     "link": null
+    },
+    {
+     "localized_name": "extra_args",
+     "name": "extra_args",
+     "shape": 7,
+     "type": "STRING",
+     "widget": {
+      "name": "extra_args"
+     },
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "localized_name": "video",
+     "name": "video",
+     "type": "VIDEO",
+     "links": null
+    },
+    {
+     "localized_name": "latent",
+     "name": "latent",
+     "type": "LATENT",
+     "links": [
+      1
+     ]
+    },
+    {
+     "localized_name": "video_path",
+     "name": "video_path",
+     "type": "STRING",
+     "links": null
+    }
+   ],
+   "title": "① 低分生成 — 内部画布 320x192（在 extra_args 里）",
+   "properties": {
+    "Node name for S&R": "H3_BinaryLatent"
+   },
+   "widgets_values": [
+    "A red fox walks through fresh snow in a pine forest.",
+    640,
+    384,
+    "custom (用 width/height)",
+    0.5,
+    4,
+    42,
+    "fixed",
+    "",
+    false,
+    "/Users/jay/h3_sys/MiniMax-H3-Convrot",
+    "",
+    1,
+    1,
+    0,
+    false,
+    "/Volumes/data/git/c/h3c/h3",
+    "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot",
+    "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3",
+    "--render-width 320 --render-height 192"
+   ],
+   "widgets_values_named": {
+    "prompt": "A red fox walks through fresh snow in a pine forest.",
+    "width": 640,
+    "height": 384,
+    "resolution_preset": "custom (用 width/height)",
+    "seconds": 0.5,
+    "steps": 4,
+    "seed": 42,
+    "control_after_generate": "fixed",
+    "lora": "",
+    "auto_steps": false,
+    "model_dir": "/Users/jay/h3_sys/MiniMax-H3-Convrot",
+    "output_path": "",
+    "core_reuse": 1,
+    "reuse": 1,
+    "layers": 0,
+    "fast_stream": false,
+    "binary": "/Volumes/data/git/c/h3c/h3",
+    "clipproj_dir": "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot",
+    "clipproj_proj": "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3",
+    "extra_args": "--render-width 320 --render-height 192"
+   }
+  }
+ ],
+ "links": [
+  [
+   1,
+   1,
+   1,
+   2,
+   0,
+   "LATENT"
+  ],
+  [
+   2,
+   2,
+   0,
+   3,
+   0,
+   "LATENT"
+  ],
+  [
+   3,
+   3,
+   0,
+   4,
+   0,
+   "VIDEO"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.6078,
+   "offset": [
+    859.4669299111549,
+    128.33333333333337
+   ]
+  }
+ },
+ "version": 0.4
+}

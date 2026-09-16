@@ -1145,3 +1145,194 @@ dispatch 交叉验证：base `linear=4000`（20×50×4）；`reuse 2` → `2200`
 2. **1 GiB states 上限**：长视频（>8s）/1080p 会回退到 per-chunk，可考虑放宽或按可用内存自适应。
 3. **低分辨率 I/O bound**：576×320 档已贴住 I/O 下限（86.7s），进一步只能动 `--layers`/`--reuse`，
    `--token-reduction` 在此档基本无效。
+
+# ===== Task Plan（当前任务）: Latent Upscaler 接入（两阶段 hires-fix）=====
+
+## Goal
+把 ComfyUI 的 `Comfyui_Minimax_h3_latent_Upscaler`（神经潜空间放大器）工作流接入 h3c：
+低分辨率生成 → latent 放大 → 高分辨率 refine，用便宜的小分辨率步替代部分昂贵的大分辨率步。
+
+## 背景数据（决定这条路值得做）
+- 权重 **659 MB**（`ComfyUI/models/latent_upscale_models/minimax_h3_latent_upscaler_3d_fp16.safetensors`，
+  322 张量全 fp16）
+- 结构：24× ResBlockEmb3D + 12× TemporalConv + conv_in/conv_out；
+  **48 个 Conv3d(512→512, 3×3×3)** 占绝大部分计算
+- **总计算量 15.58 TFLOPs**（864×480 的 latent 14×54×30）→ M4 十核约 **5–12 秒**（fp16 峰值 ~9 TFLOPS，小核效率按 30%）
+- 对照：1280×704 的一步 denoise ≈ **238s** ⇒ 放大成本 ≈ **0.05 步**，可忽略
+- 官方管线（`workflow3.json`）：`ResolutionSelector 0.2MP` → 5 步 → 放大到 `1 MP` → 4 步 refine
+- **注意**：官方 sigma（`ManualSigmas [0.9035, 0.8, 0.6316, 0.3158, 0]`）来自
+  `BasicScheduler(simple, 8)`，与 h3c 的 `h3_serving_schedule_build`（linear base grid）**不同源**
+
+## Phases
+### Phase 53: 能力缺口定位 — complete
+- h3c 缺"从 latent 续跑"：`--latent-in` 的语义是 `skipping denoise`，只解码
+- 放大器网络未移植（需 Conv3d kernel）
+
+### Phase 54: `--refine-sigma`（img2img / hires-fix） — complete
+- `h3.h`：`h3_params.refine_sigma`（0 = 保持原解码语义）
+- `main.c`：`--refine-sigma S`（新增 `parse_float`，范围 [0,1] 且拒绝 NaN）+ usage；
+  无 prompt 时警告并回落到解码路径
+- `h3_host.c/.h`：新增 `h3_refine_schedule_build(start_sigma, steps, *schedule)`
+  —— 反解 `sigma = shift·b/(1+(shift−1)·b)` 求起始 base，保持发布曲线形状；
+  **两模态各自反解**，故 video/audio 都从同一 sigma 起步
+- `h3.c`：新增 `h3_seed_refine_latents()` —— 读 bundle、校验视频元素数、
+  按 `x = (1−σ)·clean + σ·noise` 重新加噪（复用同一 per-modality RNG 流 ⇒ 固定 seed 可复现）；
+  音频尺寸不匹配时警告并退回纯噪声
+- 测试：`tests/test_h3.c` +19 行（起始 sigma 精度、单调性、边界拒绝）→ 1768 → **1788 checks**
+
+### Phase 55: 端到端验证 — complete
+| 对照 | SSIM(All) | 含义 |
+|---|---|---|
+| C（refine σ=0.05，2 步）vs A（5 步生成） | **0.9575** | 从 A 的 latent 起跑，几乎复现 |
+| D（纯噪声，2 步）vs A | 0.7880 | 独立生成 |
+
+- 尺寸校验通过；`linear` dispatch 计数符合预期（5 步 = 1000，4 步 = 800）
+
+### Phase 56: 放大器所需 GPU 原语（B1–B3） — complete
+
+**关键转折：B3 最大的未知数（GroupNorm）发现仓库已有现成实现。**
+`h3_gpu_vae_encoder_group_norm_silu_f32` 就是 NDHWC 布局下的 `GroupNorm(groups,C)+SiLU`，
+正好是放大器 `in_layers` / `TemporalConv.norm` 的形式。于是 B3 从"要新写 GroupNorm"
+缩成"只补一个去掉 SiLU 的变体"。
+
+| 子项 | 内容 | 状态 |
+|---|---|---|
+| B1 | `h3_gpu_conv3d_pad_f32`（padding + groups 参数化） | ✅ |
+| B2 | `h3_resize_bilinear_f32`（CPU，对 PyTorch 参考值逐点吻合） | ✅ 41 项测试 |
+| B3 | `h3_gpu_group_norm_f32`（无 SiLU）+ `h3_gpu_channel_scale_shift_f32` | ✅ 编译零 error |
+
+- 放大器索引映射：`res_index(b) = b + (b+1)/2`，`temp_index(b) = res_index(b)+1`（b 为偶数时）
+- 张量数核对：in_blocks 156 + out_blocks 156 + 边界 10 = **322** ✓ 与 safetensors 一致
+- 已有原语可直接复用：`h3_gpu_silu_f32` / `h3_gpu_linear_f32` / `h3_gpu_add_scaled_f32` / `h3_gpu_conv3d_pad_f32`
+  ⇒ **网络可完全用现有 C 原语搭建，不必走 MPSGraph 组合**
+
+### Phase 57: 放大器网络组装（B4） — pending（已降级，见 Decisions）
+| 子项 | 内容 | 风险 |
+|---|---|---|
+| B4a | 权重加载（322 张量 + 索引映射） | 机械，低 |
+| B4b | 前向组装（24 ResBlock + 12 TemporalConv） | 中 |
+| B4c | CLI + 管线接线 | 低 |
+| B4d | 对 PyTorch 逐点验证 | **真正的验收门槛** |
+
+### Phase 58: ComfyUI 桥接 + 工作流 — complete（并修掉 3 个阻塞级 bug）
+
+`h3_binary_nodes` 是**软链到本仓库**的，故改动直接生效。
+
+| # | Bug | 后果 |
+|---|---|---|
+| 1 | `_read_h3_latent` 只认 v2，而引擎 **恒写 v3** | `H3_BinaryLatent` 对任何输入抛异常 |
+| 2 | `_write_h3_latent` 写 v2，但 reader **无条件先吃 28 字节**（`h3.c:2578`） | 4 字节错位 → `truncated audio latent`；`H3_BinaryLatentDecode` 从未工作过 |
+| 3 | 放大器只返回 `{"samples":...}`，**丢掉 `h3_audio`** | 会掉进"纯噪声音轨"坑 |
+
+- 新增 `H3_BinaryLatentRefine`（带 `prompt`；引擎要 `-p` 才走去噪，否则退化成解码）
+- 新增 `gen_h3_two_stage_workflow.py` → 产出两份 UI 工作流：
+  - `h3_two_stage_pipeline.json`（①→②→Refine）
+  - `h3_two_stage_upscale_decode.json`（①→②→Decode）
+- **端到端实跑成功**（ComfyUI HTTP API，`POST /prompt` + 轮询 `/history`）：
+  两条链路各产出 mp4；`h3_audio` 穿过放大器的相关系数 **+1.0000**
+
+### Phase 59: 两阶段收益实测 — **变体 B 全尺寸跑通并被接受**
+
+| 配置 | tokens | 结果 |
+|---|---|---|
+| render 640×352, 121 帧 | 32,560 | ✅ 跑通（DiT 721s + VAE 175s ≈ 15 min） |
+| render 1280×704, 22 帧 | 24,640 | ✅ 跑通（96.6s/步） |
+| **render 1280×704, 121 帧** | **130,240** | ❌ **触发系统重启** |
+
+**推论：直接全分辨率生成是同一个 token 数，同样跑不动。**
+⇒ "两阶段 vs 直接"在 1280×704/5s 上**不成立**，两条路都越界。
+
+**替代路线（变体 B）已跑通并被用户接受**（2026-09-16 21:15 实跑）：
+
+```
+低分生成(① steps=4, render 640×352) → 放大器(→1280×704) → H3_BinaryLatentDecode
+→ output/video/h3_upscale_decode_00001_.mp4
+   1280×704 / 124 帧 / 含音轨 / 4.1 MB
+   帧内对比度 std=74.9，相邻帧差=4.62   → 真实画面 + 有运动
+   音轨 rms=0.00089（噪声失败案例是 0.486，低 546×）→ 真实音频
+   音轨时长 5.18s ≈ 124 帧@24fps = 5.17s         → 音视频长度对齐
+```
+
+**用户结论：效果可以接受** ⇒ **B4（把放大器搬进 h3c）无限期搁置**——
+它唯一剩下的收益是"去掉 ComfyUI 依赖"，而现有链路已经能出目标尺寸且画质可接受。
+
+附带说明：音轨 rms 0.00089 比 640×384 那次（0.00360）安静约 4 倍，
+判断为内容相关（雪林环境音），非缺陷；如需确认可目视/试听。
+
+### Phase 60: 新权重（pruned-int8 DiT / int8 VAE / 8step 蒸馏）实测 — complete
+
+- 引擎**按目录扫描**发现新权重（与文件名无关），`--info` 确认
+- `steps=2 / 1s / 256×256 / --ssd-streaming` **能成功出片**（39 帧、含音轨、120s、无警告）
+- 但 **2 步对 8step 蒸馏模型未收敛**：2步 vs 8步 SSIM 0.581 ≈ 换种子的无关生成 0.551
+- **横向标尺**：4步 vs 8步 = 0.680，2步 vs 4步 = 0.603 ⇒ 4 步在收敛但仍未到位
+- 耗时公式（`H3_DIT_RESIDENT_BLOCKS=1`）：`总墙钟 ≈ 22.5s + 17.1s × steps`
+
+## Decisions Made（本任务）
+| Decision | Rationale |
+|---|---|
+| 复用 `--latent-in` 而非新增路径参数 | `--latent-in` + `--refine-sigma` = img2img；只给 `--latent-in` = 原解码语义，零破坏 |
+| refine 用**独立构造**的 schedule，而非截取 | 两边 sigma 调度不同源；独立构造才能精确指定起始 sigma |
+| 两模态各自反解 base | 同一 start_sigma 下 video/audio 都能从该 sigma 起步（各自 shift 不同） |
+| 先做 A 再做 B | A 能立刻用 ComfyUI 放大跑通管线验证收益，避免在未实测前投入 B 的 ~600 行 |
+| **B4 无限期搁置** | 放大器 CPU 前向只要 2.4s（1280×704 时 60.9s）——**它不是瓶颈**；而变体 B 已跑通 1280×704/124 帧并经用户确认"效果可以接受"。B4 唯一剩下的收益是"去掉 ComfyUI 依赖"，不值得 350–400 行 C |
+| **保留 steps=4** | 用户实跑后确认可接受（变体 B 无精修，① 的步数直接决定最终画质；8step 蒸馏权重下 4 步属欠收敛，但画质够用即止）|
+| **所有性能测量必须加 `H3_DIT_RESIDENT_BLOCKS=1`** | 自适应驻留随系统内存漂移；不钉住则同一参数能差 4.6×（见 Errors） |
+
+## Errors Encountered（本任务）
+| Error | Attempt | Resolution |
+|---|---|---|
+| `truncated audio latent` | 1 | 根因是 `_write_h3_latent` 写 v2 而 reader 恒吃 28 字节 → 4 字节错位。改为写 v3（dtype=0） |
+| `--refine-sigma needs a prompt (-p)` | 1 | refine 节点缺 `prompt` 输入；补上并在空值时硬报错 |
+| 放大器丢 `h3_audio` | 1 | 改为保留 LATENT 字典附加键 |
+| **`h3: missing required model file`** | 1 | 用户工作流里 `binary` 指向 `/Volumes/data/git/c/h3.c/h3`，该目录**不存在**（仓库已改名 `h3c`）。新工作流用节点默认值 |
+| **系统重启（OOM）** | 1 | 1280×704 + 121 帧 = 130,240 tokens。改用变体 B 或降时长 |
+| **steps=4 报出 422s** | 2 | **测量错误**，非真实结果：未钉住驻留块数，引擎自适应选了 11 块。钉住 1 块后重测为 **91s**（差 4.6×） |
+| `exec_command` 工具不存在 | 1 | 工具名应为 `execute_command` |
+| zsh 不分词 `$VAR` | 1 | 多 flag 不要用变量承载（zsh 无引号变量不分词） |
+| `pkill -f "ComfyUI/main.py"` 无效 | 1 | 实际命令行是 `./.venv/bin/python3 main.py`；改用 `lsof -ti:8188` 精确定位 |
+
+## 本轮改动文件
+| 文件 | 改动 |
+|---|---|
+| `h3.h` / `main.c` / `h3_host.h` / `h3_host.c` / `h3.c` | `refine_sigma`（阶段 A）+ `H3_LATENT_VERSION_F16` 读写 |
+| `h3_gpu.h/.m` / `h3_shaders.metal` | `conv3d_pad_f32`、`group_norm_f32`、`channel_scale_shift_f32`（+ kernel 注册与参数镜像） |
+| `h3_host.c/.h` | `h3_resize_bilinear_f32` |
+| `tests/test_h3.c` | schedule 测试 + bilinear 测试 → **1829 checks** |
+| `comfyui_nodes/h3_binary.py` | `_read_h3_latent`(v2+v3/f32+f16)、`_write_h3_latent`(v3)、**新增 `H3_BinaryLatentRefine`** |
+| `comfyui_nodes/__init__.py` | 注册 refine 节点 |
+| `h3_latent_bridge.py`（仓库根） | 终端桥接工具（H3LT bundle ↔ ComfyUI `.latent`） |
+| `gen_h3_two_stage_workflow.py` | 生成两份 UI 工作流 |
+| `README.md` | §10「Two-stage latent pipeline」 |
+| `ComfyUI/custom_nodes/Comfyui_Minimax_h3_latent_Upscaler/.../minimax_h3_latent_upscaler_3d.py` | 保留 `h3_audio`（第三方节点，1 行补丁） |
+
+## Next
+1. **变体 B 已验证可用** —— 直接用于生产；`steps=4` 经用户确认可接受
+2. **B4 无限期搁置**（见上）
+3. 若日后仍要做 B4，先补 `B4d`（对 PyTorch 逐点对拍），否则接线无法证明正确
+4. **所有后续性能测量一律加 `H3_DIT_RESIDENT_BLOCKS=1`**
+5. 新权重：本任务用 4 步已够；追求上限可试 8 步
+6. 变体 A（含精修）仍受 token 上限约束，大尺寸请用变体 B
+
+## 用法（当前）
+```bash
+# 变体 A（有精修，受 token 上限约束）—— 直接在 ComfyUI 打开工作流
+#   h3_two_stage_pipeline.json
+
+# 变体 B（无精修，能出 1280x704 / 5s）—— h3_two_stage_upscale_decode.json
+#   ① 输出 1280x704 + extra_args "--render-width 640 --render-height 352" + seconds 5
+#   ② target dimensions 1280x704
+#   ③ H3_BinaryLatentDecode(1280, 704)
+
+# 终端路线（等价，无需 ComfyUI）
+./h3 -d MODEL -p "..." -o s1.mp4 --width 1280 --height 704 \
+     --render-width 640 --render-height 352 --frames 121 --steps 5 \
+     --latent-out s1.h3lt
+python3 h3_latent_bridge.py to-comfy s1.h3lt          # → ComfyUI input/
+#   （ComfyUI 内放大后 SaveLatent）
+python3 h3_latent_bridge.py to-bundle <saved.latent> -o up.h3lt --audio-from s1.h3lt
+./h3 -d MODEL -p "..." -o final.mp4 --width 1280 --height 704 --frames 121 \
+     --steps 4 --latent-in up.h3lt --refine-sigma 0.4
+
+# 性能测量必须钉住驻留：
+export H3_DIT_RESIDENT_BLOCKS=1
+```

@@ -117,6 +117,64 @@ static void test_schedule(void) {
     }
     CHECK(!h3_serving_schedule_build(1, &schedule));
     CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
+
+    /* Refine schedule: the released curve, but beginning at the requested
+     * sigma so a re-noised latent can be denoised down from there. */
+    CHECK(h3_refine_schedule_build(0.9f, 4, &schedule));
+    CHECK(schedule.steps == 4);
+    CHECK(schedule.video[0] > 0.89f && schedule.video[0] < 0.91f);
+    CHECK(schedule.audio[0] > 0.89f && schedule.audio[0] < 0.91f);
+    CHECK(schedule.video[4] == 0.0f && schedule.audio[4] == 0.0f);
+    for (int index = 0; index < schedule.steps; index++) {
+        CHECK(schedule.video[index] > schedule.video[index + 1]);
+        CHECK(schedule.audio[index] > schedule.audio[index + 1]);
+    }
+    CHECK(h3_refine_schedule_build(0.5f, 4, &schedule));
+    CHECK(schedule.video[0] > 0.49f && schedule.video[0] < 0.51f);
+    CHECK(schedule.audio[0] > 0.49f && schedule.audio[0] < 0.51f);
+    CHECK(!h3_refine_schedule_build(0.0f, 4, &schedule));
+    CHECK(!h3_refine_schedule_build(1.5f, 4, &schedule));
+    CHECK(!h3_refine_schedule_build(0.5f, 0, &schedule));
+    CHECK(!h3_refine_schedule_build(0.5f, H3_MAX_STEPS + 1, &schedule));
+
+    /* Bilinear volume resize: the latent upscaler interpolates with an
+     * unchanged temporal extent, so it must match PyTorch's trilinear resize
+     * per frame. Expected values come from torch.nn.functional.interpolate. */
+    {
+        const float source_2x2[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        const float want_4x4[16] = {
+            1.0f, 1.25f, 1.75f, 2.0f,
+            1.5f, 1.75f, 2.25f, 2.5f,
+            2.5f, 2.75f, 3.25f, 3.5f,
+            3.0f, 3.25f, 3.75f, 4.0f
+        };
+        float got_4x4[16];
+        CHECK(h3_resize_bilinear_f32(source_2x2, 1, 1, 2, 2, got_4x4, 4, 4));
+        for (int index = 0; index < 16; index++)
+            CHECK(close_enough(got_4x4[index], want_4x4[index], 1e-5));
+
+        const float source_3x2[6] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+        const float want_5x3[15] = {
+            1.0f, 1.5f, 2.0f,
+            1.8f, 2.3f, 2.8f,
+            3.0f, 3.5f, 4.0f,
+            4.2f, 4.7f, 5.2f,
+            5.0f, 5.5f, 6.0f
+        };
+        float got_5x3[15];
+        CHECK(h3_resize_bilinear_f32(source_3x2, 1, 1, 3, 2, got_5x3, 5, 3));
+        for (int index = 0; index < 15; index++)
+            CHECK(close_enough(got_5x3[index], want_5x3[index], 1e-5));
+
+        /* Identity geometry copies through; invalid geometry is rejected. */
+        float identical[4];
+        CHECK(h3_resize_bilinear_f32(source_2x2, 1, 1, 2, 2, identical, 2, 2));
+        for (int index = 0; index < 4; index++)
+            CHECK(identical[index] == source_2x2[index]);
+        CHECK(!h3_resize_bilinear_f32(NULL, 1, 1, 2, 2, identical, 2, 2));
+        CHECK(!h3_resize_bilinear_f32(source_2x2, 1, 1, 2, 2, identical, 0, 2));
+        CHECK(!h3_resize_bilinear_f32(source_2x2, 0, 1, 2, 2, identical, 2, 2));
+    }
 }
 
 static void test_dit_reuse_schedule(void) {

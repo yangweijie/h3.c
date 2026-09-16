@@ -450,6 +450,66 @@ Standalone audio must accompany an image or video reference. Audio references
 must be 2–15 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 15 seconds.
 
+### 10. Two-stage latent pipeline: generate small, upscale, refine
+
+A 1280x704 canvas costs about four times what 640x352 does, so generate the
+small latent first, enlarge it, and spend only a few denoising steps at the
+final size. h3c owns both ends of that split; the latent upscaler currently
+lives in ComfyUI, so the middle step hands over through a converter.
+
+```sh
+# 1. Low-resolution first pass, keeping the denoised latent.
+./h3 -d ./MiniMax-H3 -p "A red fox walks through fresh snow." \
+  --width 1280 --height 704 --render-width 640 --render-height 352 \
+  --frames 121 --steps 5 -o outputs/stage1.mp4 --latent-out outputs/stage1.h3lt
+
+# 2. Hand it to ComfyUI: LoadLatent -> MinimaxH3LatentUpscaler3D -> SaveLatent.
+python3 h3_latent_bridge.py to-comfy outputs/stage1.h3lt
+
+# 3. Bring the enlarged latent back, re-attaching the audio block.
+python3 h3_latent_bridge.py to-bundle \
+  /path/to/ComfyUI/output/latents/ComfyUI_00001_.latent \
+  -o outputs/refine.h3lt --audio-from outputs/stage1.h3lt
+
+# 4. Refine the enlarged latent at full resolution.
+./h3 -d ./MiniMax-H3 -p "A red fox walks through fresh snow." \
+  --width 1280 --height 704 --frames 121 --steps 4 \
+  --latent-in outputs/refine.h3lt --refine-sigma 0.4 -o outputs/final.mp4
+```
+
+`--render-width`/`--render-height` must be multiples of 32 sharing the output
+canvas aspect ratio, and `--latent-in` requires the geometry its bundle was
+written at. `to-comfy` defaults to writing into ComfyUI's `input/` directory,
+because `LoadLatent` only lists files directly there.
+
+Both ends of the bridge store the same *normalized* latent: ComfyUI's video VAE
+applies `z * latents_std + latents_mean` inside `decode()`, and h3c's applies the
+identical transform in `prepare_input()` with byte-identical per-channel
+constants. The converter therefore only rearranges `[C,T,H,W]` into
+`[B,C,T,H,W]` and back — it never rescales values. The default float16 halves
+the file for about 0.98 SSIM, which is far below what the refine step itself
+moves; pass `--f32` for a byte-identical round trip.
+
+Two properties of that split are worth knowing before relying on it:
+
+- **`--audio-from` is required.** The refine step re-noises the audio block that
+  travelled with the video latent, at the same sigma as the video. Without it
+  h3c warns on stderr and restarts the audio from unit-normal noise, but the
+  schedule begins at `--refine-sigma` (say 0.2), so the model is handed an
+  out-of-distribution input and ends up with a noise soundtrack roughly 180x
+  louder than the real one. More steps do not recover it.
+- **`--refine-sigma` trades preservation against correction.** Measured against
+  the first pass at 288x160, where an unchanged video scores 0.99 SSIM and a
+  re-run with a different seed scores 0.84:
+
+  | `--refine-sigma` | 0.05 | 0.1 | 0.2 | 0.4 | 0.6 |
+  | --- | --- | --- | --- | --- | --- |
+  | SSIM vs first pass | 0.95 | 0.92 | 0.89 | 0.87 | 0.84 |
+
+  Below 0.2 the pass cannot repair much, and by 0.6 it is effectively generating
+  a new clip. 0.3–0.5 is the useful range; the right value depends on how much
+  correction the upscaler needs, which has not been measured end to end.
+
 ## Tests and runtime requirements
 
 ```sh

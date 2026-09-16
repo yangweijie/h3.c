@@ -77,6 +77,8 @@ static void usage(const char *program) {
         "      --latent-out PATH  Also dump the denoised video latent (raw) to PATH\n"
         "      --latent-in PATH   Decode a latent file to video, skipping denoise\n"
         "                         (requires --output/-o)\n"
+        "      --refine-sigma S   With --latent-in: re-noise that latent to sigma S\n"
+        "                         and run --steps passes from there (img2img/refine)\n"
         "      --pipeline          After denoising, hint the latent buffer as\n"
         "                         reclaimable (madvise DONTNEED) so the OS can\n"
         "                         reclaim those pages for VAE weights. Reduces\n"
@@ -94,6 +96,18 @@ static int parse_int(const char *value, const char *label) {
         exit(2);
     }
     return (int)parsed;
+}
+
+/* Sigma-like parameters live in [0, 1]. The `!(v >= 0)` form also rejects NaN. */
+static float parse_float(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    float parsed = strtof(value, &end);
+    if (errno || !end || *end || !(parsed >= 0.0f) || parsed > 1.0f) {
+        fprintf(stderr, "h3: invalid %s (expected 0.0-1.0): %s\n", label, value);
+        exit(2);
+    }
+    return parsed;
 }
 
 static int frames_from_seconds(const char *value) {
@@ -299,6 +313,7 @@ int main(int argc, char **argv) {
            OPT_PROFILE, OPT_INFO,
            OPT_SR, OPT_SR_BIN, OPT_SR_MODEL_DIR, OPT_SR_MODEL,
            OPT_SR_TARGET, OPT_SR_SCALE, OPT_LATENT_OUT, OPT_LATENT_IN,
+           OPT_REFINE_SIGMA,
            OPT_PIPELINE };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
@@ -364,6 +379,7 @@ int main(int argc, char **argv) {
         {"sr-scale", required_argument, NULL, OPT_SR_SCALE},
         {"latent-out", required_argument, NULL, OPT_LATENT_OUT},
         {"latent-in", required_argument, NULL, OPT_LATENT_IN},
+        {"refine-sigma", required_argument, NULL, OPT_REFINE_SIGMA},
         {"pipeline", no_argument, NULL, OPT_PIPELINE},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
@@ -559,6 +575,9 @@ int main(int argc, char **argv) {
             }
             case OPT_LATENT_OUT: params.latent_out_path = optarg; break;
             case OPT_LATENT_IN: params.latent_in_path = optarg; break;
+            case OPT_REFINE_SIGMA:
+                params.refine_sigma = parse_float(optarg, "refine sigma");
+                break;
             case OPT_PIPELINE: params.pipeline = 1; break;
             default: usage(argv[0]); return 2;
         }
@@ -654,6 +673,9 @@ int main(int argc, char **argv) {
         if (cli.frames_dir)
             fprintf(stderr, "h3: wrote frames to %s\n", cli.frames_dir);
     } else if (params.latent_in_path && *params.latent_in_path) {
+        if (params.refine_sigma > 0.0f)
+            fprintf(stderr, "h3: warning: --refine-sigma needs a prompt (-p) "
+                    "to denoise; decoding the latent instead\n");
         h3_result *result = h3_decode_latent(ctx, &params);
         if (!result) {
             fprintf(stderr, "h3: %s\n", h3_last_error(ctx));

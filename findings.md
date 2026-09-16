@@ -1744,3 +1744,146 @@ README 自述它 "can omit child buffers scheduled internally by MPSGraph"。**�
 - **量化质量代价实测**（`ab_report/report_steps4.json`）：int6g128(实为 int8) vs BF16
   → SSIM 0.705 / PSNR 17.47 dB。**H3 对量化敏感**。
 - 在 compute bound 下，量化省 I/O 换不回时间；只有在 ≤576×320 档才有意义。
+
+## 八、Latent Upscaler 接入：原语、桥接、内存墙（2026-09-16/17）
+
+### 1. B3 最大的未知数半路消失：GroupNorm 仓库里本来就有
+
+放大器需要的归一化是 `GroupNorm(32,C)`，`in_layers` / `TemporalConv.norm` 后面都接 SiLU。
+而 `h3_gpu_vae_encoder_group_norm_silu_f32`（`h3_shaders.metal:644`）**正是 NDHWC 布局下的
+GroupNorm(groups,C) + SiLU** —— 连 `vae_encoder_norm_args` 都是同一套字段。
+
+⇒ B3 从"新写 GroupNorm"缩成"补一个去掉 SiLU 的变体 + 一个逐通道仿射"。
+`out_norm` 之后接的是 AdaLN 式调制（`h*(1+scale)+shift`），所以必须有一个不带激活的版本。
+
+其余全部可复用现成原语：`h3_gpu_silu_f32` / `h3_gpu_linear_f32` / `h3_gpu_add_scaled_f32` /
+`h3_gpu_conv3d_pad_f32` ⇒ **网络可用纯 C 原语搭建，不必走 MPSGraph 组合**。
+
+放大器索引映射（此前未理清）：
+```
+res_index(b)  = b + (b+1)/2        # b = 0..11
+temp_index(b) = res_index(b) + 1   # 仅 b 为偶数时存在（temporal_every=2）
+```
+张量数核对：in_blocks 156 + out_blocks 156 + 边界 10 = **322** ✓
+
+### 2. 两端归一化一致 ⇒ 桥接只换轴序，绝不重缩放
+
+```python
+# ComfyUI comfy/ldm/minimax/vae.py:698-702
+def decode(self, z, output_buffer=None):
+    # z: [B, 24, T_lat, H_lat, W_lat] normalized latents
+    z = z * latents_std + latents_mean
+```
+```c
+/* h3c h3_video_vae.c:361 */
+rows[row++] = input[source] * deviation[channel] + mean[channel];
+```
+**逐字等价**，且 per-channel 常量逐位相同。⇒ ComfyUI 的 `latent["samples"]` 与 h3c 的 `z`
+是同一空间，桥接只做 `[C,T,H,W] ↔ [B,C,T,H,W]`。
+
+放大节点内部的 `(s-mean)/std` 与出口的 `out*std+mean` 是它自己的进出配对，对桥接透明。
+
+### 3. latent 包读写的三个坑（都是阻塞级）
+
+| # | 坑 | 症状 |
+|---|---|---|
+| 1 | `_read_h3_latent` 只认 v2，引擎**恒写 v3** | `H3_BinaryLatent` 对任何输入抛"版本不支持" |
+| 2 | `_write_h3_latent` 写 v2（24B 头），但 reader **无条件 `fread` 7 字=28B**（`h3.c:2578` 无 rewind） | 4 字节错位：视频整体偏移、`ap` 读到音频头首字段而误判为"有音频"、音频长度取到音频数据的头 4 字节 → `truncated audio latent`。**`H3_BinaryLatentDecode` 从未工作过** |
+| 3 | 放大器只返回 `{"samples":...}` | 丢掉 `h3_audio` → 下游退回纯噪声初始化（σ=1）而 schedule 从 refine_sigma 起步 → 分布外输入 |
+
+引擎 writer 恒写 v3 正是因为 reader 恒吃 28 字节 —— 所谓"v2 向后兼容"在 reader 侧实际是坏的。
+
+**实测验证**：修好后 `h3_audio` 穿过放大器的相关系数 **+1.0000**，rms 逐位相同（0.00360）。
+
+### 4. 放大器不是瓶颈（实测推翻估计）
+
+345M 参数、CPU、fp32：
+
+| | 前向 | 外推 |
+|---|---|---|
+| 20×12→40×24, T=7 | **2.44s** | — |
+| 40×22→80×44, T=37 | **60.9s** | 体积 19.4× ⇒ 47s（实测 60.9s）|
+
+此前"CPU 上要十几到几十分钟"的估计是错的。⇒ **B4（把放大器搬进 h3c）的收益只剩
+"去掉 ComfyUI 依赖"，性价比存疑。**
+
+### 5. 内存墙：DiT 的 token 上限（决定这条路能走多远）
+
+DiT 激活随 token 数线性增长，**无 token 维度分块**（引擎只做激活别名复用，
+864-class 省 99.63 MiB，`H3_DISABLE_DIT_ACTIVATION_ALIAS=1` 可关）。
+
+| 配置 | tokens | 结果 |
+|---|---|---|
+| render 640×352, 121 帧 | 32,560 | ✅ 跑通 |
+| render 1280×704, 22 帧 | 24,640 | ✅ 跑通（96.6s/步）|
+| **render 1280×704, 121 帧** | **130,240** | ❌ **系统重启** |
+
+`tokens = (宽/16)×(高/16)×T`，`T = 5k+2`（帧数按 24fps 换算后对齐到 `5+17k`）。
+经验上限约 **30k**。
+
+**关键推论：直接全分辨率生成是同一个 token 数 ⇒ 同样跑不动。**
+所以"两阶段 vs 直接"在 1280×704/5s 上**不成立**。可行的是
+**变体 B（低分生成 → 放大 → 直接 VAE 解码）**：DiT 只在低分辨率下运行。
+
+### 6. 自适应驻留毁测量（再次确认，且量化了）
+
+`H3_DIT_RESIDENT_BLOCKS=0` ⇒ 读系统可用内存自适应决定常驻块数。
+**内存越松它越激进，而多常驻反而更慢**（常驻块与流式路径争抢统一内存）。
+
+受控 A/B（256×256 / 1s / 2 步，只改驻留）：
+
+| 常驻 | peak | denoise | SSD 读取 | 带宽 |
+|---|---|---|---|---|
+| **1** | **2.29 GiB** | **34.4s** | 35.9 GiB | **1.026 GiB/s** |
+| 11 | 9.46 GiB | 50.6s | **32.3 GiB**（更少） | 0.888 GiB/s |
+
+常驻=1 时 `denoise(34.4s) ≈ SSD(35.0s)` ⇒ **计算被 I/O 完全掩盖**；
+常驻=11 时多出 14.2s 非重叠停顿。
+
+**最严重的一次**：steps=4 报出 422s，钉住 1 块后重测为 **91s —— 差 4.6 倍**。
+⇒ 所有跨运行的性能对比必须在 `H3_DIT_RESIDENT_BLOCKS=1` 下做。
+
+### 7. int8 VAE 省磁盘不省内存
+
+| | BF16 | int8_convrot |
+|---|---|---|
+| 磁盘 | 14.6 GiB | **2.95 GiB** |
+| 运行时常驻 | ~9.7 GB | **9.67 GB**（`total_block_bytes=9668689920`，peak 9.365 GiB）|
+
+加载时**反量化成 F32 常驻** ⇒ 对内存天花板无帮助。
+DiT 侧同理：文件 21.4 → 20.67 GiB（−4%），`SSD stream` 每步仍读 ~17.7 GiB。
+
+### 8. 8step 蒸馏模型必须走 8 步（横向标尺）
+
+文件名 `fastvideo_fasth3_8step_v2_pruned_int8_convrot` ⇒ 训练步数 8。
+
+标尺：`0.551` = 换种子的两次无关生成；`0.977` = 同参数仅步数不同的常态。
+
+| 对比 | SSIM |
+|---|---|
+| 2步 vs 8步 | **0.581**（≈ 无关生成）|
+| 2步 vs 4步 | 0.603 |
+| **4步 vs 8步** | **0.680** |
+
+⇒ 2 步**未收敛**，出的不是提示词对应的内容；4 步在改善但没到位。
+
+耗时（`H3_DIT_RESIDENT_BLOCKS=1`，256×256 / 1s）：
+```
+总墙钟 ≈ 22.5s（固定开销）+ 17.1s × steps
+  2步  57s    4步  91s    8步 159s
+```
+每步恒定 17.1s，且 `SSD 时间 ≈ denoise 全部时间` ⇒ **该配置纯 I/O bound**（1.03 GiB/s）。
+
+### 9. 引擎的模型发现机制
+
+`-d` 只设根目录，之后按硬编码相对路径解析，两类检查：
+
+- **精确文件**：`FL2VA/transformer/config.json`、`FL2VA/tokenizer/tokenizer.json`
+- **目录扫描**（`h3_st_inventory_dir`）：`readdir` 取**所有以 `.safetensors` 结尾且非点开头**
+  的文件，读 header 统计；**空目录报错** `no safetensors files`
+
+⇒ **文件名完全无关**，只要放进对的目录。同目录多个 `.safetensors` 会被**合并成一个逻辑组件**
+（按张量名查找），所以 DiT 目录被报成 "2 files 1102 tensors"（主权重 + time_embedder）。
+
+`FL2VA/text_encoder` 仅在 `H3_CLIPPROJ_DIR` 未设/为 `0`/`off` 时才必须（`h3.c:775-798`）。
+`Ref2VA/transformer/model.safetensors.index.json` 存在与否开关 R2V。

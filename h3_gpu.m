@@ -449,6 +449,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
             @"h3_vae_encoder_group_norm_silu_f32",
+            @"h3_group_norm_f32", @"h3_channel_scale_shift_f32",
             @"h3_weight_dequant_unrotate_int8",
             @"h3_convrot_remap_qkv_bf16",
             @"h3_sdpa_window_mask",
@@ -1092,6 +1093,7 @@ typedef struct {
     uint32_t batch, depth, height, width, channels, groups;
     float epsilon;
 } vae_encoder_norm_args;
+typedef struct { uint32_t rows, channels; } channel_scale_shift_args;
 typedef struct { uint32_t rows, width; } swiglu_args;
 typedef struct { uint32_t elements, approximate; } gelu_bf16_args;
 typedef struct { uint32_t tokens, vocab_size, width; } embedding_args;
@@ -1915,21 +1917,27 @@ static H3Conv *h3_gpu_conv3d_graph(
         uint32_t width, uint32_t input_channels, uint32_t output_channels,
         uint32_t kernel_depth, uint32_t kernel_height, uint32_t kernel_width,
         uint32_t stride_depth, uint32_t stride_height, uint32_t stride_width,
+        uint32_t pad_depth, uint32_t pad_height, uint32_t pad_width,
+        uint32_t groups,
         uint32_t output_depth, uint32_t output_height, uint32_t output_width,
         int has_bias) {
     @autoreleasepool {
         NSString *key = [NSString stringWithFormat:
-            @"3:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d", batch, depth,
-            height, width, input_channels, output_channels, kernel_depth,
-            kernel_height, kernel_width, stride_depth, stride_height,
-            stride_width, has_bias];
+            @"3:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d", batch,
+            depth, height, width, input_channels, output_channels,
+            kernel_depth, kernel_height, kernel_width, stride_depth,
+            stride_height, stride_width, pad_depth, pad_height, pad_width,
+            groups, has_bias];
         H3Conv *cached = gpu.convCache[key];
         if (cached) return cached;
         H3Conv *conv = [[H3Conv alloc] init];
         conv.graph = [[MPSGraph alloc] init];
         conv.inputShape = @[@(batch), @(depth), @(height), @(width),
                             @(input_channels)];
-        conv.weightShape = @[@(output_channels), @(input_channels),
+        /* Grouped convolutions carry a projected weight: one input plane per
+         * group, which is what makes the released depthwise temporal kernel
+         * [512, 1, 5, 1, 1] load directly. */
+        conv.weightShape = @[@(output_channels), @(input_channels / groups),
                              @(kernel_depth), @(kernel_height), @(kernel_width)];
         conv.biasShape = @[@1, @1, @1, @1, @(output_channels)];
         conv.outputShape = @[@(batch), @(output_depth), @(output_height),
@@ -1944,9 +1952,11 @@ static H3Conv *h3_gpu_conv3d_graph(
             [MPSGraphConvolution3DOpDescriptor
                 descriptorWithStrideInX:stride_width
                 strideInY:stride_height strideInZ:stride_depth
-                dilationRateInX:1 dilationRateInY:1 dilationRateInZ:1 groups:1
-                paddingLeft:0 paddingRight:0 paddingTop:0 paddingBottom:0
-                paddingFront:0 paddingBack:0
+                dilationRateInX:1 dilationRateInY:1 dilationRateInZ:1
+                groups:groups
+                paddingLeft:pad_width paddingRight:pad_width
+                paddingTop:pad_height paddingBottom:pad_height
+                paddingFront:pad_depth paddingBack:pad_depth
                 paddingStyle:MPSGraphPaddingStyleExplicit
                 dataLayout:MPSGraphTensorNamedDataLayoutNDHWC
                 weightsLayout:MPSGraphTensorNamedDataLayoutOIDHW];
@@ -2002,7 +2012,8 @@ int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     H3Conv *conv = h3_gpu_conv3d_graph(
         gpu, batch, depth, height, width, input_channels, output_channels,
         kernel_depth, kernel_height, kernel_width, stride_depth, stride_height,
-        stride_width, output_depth, output_height, output_width, bias != NULL);
+        stride_width, 0, 0, 0, 1, output_depth, output_height, output_width,
+        bias != NULL);
     if (!conv) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
@@ -2030,6 +2041,89 @@ int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                 executionDescriptor:nil];
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"MPSGraph Conv3d failed: %@",
+                             exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_conv_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+/* Padded / grouped Conv3d with unit stride. The latent upscaler needs both:
+ * padding=1 to preserve the volume under 3x3x3 kernels, and groups=channels for
+ * the depthwise temporal kernel [C, 1, 5, 1, 1]. The general entry point above
+ * hard-codes padding 0 and groups 1, so it cannot express either. */
+int h3_gpu_conv3d_pad_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *bias, uint32_t batch,
+                          uint32_t depth, uint32_t height, uint32_t width,
+                          uint32_t input_channels, uint32_t output_channels,
+                          uint32_t kernel_depth, uint32_t kernel_height,
+                          uint32_t kernel_width, uint32_t pad_depth,
+                          uint32_t pad_height, uint32_t pad_width,
+                          uint32_t groups) {
+    H3GPU *gpu = GPU(opaque);
+    if (!batch || !depth || !height || !width || !input_channels ||
+        !output_channels || !kernel_depth || !kernel_height || !kernel_width ||
+        !groups || input_channels % groups || output_channels % groups ||
+        depth + 2 * pad_depth < kernel_depth ||
+        height + 2 * pad_height < kernel_height ||
+        width + 2 * pad_width < kernel_width)
+        return 0;
+    uint32_t output_depth = depth + 2 * pad_depth - kernel_depth + 1;
+    uint32_t output_height = height + 2 * pad_height - kernel_height + 1;
+    uint32_t output_width = width + 2 * pad_width - kernel_width + 1;
+    size_t input_count = (size_t)batch * depth * height * width * input_channels;
+    size_t weight_count = (size_t)output_channels * (input_channels / groups) *
+                          kernel_depth * kernel_height * kernel_width;
+    size_t output_count = (size_t)batch * output_depth * output_height *
+                          output_width * output_channels;
+    if (!h3_gpu_require_elements(gpu, input, input_count, @"Conv3d input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, weight, weight_count, @"Conv3d weight") ||
+        TENSOR(weight).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_count, @"Conv3d output") ||
+        TENSOR(output).dtype != H3_GPU_F32 ||
+        (bias && (!h3_gpu_require_elements(gpu, bias, output_channels,
+                                           @"Conv3d bias") ||
+                  TENSOR(bias).dtype != H3_GPU_F32)) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    H3Conv *conv = h3_gpu_conv3d_graph(
+        gpu, batch, depth, height, width, input_channels, output_channels,
+        kernel_depth, kernel_height, kernel_width, 1, 1, 1,
+        pad_depth, pad_height, pad_width, groups,
+        output_depth, output_height, output_width, bias != NULL);
+    if (!conv) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *input_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(input).buffer shape:conv.inputShape
+            dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *weight_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(weight).buffer shape:conv.weightShape
+            dataType:MPSDataTypeFloat32];
+        MPSGraphTensorData *output_data = [[MPSGraphTensorData alloc]
+            initWithMTLBuffer:TENSOR(output).buffer shape:conv.outputShape
+            dataType:MPSDataTypeFloat32];
+        NSMutableDictionary *feeds = [@{conv.input: input_data,
+                                         conv.weight: weight_data} mutableCopy];
+        if (bias) {
+            MPSGraphTensorData *bias_data = [[MPSGraphTensorData alloc]
+                initWithMTLBuffer:TENSOR(bias).buffer shape:conv.biasShape
+                dataType:MPSDataTypeFloat32];
+            feeds[conv.bias] = bias_data;
+        }
+        NSDictionary *results = @{conv.output: output_data};
+        @try {
+            [conv.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph padded Conv3d failed: %@",
                              exception.reason);
             return 0;
         }
@@ -2399,6 +2493,72 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(bias).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
+/* Same reduction as the fused entry point above, minus the activation, for the
+ * resampler's output normalization. */
+int h3_gpu_group_norm_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *weight,
+                          const h3_gpu_tensor *bias, uint32_t batch,
+                          uint32_t depth, uint32_t height, uint32_t width,
+                          uint32_t channels, uint32_t groups, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)batch * depth * height * width * channels;
+    if (!batch || !depth || !height || !width || !channels || !groups ||
+        channels % groups || !(epsilon > 0.0f) ||
+        !h3_gpu_require_elements(gpu, input, count, @"group norm input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, weight, channels,
+                                 @"group norm weight") ||
+        TENSOR(weight).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, bias, channels, @"group norm bias") ||
+        TENSOR(bias).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, count, @"group norm output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    vae_encoder_norm_args args = {
+        batch, depth, height, width, channels, groups, epsilon
+    };
+    uint64_t rows = (uint64_t)batch * depth * groups;
+    if (rows > UINT32_MAX) return 0;
+    return h3_gpu_dispatch_rows(
+        gpu, @"h3_group_norm_f32", (uint32_t)rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(bias).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
+int h3_gpu_channel_scale_shift_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                                   const h3_gpu_tensor *input,
+                                   const h3_gpu_tensor *scale,
+                                   const h3_gpu_tensor *shift,
+                                   uint32_t rows, uint32_t channels) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !channels) return 0;
+    size_t count = (size_t)rows * channels;
+    if (count > UINT32_MAX ||
+        !h3_gpu_require_elements(gpu, input, count, @"scale/shift input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, scale, channels, @"scale/shift scale") ||
+        TENSOR(scale).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, shift, channels, @"scale/shift shift") ||
+        TENSOR(shift).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, count, @"scale/shift output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    channel_scale_shift_args args = { rows, channels };
+    return h3_gpu_dispatch_1d(
+        gpu, @"h3_channel_scale_shift_f32", (uint32_t)count,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(scale).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(shift).buffer offset:0 atIndex:2];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
         });
