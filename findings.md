@@ -1887,3 +1887,1999 @@ DiT 侧同理：文件 21.4 → 20.67 GiB（−4%），`SSD stream` 每步仍读
 
 `FL2VA/text_encoder` 仅在 `H3_CLIPPROJ_DIR` 未设/为 `0`/`off` 时才必须（`h3.c:775-798`）。
 `Ref2VA/transformer/model.safetensors.index.json` 存在与否开关 R2V。
+
+---
+
+# ===== Findings（当前任务）: ANE int8 投影移植（h3.c-ane → h3c）=====
+
+## F1. 决策 A 关闭：磁盘 int8 payload 已经是 ANE 要的格式
+
+`dbg_ane_int8_format.py` 对 `fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors`
+block 0 的 qkv/out/fc1/fc2 四项实测：
+
+- dtype=I8，shape 与图常量假设的 `[out,in]` 完全一致
+- `weight_scale` 为 **每输出行一个 F32**（count == rows），ANE 的
+  `constexpr_affine_dequantize(axis=0, scale=fp16[N], zero_point=int8(0))` 直接可用
+- `zero` 张量不存在（对称量化）→ 无需重新居中
+- bias 不存在 → MIL conv 无 bias 操作数这件事不构成障碍
+- scale 转 fp16 最大相对误差 ~4.8e-4，0 个 subnormal / 0 个 flush-to-zero
+
+⇒ **不需要任何 requant / 转 per-row / 重排预处理**。第 1 步的前提成立。
+
+## F2. LoRA 不能折进 int8 权重，只能走高精度低秩旁路
+
+`dbg_lora_fuse_convrot.py` 的判据：`SNR = RMS(delta)·sqrt(12) / per-row step`。
+delta 只有 ~0.2%·||W||，与 per-row int8 噪声同量级；折叠后
+「有效 delta vs 真 delta」relRMS ≈ 1.0、cos 0.02–0.2 ⇒ LoRA 被量化噪声淹没。
+（陷阱：只比折叠前后整个权重的话，relRMS 一直 ~0.002，看不出问题。）
+
+fork 的答案是**图内多 band 旁路**：打包时预旋转 `A_rot = A·R`，
+于是旁路可以复用主 conv 已经算出的旋转激活 `rᵢ`——
+不加输入绑定、不多一次 eval；每 band 自己的行 → `concat(axis=1)` → 一次 `add`。
+qkv 是 module-major，需要 3 个 band（to_q/to_k/to_v）；其余 1 个。
+
+## F3. 上午「08:37 全 PASS → 08:57 真实 gate FAIL」不是代码回归，是磁盘
+
+证据链（全部今天实测）：
+
+1. `/tmp/ane_base_only.log` 08:37：含 real-qkv（126.5 MiB 权重）全 PASS。
+2. `/tmp/ane_final.log` 08:57：real-qkv + real-lora 双双 `ANECCompile() FAILED`。
+3. `/tmp/ane_repro_0919.log`：只有 real-lora FAIL，错误串是 `"?"`
+   ——`h3_ane_bridge.m:210` 在 NSError 为 nil 时打印 `"?"`，即编译框架没给原因。
+4. 直接前台复跑：**SIGBUS，exit 138 / 经 script 包装后 10**，日志 0 字节
+   （SIGBUS 杀进程时管道全缓冲的 stdout 直接丢失，所以「空日志」本身就是被杀的信号）。
+5. `df`：`/System/Volumes/Data` 228 Gi 用了 199 Gi，**只剩 4.8 Gi（98%）**。
+6. 缓存目录 mtime 与崩溃时刻吻合：real-qkv 命中缓存所以「通过」，
+   real-lora 需要全新的大编译 → 失败。**只有新鲜编译会挂**，这正是磁盘症状。
+
+⇒ ANE_PORT_SUMMARY §7 预写的「磁盘不足会 SIGBUS/InvalidMILProgram」被命中。
+
+## F4. TMPDIR 搬迁对 ANE 编译无效（重要，别再试）
+
+试过 `TMPDIR=/Volumes/data/tmp/ane-tmp ./h3_ane_int8_test ...`：
+崩溃点、exit code 完全一样，且新目录**始终是空的**，而
+`/var/folders/f8/.../T/h3-ane-cache` 的 mtime 跟着每次运行更新。
+
+原因：`h3_ane_bridge.m:77` 和 `:183` 用的是 `NSTemporaryDirectory()`，
+它走 `confstr(_CS_DARWIN_USER_TEMP_DIR)`，**不读 TMPDIR 环境变量**。
+所以 bridge 的 staging 目录和 h3-ane-cache 永远落在系统卷。
+（顺带：`h3_ane_linear.m:515` 的 `H3_ANE_DUMP_MIL` 更是硬编码 `/tmp/ane_dump_%s`。）
+
+⇒ 唯一可行的解法是**给系统卷腾空间**，不是改环境变量。
+
+## F5. 空间账本（Data 卷，用于决定清什么）
+
+| 路径 | 大小 | 归属 |
+|------|------|------|
+| `~/h3_sys` | 31G | 用户模型权重 |
+| `~/Library/Application Support` | 18G | 用户 |
+| `/private/var/folders`（整个 Darwin 临时域） | 4.0G | 混合 |
+| `~/Library/Caches` | 3.9G | 用户，可再生但需确认 |
+| `~/Library/Containers` | 3.4G | 用户 |
+| `~/.cache` | 2.5G | 用户 |
+| `T/h3-ane-cache` | 400M | **我们的**，删了只是重新编译 |
+| `T/94FBBC93…`（两个孤立 staging） | 131M + 263M | **我们的**，崩溃残留 |
+
+## F6. 「真实 gate 跑不过」的真因是 fork 测试里的两处少乘 sizeof，不是 ANE、也不只是磁盘
+
+`lldb` 抓到的崩溃现场：`main+13116` 处 `str d1, [x24, x21, lsl #3]`，
+`EXC_BAD_ACCESS code=2`，故障地址每次都在**页起始**（ASLR 变、页对齐不变）
+= 写到一段映射之后的第一个未映射页 = 堆溢出。
+内层 `cmp x5, #0x20`（32 = rows）定位到参考实现里 `want[n*rows+s]` 的写入循环。
+
+`tests/test_ane_int8.c` 里两处漏了元素大小（fork 测试代码，非库代码）：
+
+| 行 | 原代码 | 需要 | 实际 |
+|----|--------|------|------|
+| 886 | `float *x = malloc((size_t)in_dim * rows)` | 688 KB | 172 KB（写越界 4 倍） |
+| 926 | `double *want = malloc((size_t)out_dim * rows)` | 5.5 MB | 688 KB（写越界 8 倍） |
+
+同类分配在 `:38 / :415 / :619` 都正确带 `sizeof(double)`，只有 `real_lora_gate` 这两处漏了。
+（`x` 那处更阴：不崩，只是参考值读到越界垃圾，即使侥幸不死也过不了 gate。）
+
+改完 `make h3_ane_int8_test` 后全绿：
+
+```
+real-qkv   K=5376 N=21504 kc=1024 rows=32 gs=256: cos=0.9999998 rel_l2=6.415e-04 nonfinite=0 weights=126.5 MiB PASS
+real-lora    K=5376 N=21504 kc=1024 rows=32 gs=256: cos=0.9999998 rel_l2=6.729e-04 max_abs=7.039e-02 nonfinite=0 PASS
+0 failure(s)
+```
+
+⇒ **Phase A 关闭**：真实 checkpoint 的 int8 主卷积 + 真实 Turbo LoRA 的
+3-band 旁路，端到端对 double 参考余弦 0.9999998。图本身没有任何问题。
+
+## F7. 两个成因要分清，别把磁盘结论过度外推
+
+- 08:37→08:57 那两次 `ANECCompile() FAILED`（含 real-qkv）发生在**编译期**，
+  而两处少 sizeof 的越界发生在**其之后**的参考计算，所以那次确实像磁盘紧；
+  腾出 ~800 MB（删我们自己的 `h3-ane-cache` 400M + 崩溃残留 staging 394M）后新鲜编译即可通过。
+- 今天 repro 的 SIGBUS 则是**堆溢出**，与磁盘无关。
+- 也就是说：`ANE ... compile failed: ?`（`h3_ane_bridge.m:210`，NSError 为 nil 时打 `"?"`）
+  这条错误串信息量为零，将来排障要先把 NSError 的 domain/code 打出来。
+- 系统卷目前仍只有 ~5.0 Gi 空闲（98%）。**Phase B 之前需要用户决定是否清理**
+  `~/Library/Caches` 3.9G / `~/.cache` 2.5G 这类可再生大目录（不确认不动）。
+
+## F8. 移植注意：带这两处 bug 的是 fork 的测试文件
+
+Phase B 把 `h3_ane_bridge` / `h3_ane_linear` 搬进 h3c 时，
+测试也要一起搬，但必须带上这两个 `sizeof` 修正——
+否则会在新仓库里复现同一个「神秘 SIGBUS / compile failed ?」。
+
+## F9. 「ANE 为什么不在外置 SSD 上产生临时缓存」——实测：不能，卡在编译器沙箱
+
+先量化一次新鲜大编译到底花掉多少内部盘空间（`H3_ANE_CACHE=0`，real-qkv 126.5 MiB 权重）：
+
+| 指标 | 前 | 后 | 差 |
+|------|-----|-----|-----|
+| `/System/Volumes/Data` free | 5,503,808 KiB | 5,372,356 KiB | **−128 MiB** |
+| `getconf DARWIN_USER_TEMP_DIR` 用量 | 67,080 KiB | 196,668 KiB | **+129,588 KiB** |
+
+⇒ 掉的空间**全部等于我们交给 aned 的 staging 目录**（`MIL 文本 + weight.bin +
+编译产物 data/net.plist/compiled.ok`）。缓存条目实测 127M/图（`data` 里已经嵌了常量）。
+也就是说不存在「apple 偷偷在内部盘存了个巨大的东西」——东西是我们自己写的，
+只是写在了内部盘。
+
+于是试着把 staging 挪走（给 `h3_ane_bridge.m:77/183` 加 `H3_ANE_TMP` 基准目录，
+`bridge_cache_entry` 和 staging 一起换根，保证 `bridge_mirror()` 的硬链接仍同卷）：
+
+| `H3_ANE_TMP` | 结果 |
+|--------------|------|
+| 未设（`NSTemporaryDirectory()`，系统卷） | `0 failure(s)`，新鲜编译通过 |
+| `/Volumes/data/tmp/ane-staging`（USB SSD，1.9 T 剩 546 G） | **16 个 gate 全挂**：`ANECCompile() FAILED` |
+| `/tmp/ane-base`（普通内部卷路径，但不在 Darwin temp） | **同样 16 个全挂** |
+
+⇒ 决定性对照：**不是外置 SSD 的问题，是路径必须在用户的 Darwin 临时域里**。
+`ANECompilerService`（root 的 XPC 沙箱服务）只被允许访问
+`confstr(_CS_DARWIN_USER_TEMP_DIR)` 那一块；换任何别的路径它都读不到源，
+直接 ANECCompile 失败。所以「把 ANE 编译缓存搬到 SSD」这条路是**死的**。
+
+副作用记录：搬到 SSD 那次 `DARWIN_USER_TEMP_DIR` 仍涨了 ~141 MB（我们的 staging 不在那儿），
+说明编译器服务还会在自己的容器里另写一份工作副本——进一步印证腾空间只能在系统卷上做。
+`TMPDIR` 环境变量同样无效（F4），因为 `NSTemporaryDirectory()` 不读它。
+
+**该 patch 已回退**（证明不可用的开关留在代码里只会变成下一个坑）；
+fork 现在只剩两处 `sizeof` 修正。
+
+### 由此得到的硬结论
+
+内部卷剩余空间是 ANE 的**前置条件**，不是可以绕开的细节。预算：
+每张不同的图 ≈ 128 MiB staging（编译期峰值）+ 127 MiB 缓存产物；
+整 block 一张图的产物更大。多形状扫档时必须留 **GiB 级**余量，
+否则又会看到 F7 那种 `ANECCompile FAILED`。
+
+## F10. ANE 到底需要多少盘 —— 编译几乎免费，19 GiB 是"全量缓存"的成本
+
+用真实 checkpoint 直接量（gate 里加了 `compile=%.2fs cache=%d` 打印）：
+
+| 图（rows=32, kc=1024） | payload | 新鲜编译 | 缓存命中 | 缓存条目 |
+|------|---------|----------|----------|----------|
+| real-qkv `K=5376 N=21504` | 126.5 MiB | **0.11 s** | 0.04 s | 129.6 MiB |
+| real-lora（同图 + 3-band 旁路，最大图） | ~130 MiB | **0.56 s** | 0.00 s | 134.6 MiB |
+
+其他实测：
+- 编译期瞬时峰值 ≈ 1× payload（`df` 掉 128 MiB，等于我们写进 staging 的 MIL+weight.bin）；
+  **`h3_ane_model_free()` 会 `removeItemAtPath:staging_directory`**，所以进程正常退出零残留。
+- A/B 隔离验证 `H3_ANE_CACHE`：`=0` → cache 目录 **0 个条目**；`=1` → **8 个条目**。
+  之前一次观测到的"关缓存也留了 264 MiB"是同一命令串里**前一个开缓存的 run** 写的，看错时间戳了。
+- 硬链接镜像（`bridge_mirror` 的 `linkItemAtPath`）⇒ staging 和 cache 条目共享 extent，
+  不翻倍；unload 删 staging 后由 cache 条目持有那些块。
+
+按 payload 汇总（直接读 safetensors header，不加载）：
+
+```
+transformer  attn  9,415 MiB + mlp 11,031 MiB = 19.0 GiB   (50 block, I8)
+             每 block ≈ 414 MiB（qkv 126.5 + out ~37 + fc1 ~147 + fc2 ~73）
+audio_vae    577 MiB (F32)      video_vae 3.0 GiB（子目录，需另算）
+```
+
+⇒ **ANE_PORT_SUMMARY 里那个"~19 GB/形状"不是编译门槛，而是"把 50 个 block 的编译产物全量缓存在盘上"的成本。**
+真实需求分两种：
+
+| 策略 | 常驻盘 | 一次性时间 | 结论 |
+|------|--------|-----------|------|
+| 关缓存（或 LRU 上限） | ~0，瞬时峰值 = 最大单图（整 block 一张图 ≈ 414 MiB/shape） | 50 block 重编译 ≈ 20–60 s/shape | **内部卷留 2 GiB 就够跑全流程** |
+| 全量缓存 | **19 GiB / shape**，多一档 shape 再 ×19 GiB | 每次启动省 20–60 s | 当前 14 Gi 空闲装不下，必须加 LRU/白名单 |
+
+顺带：内部卷 avail 从上午的 4.9 Gi 自己涨到 **14 Gi**（APFS purgeable 被回收），
+说明当时那几次 `ANECCompile FAILED` 有"可回收空间没及时让出来"的成分。
+即便如此，稳态仍建议 ≥ 8–10 Gi 空闲，且**Phase B 不再需要用户清理 `~/Library/Caches`**
+——关缓存路线 2 GiB 就够。
+
+移植时要注意的实现点：`h3_ane_bridge.m` 的 cache 目前**无上限、无淘汰**（只有
+`bridge_cache_evict` 在 free 时按 identifier 删自己）。要上 50 block × 多 shape，
+必须补一个按总字节的 LRU，或默认 `H3_ANE_CACHE=0` + 进程内复用。
+
+---
+
+## F11（2026-09-19 10:50，Phase B2a 完成）：h3c host 依赖已就位，且两条 un-rotate 路径可证等价
+
+### 新增文件（全部在 h3c 侧，未动 fork）
+
+| 文件 | 行数 | 来源 |
+|------|------|------|
+| `h3_convrot.h` / `h3_convrot.c` | 22 / 84 | fork 逐字移植（Hadamard 表缓存 + `cblas_sgemm` 分块 derotate） |
+| `tests/test_int8_raw.c` | 155 | **新写**（fork 无此测试），Makefile 目标 `h3_int8_raw_test` |
+| `h3_weights.c` | +143 | 新增 `h3_weight_load_int8_raw` + statics `weight_sidecar_name` / `comfy_quant_group_size` / `read_int8_scales` |
+| `Makefile` | +9 | `LIB_C += h3_convrot.c`；`h3_int8_raw_test` 目标 + `test` 里带 `DIT_MODEL` 守卫的调用 |
+
+### 移植时按 h3c 约定改写（不是复制）的三处
+
+1. **读 payload 用 `pread_bytes()`**（h3c `h3_weights.c:232` 的本地约定），不用 fork 的
+   `h3_st_read_data()` ⇒ 少一个 `detail[384]` 中间缓冲，错误信息按 h3c 风格自己 `fail()`。
+2. **scale 名按 h3c 的 `"%s_scale"`**（`qkv_proj.weight` → `qkv_proj.weight_scale`），
+   和 fork 的 `sidecar_name(..., "weight_scale")` 结果等价，但和 `load_int8_dequantized`
+   共用同一条命名路径；`.comfy_quant` 侧车仍需剥掉 `.weight` 再接后缀。
+3. **只接受 F32 scale**（`int8_tensorwise` 的磁盘契约），不像 `h3_dit.c:625` 那样
+   兼容 BF16 —— 那个宽容是给流式路径的，ANE 侧要的是原始 F32，宽容只会掩盖格式漂移。
+
+### 把「两套 Hadamard 实现」变成被测不变量（而不是隐患）
+
+h3c 原本有两处 ConvRot：`h3_weights.c` 的 radix-4 butterfly（`convrot_unrotate_row`）
+和 `h3_dit.c:780 build_convrot_hadamard`（喂 Metal kernel）。fork 的 `h3_convrot.c` 是
+第三种写法（H4 的 Kronecker 幂）。三者数学上是同一个矩阵：butterfly 的 stride=1,4,16,64
+就是在 base-4 各位上依次右乘 H4，Kronecker 递归正是同一件事。
+
+实测坐实（两个测试，都不依赖 ANE）：
+
+- `tests/test_convrot_unrotate.c` 扩了两项检查：
+  `convrot table vs radix-4 butterfly: max_abs=0.000e+00`（表元素是 ±1/16，bf16 精确可表示，
+  所以能要求**逐元素 0**），`table derotate vs cpu exact: max_abs=0.000e+00`。
+- `tests/test_int8_raw.c` 在真实 checkpoint 上比对「表 derotate」vs「butterfly un-rotate」：
+  4 个投影 `rel_rms=1.3e-08 ~ 3.9e-08`，`max_abs≤8.4e-07`（只剩 sgemm 与 butterfly 的
+  浮点求和次序差），全部 `0 failure(s)`。
+
+⇒ 以后任何人改坏其中一条路径，`make test` 当场红，不用等到 ANE 投影对不上 Metal。
+
+### 真实 checkpoint 侧车确认（读 header，不加载权重）
+
+```
+/Users/jay/h3_sys/MiniMax-H3-Convrot/FL2VA/transformer/
+  fastvideo_fasth3_8step_v2_pruned_int8_convrot.safetensors   21 GiB
+  blocks.0.attn.qkv_proj.weight        I8  [21504, 5376]
+  blocks.0.attn.qkv_proj.weight_scale  F32 [21504, 1]
+  blocks.0.attn.qkv_proj.comfy_quant   U8  [72] =
+      {"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}
+```
+（`test_int8_raw.c` 首次运行还顺带量到每投影的行 scale 区间：
+qkv 6.5e-4~7.1e-3、out 1.5e-3~9.9e-3、fc1 2.4e-4~7.9e-3、fc2 2.2e-3~9.8e-3。）
+
+### 待办衔接
+
+- `h3_dit.c:780 build_convrot_hadamard` 与 `h3_weights.c` butterfly 仍各自持有实现，
+  现在有了测试兜底，**收敛成一处**是后续独立小改动（不阻塞 Phase B2b）。
+- B2b 需要：`-framework IOSurface` 尚未加进 `Makefile` 的 `FRAMEWORKS`。
+
+---
+
+## F12（2026-09-19 11:05，Phase B2b 完成）：ANE bridge/linear 已在 h3c 内独立跑通全部 12 个关
+
+### 落地的文件
+
+| h3c 新增/改动 | 行数 | 说明 |
+|---------------|------|------|
+| `h3_ane_bridge.h/.m` | 53/345 | fork 逐字拷贝，一次编译通过（只依赖 Foundation/IOSurface/objc_msgSend） |
+| `h3_ane_linear.h/.m` | 207/1053 | 同上；它需要的 host 依赖恰好就是 B2a 补的那三个（`h3_convrot`、`h3_weight_load_int8_raw`、`h3_gpu` 老 API） |
+| `h3_gpu.{h,m}` | +26/+90 | `h3_gpu_tensor_wrap_f32`（无拷贝收养 IOSurface 基址）、`h3_gpu_tensor_host_pointer`、`h3_gpu_pack_ane_input_bf16`、`h3_gpu_unpack_ane_output_bf16` |
+| `h3_shaders.metal` | +41 | kernel `h3_ane_pack_bf16` / `h3_ane_unpack_bf16` |
+| `Makefile` | +12 | `LIB_M += h3_ane_{bridge,linear}.m`、`-framework IOSurface`、3 个测试目标 |
+| `tests/test_ane_int8.c` | 1030 | 从 fork 拷入，**带上了两处 `sizeof` 修复**和 compile/cache 打点 |
+| `tests/test_ane_staging.c` | 165 | **新写**（fork 没有）：Metal pack/unpack 位级往返 |
+
+### 移植中撞到的两处 h3c 差异（都不是复制粘贴能解决的）
+
+1. **`h3_gpu_require_bf16` 已存在**（h3c `h3_gpu.m:2567`，我最初 grep 用 `head -5` 截断了输出，
+   以为没有，就在文件尾部补了一份 → `redefinition`）。删掉重复实现，复用原有的。
+2. **kernel 必须显式注册**：h3c 的 `gpu.pipelines` 是一张写死的名单
+   （`h3_gpu.m:534` 起，`[names addObject:...]`），名单外的 kernel 运行期取不到
+   （表现为 `missing Metal pipeline h3_ane_pack_bf16`，而不是加载失败）。
+   且这段名单嵌在 `if (gpu.tensorOpsEnabled)` 里 ⇒ ANE staging 两个 kernel 注册在
+   **该 if 之外**，否则关掉 TensorOps 的档位就取不到 pipeline。
+
+### 数值结果（h3c 内，`H3_ANE_CACHE=0`）
+
+```
+rot-padded/plain-2048/bypass-r32/r128/zeroB/zeroA/1chunk/bands-qkv/cache-shape  全 PASS
+real-qkv  K=5376 N=21504 gs=256: cos=0.9999998 rel_l2=6.415e-04 compile=0.43s cache=0 PASS
+real-lora K=5376 N=21504 gs=256: cos=0.9999998 rel_l2=6.729e-04 compile=0.50s cache=0 PASS
+0 failure(s)
+```
+真实 Turbo LoRA 文件：
+`/Volumes/data/.lmstudio/models/LightX2V/MiniMax-H3-Turbo/minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors`
+（50 block × `attn.to_{q,k,v}.lora_{A,B}.default.weight`，`__metadata__` alpha=128/rank=128 ⇒ scale=1.0）。
+
+### 对 F10「关缓存进程退出零残留」的修正（重要）
+
+`tests/test_ane_int8.c` 的 `cache_gates()` 会 `setenv("H3_ANE_CACHE","1",1)` 且**从不还原**，
+所以同一个进程里其后的 real-qkv/real-lora 实际是**开着跨进程缓存**跑的：
+外部 `H3_ANE_CACHE=0` 被静默覆盖，`cache=1`、每次退出留 ~130 MiB/形状
+（实测两次运行后 `T/h3-ane-cache` = 2 条目 258 MiB）。⇒ 已补上「保存并还原调用方的值」，
+还原后重跑：12 关全 PASS、真机关显示 `cache=0`、`T/h3-ane-cache` 剩 **0 B**。
+
+（顺带：那个目录里 11 个 1.3–1.6 MiB 的十六进制命名目录**不是我们的** staging——它们是 10:03 之前
+就有的、ANE 编译器服务自己的产物，本次只删了本会话写的 `h3-ane-cache`。）
+
+### 尚未接线的部分
+
+`h3_gpu_pack/unpack_ane_*` 现在只有独立测试在用；**h3_dit.c 还没有任何一条投影走 ANE**。
+下一步（原计划 B3/B4）是把 `blocks.N.attn.qkv/out, mlp.fc1/fc2` 挂到 `H3_ANE_LINEARS` 开关后面，
+并保留 Metal 对照路径 + cos 检查。注意 h3c 侧两个既有事实会决定接线方式：
+- qkv/out/fc1/fc2 在 h3c 是**融合** kernel（`h3_gpu_grouped_qkv_linear_rope_int8`
+  `h3_dit.c:4007`、`h3_gpu_mlp_int8_bf16` `h3_dit.c:4109`），走 ANE 等于把 RoPE/SwiGLU 拆回两步；
+- h3c 的 LoRA 在加载时**已并入权重**（`h3_lora.c:170 h3_lora_apply`），
+  而 F2 的结论是 int8 下 LoRA 必须以高精度旁路存在 ⇒ 接线前必须先确认这两条不冲突。
+
+---
+
+## F13：B3 接线前提核对 —— F12 提的「两个冲突」里只有一个成立（2026-09-19 11:55）
+
+读源码把 F12 结尾两条待确认项各自查实，结论是**LoRA 那条不是冲突，融合那条才是真代价**。
+
+### 1. LoRA：h3c 做的是「合并后重新量化」，不是 F2 否决的「折进既有 int8 网格」
+
+- 流式 int8 路径顺序（`h3_dit.c:2084` 起，注释原文 "before the int8 requantization bakes
+  them into the resident slot"）：
+  **pread int8 → dequant+un-rotate 成 BF16 → `merge_block_loras(..., blocking=1)` 把
+  ΔW 加进 BF16 → 再 requant 成驻留 int8（per-row scale 重新算）**。
+- F2 的「LoRA 折进 int8 会掉到噪声底」针对的是**沿用原 scale/zero-point** 的就地折叠；
+  h3c 在合并之后重算了行 scale ⇒ 是不同的算子，结论不能直接套过来。
+- 所以对 ANE 而言：**喂 h3c 已有的驻留 int8 权重即可**，不需要旁路，也不需要改 h3c 的 LoRA 策略。
+  合并+重量化若有精度损失，那是 h3c 现路径**已经付掉**的成本（Metal/ANE 两条线吃同一个张量），
+  不是「选 ANE 引入的新损失」⇒ `cos(ANE, Metal)` 仍是有意义的对照。
+- fork 里那条 `real-lora` 旁路 gate 的价值不变（它证明的是「旁路写法正确」），
+  但**不属于 h3c 接线的必要条件**。
+
+### 2. 权重已 un-rotate ⇒ ANE 图用「无旋转」那档（gs=0），不需要图内 Hadamard
+
+`h3_dit.c:819` 注释：ConvRot 权重的产出是 "BF16 tensor holding the true (unrotated) weight,
+ready for the existing quantize/forward"，由 `h3_gpu_weight_dequant_unrotate_int8`
++ `dit->convrot_hadamard`（`build_convrot_hadamard`，`h3_dit.c:780`）完成。
+⇒ 激活侧不需要再做 grouped Hadamard，fork 图里那一段 conv 在 h3c 接线时**应当整个省掉**，
+只留纯 int8 GEMM（对应 fork 已 PASS 的 `plain-2048` 档）。
+顺带：qkv 的 q/k/v 交错→分离重排（`h3_gpu_convrot_remap_qkv_bf16`、`convrot_unrotate_cpu` 的
+`layout == 1`）h3c 也已经在权重侧做完，ANE 侧不必重复。
+
+### 3. 真正的代价：融合 kernel 会被拆成 2~3 步
+
+- `h3_gpu_grouped_qkv_linear_rope_int8`（`h3_dit.c:4007`）= GEMM+per-head 分组+RoPE 一步；
+  `h3_gpu_mlp_int8_bf16`（`h3_dit.c:4109`）= fc1+SwiGLU 一步。
+- ANE 只能吃 GEMM，接线后 RoPE / SwiGLU 要退回独立 kernel ⇒ 多两趟 HBM 往返 + 两次
+  pack/unpack 到 ANE 平面。**净收益必须是「ANE GEMM 省下的时间 > 拆融合的代价」**，
+  这个数现在没有，只能实测。
+- 建议第一步只做 `attn.out` 和 `mlp.fc2`（两者下游本来就无融合，SwiGLU 在 fc1、RoPE 在 qkv，
+  这两条是「GEMM 完就写回」的纯矩阵乘），拿到 ANE/Metal 单算子计时后再决定要不要动 qkv/fc1。
+
+### 4. 接线范围约束：只有 int8 驻留路径能走 ANE
+
+私有 `AppleNeuralEngine` 的 `constexpr_affine_dequantize` 输入是 int8 载荷；
+h3c 的 BF16 直载路径（`LOAD_BF16_CONVROT`，`h3_dit.c:908`）拿到的是 BF16 权重，
+若要走 ANE 必须先量化 —— 那等于给 BF16 档位凭空加一层量化误差。
+⇒ `H3_ANE_LINEARS` 应与 int8/int6 驻留权重的开关**互锁**（非量化模式下自动回退 Metal），
+而不是独立生效。
+
+---
+
+## F14：整 block 单图（B3'）移植结果 + 一整套决定性数字（2026-09-19 11:35）
+
+fork 的 `h3_ane_block.{h,m}`（857 行，把 adaln→int8 ConvRot 投影→per-head norm→RoPE→
+full softmax→gate 残差→SwiGLU MLP 编成**一张** ANE 图，激活每 block 只跨界一次）
++ `tests/test_ane_full_block.c`（真实 checkpoint + f64 回放参考）移植进 h3c。
+
+### 移植成本：几乎为零（依赖早在 B2a/B2b 就位）
+
+- 拷贝后**只改 4 行**：h3c 的 `-Wenum-float-conversion` 比 fork 严，
+  `1.0 / BLK_HIDDEN`、`1.0 / BLK_HEAD_DIM`（`h3_ane_block.m:413/490`）和测试里
+  `qs / HEAD_DIM`、`ks / HEAD_DIM` 要显式 `(double)`；顺带修了 usage banner 把 binary 名
+  写成 `h3_ane_block_test` 的笔误，并补了一句「rotation 那条腿需要 `H3_ANE_CACHE=1`」。
+- 依赖核对（fork `h3_ane_block.m` 调用的全部 h3_ 符号）：`h3_weight_load_int8_raw`、
+  `h3_convrot_hadamard`（B2a）、`h3_ane_model_*`/`h3_ane_bridge_surface`/`h3_ane_bridge_available`、
+  `h3_weight_find`、`h3_st_read_data`、`h3_st_tensor_elements`（h3c 全有）⇒ **一次编译通过**。
+- Makefile：`LIB_M` 加 `h3_ane_block.m`，新 target `h3_ane_full_block_test`。
+
+### h3c 内实测（真实 `MiniMax-H3-Convrot/FL2VA/transformer` 的 blocks.0，`H3_ANE_CACHE=1`）
+
+```
+compiled in 4.19s, blob 380.8 MiB
+  segment 0 rows [0,6):  cos=0.99999 max_abs=5.744e+01
+  segment 1 rows [6,20): cos=0.99999 max_abs=1.740e+01
+  segment 2 rows [20,64): cos=0.99999 max_abs=2.566e+01
+block S=64: cos=0.999988 rel_l2=4.898e-03 max_abs=5.744e+01 nonfinite=0 PASS
+timing S=1904: best 334.3 ms/block (compile 3.21s)
+rotation S=1904: unload 5 ms + reload 29 ms, 3 cycles bit-identical PASS
+```
+
+- 精度关（cos≥0.999、rel_l2≤3e-2、nonfinite=0）**在 h3c 的构建/依赖下成立**，
+  整 block 走 fp16 激活 + int8 权重后 rel_l2 只有 4.9e-3。
+- **常驻轮换是真的可用**：`unload 5ms + reload 29ms` = eval(334ms) 的 8.7%，
+  而且 reload 之后输出**逐字节相同** ⇒ 「800MB wired/block，50 个装不下」可以靠轮换绕开
+  （fork README 的判断成立，但代价可接受）。
+
+### 决定性的一条：编译产物 381 MiB/block-形状（磁盘关）
+
+本次跑完 `T/h3-ane-cache` = **762 MiB / 2 条目**（S=64 与 S=1904 各一），即
+**381 MiB ≈ 1.0× int8 blob**。乘回去：
+
+| 量 | 数值 |
+|---|---|
+| 一个形状 × 50 block 的跨进程缓存 | 50 × 381 MiB ≈ **18.6 GiB** |
+| 再算上 aned 自己那份副本（fork README 实测翻倍） | ≈ **37 GiB** |
+| 本机两个卷的 avail | **12 GiB**（Data 与系统卷同一容器） |
+
+⇒ fork 估的「~19GB/形状」在 h3c 依赖下**逐 MiB 得到验证**；
+**当前磁盘条件不支持「50 block 全量 + 跨形状缓存」**，这不是可调参绕开的，是硬墙。
+关缓存（`H3_ANE_CACHE=0`）退出零残留，但每次换形状要重付 50 × 3.2~4.2 s ≈ **170~210 s** 冷编译。
+
+### 与 h3c 现有瓶颈对账：低分辨率下 ANE 打不过「少读字节」
+
+- h3c 的流式去噪在 256×256/0.5s/steps=2 已经是 **SSD 地板**：每 block 每 worker
+  read ≈ 173.5 ms（2.22 GB/s，等于该卷实测上限），dequant ≈ 87 ms，
+  整 block ≈ 200 ms（F 前文「终点：已贴磁盘地板」）。
+- ANE 那条路**一样要从盘上读 414 MiB/block**，还多付每形状每 block 3~4 s 编译
+  ⇒ 在「权重装不进内存、必须每步重流」的低分辨率档，ANE 没有位置。
+- ANE 有位置的唯一情形：**行数大到计算开始盖过读盘**（S=1904 时单 block 图 eval 334 ms）
+  **且同一形状被重复求值**（多 step / 多 chunk 复用一次编译）。
+- ⚠️ 但 334 ms 只是 `h3_ane_block_eval`，**不含** pack/unpack 与 h3c 那两趟 GEMM 的 Metal 对照，
+  所以现在还不能下「ANE 更快」的结论。
+
+### 因此 B4 的前置量（先测再决定接线）
+
+需要 **h3c 自身在 rows≈1904、权重常驻（不流式）时单 block 的 Metal 时间**，
+和 334 ms 对齐比较；fork 的 `tests/test_ane_block.c` 正是这个对照
+（4 投影 ANE vs 纯 Metal vs 融合 Metal，合成权重，argv=ROWS，gate cos≥0.999）。
+⇒ 建议把它作为 **B4-pre** 移植进来出曲线，而不是先去改 `h3_dit.c`。
+
+---
+
+## F15：B4-pre 量完了 —— 「4 投影分别上 ANE」被判死刑，且顺带挖出一个计时口径 bug（2026-09-19 12:00）
+
+fork 的 `tests/test_ane_block.c` 移植进 h3c **零改动**（443 行，编译+链接一次过；
+`h3_gpu_{grouped_qkv_linear_rope,grouped_qkv_rope,mlp,swiglu,sdpa,rms_norm,copy,add,linear}_bf16`
+这批 Metal API 在 h3c 全都还在，签名没漂）。它跑的是：
+**同一个 block，四条投影分别走 ANE，其余算子留在 Metal**，对照「纯 Metal（融合）」和「Metal（拆融合）」。
+合成权重、真实 DiT 形状（qkv 21504×5376 / out 5376×21504 / fc1 28672×5376 / fc2 5376×14336）。
+
+### 干净环境下的 rows 扫描（机器上无其它负载，`H3_ANE_CACHE=0`，best/mean 毫秒）
+
+| rows | Metal 融合 best | 拆投影 ANE best | ratio | ANE mean | 分阶段（staged 模式）pack / ANE / rest |
+|---|---|---|---|---|---|
+| 384 | 101.5 | 68.3 | **1.49×** | 90.0 | 20.8 / 30.1 / 56.9 |
+| 1536 | 436.7 | 418.8 | **1.04×** | **549.2（比 Metal 慢）** | 71.7 / 114.8 / 196.3 |
+| 3072 | 903.7 | 842.7 | **1.07×** | **943.0（比 Metal 慢）** | 157.9 / 248.7 / 475.7 |
+
+数值关三档全 PASS（cos≈0.99999、rel_l2≈4.8e-3、nonfinite=0）。
+
+### 计时口径 bug（继承自 fork，会骗人）
+
+`h3_ane_projection_apply()` 里 `pack_seconds += packed - started`，而 `started` 取在
+**pack 之前**，pack 又是往**已经排着前面所有 Metal 工作的命令缓冲**里追加
+⇒ plain 模式的「pack+submit」**把整条 Metal 队列的排空时间记成了 pack**：
+1536 行下 plain 报 384.9 ms、staged 报 71.7 ms（其中真 pack 只有 1.0~2.1 ms/投影）。
+⇒ 任何「pack 太慢」的结论都必须用 `H3_ANE_PROFILE_STAGES=1` 复核；
+plain 的那个数字只能当「ANE 之前的 Metal 尾巴」。
+
+### 第二个陷阱：后台有并发时数字整体虚高 ~2×
+
+第一次 1536 行的 run 与后台 `h3_ane_int8_test` 撞车，同一 binary 同一参数报出
+`metal_default=855 ms`（干净时 436.7 ms）。⇒ ANE/Metal 计时 gate 必须独占机器。
+
+### 判读
+
+1. **拆投影走 ANE 不值**：只有小 rows（384）拿到 1.49×，rows 越大越贴平，mean 还反超为慢。
+   原因是硬账：**每投影一次 pack+unpack 跨界**，而 ANE 省下的只是那趟 GEMM；
+   加上每形状每投影 0.16~0.87 s 编译 × 4 投影 × 50 block ≈ **30~170 s 冷编译**。
+2. **唯一有肉的是「整 block 一张图」**（F14：S=1904 时 eval 334 ms，而本表插值出
+   Metal 在 1904 行 ≈ 530 ms ⇒ 约 1.6×，且激活每 block 只跨界一次），
+   这与 fork README 端到端 26.3 s vs 31.9 s 的量级一致。
+3. 但整 block 图的跨进程缓存是 **381 MiB/block-形状 ⇒ 18.6 GiB/形状**（F14），本机 12 GiB 装不下；
+   关缓存又要为每个形状重付 50 × 3~4 s ≈ 170~210 s。
+4. 所以对 h3c 的判断是：**DiT 侧 ANE（无论拆还是整块）在这台机器上都不划算**；
+   ANE 真正合适的目标是**形状固定、payload 小、每形状只求值一次的模块**
+   ——即 Phase D 的三个 VAE（video/vision/audio tile 尺寸固定，编译产物按 tile 计）。
+   这条建议待用户拍板后再改 task_plan 的 C/D 阶段划分。
+---
+
+## F16：D0 放行 —— video VAE 投影在 ANE 上实测 2.9~3.7×，rel_l2 ≤ 7.9e-4，编译/缓存账比 DiT 轻两个量级（2026-09-19 12:45）
+
+新建 `tests/test_ane_vae.c`（Makefile 目标 `h3_ane_vae_test`）：真实
+`decoder.transformer_blocks.0` 的四条投影，对照 h3c 自己的 `h3_gpu_linear_f32`，
+另加一路 `cblas_sgemm` 宿主参考。**参考实现零误差**（Metal fp32 vs BLAS
+rel_l2=0.000e+00 max_abs=0.000e+00，四条形），所以下面的误差全是 ANE 侧引入的。
+
+### 先纠一条前提（Phase D 计划里写错了）
+
+盘上不是 F16：`FL2VA/video_vae/source/model.safetensors` 是**单片 10,415,548,320
+字节、560 张量全 F32**（脚本读头部清点）。⇒ **权重 fp32→fp16 的舍入本身就在误差
+预算里**，不能当"零损失"。好在实测它和激活舍入加起来仍然过闸（见下）。
+顺带确认形状与假设一致：qkv 6144×2048 / out 2048×2048 / w1 16384×2048 /
+w2 2048×8192，decoder 恰好 36 个 `transformer_blocks`，bias 全在（F32，本 gate 两边都不加）。
+
+### 速度 / 误差（机器独占，`H3_ANE_CACHE=0`，best 毫秒）
+
+| rows | qkv | out | w1 | w2 | block 合计 | ratio | rel_l2 范围 |
+|---|---|---|---|---|---|---|---|
+| 1797 | 16.02→5.03 | 5.36→1.82 | 42.88→13.37 | 26.93→7.38 | **90.7→28.0** | **3.24×** | 5.1e-4 ~ 7.9e-4 |
+| 512 | 4.49→1.54 | 1.65→0.60 | 11.25→3.87 | 6.26→2.18 | **23.7→8.2** | **2.89×** | 5.1e-4 ~ 7.9e-4 |
+
+- cos=1.000000，`nonfinite=0`，**fp16 不可表示的权重 = 0**（最大权重 0.36，参考峰值
+  13.4，离 fp16 上限 65504 极远）⇒ 三条放行判据（≥2×、≤1e-3、溢出 0）**全过**。
+- **小 rows 不掉速**：512 行仍然是 2.89×，说明不需要"rows 太小退回 Metal"的门槛。
+  这与 DiT 的拆投影曲线（F15：1536 行只有 1.04×）完全不同，因为这里权重是 fp16、
+  N/K 比小，ANE 的 MAC 阵列吃得满。
+- **rel_l2 与 rows 无关**（1797 和 512 一模一样到 1e-7）⇒ 误差纯来自 fp16 的
+  权重/激活舍入，不是累加长度。w2 的 7.9e-4 最大（K=8192 且 8 个分片求和），
+  是四条里最该盯的那条。
+- 外推到整轮解码：**一条 pass 的四投影 3.26 s → 1.01 s**，24 pass ≈ **78 s → 24 s**
+  （只算 GEMM，未扣 pack/unpack；未算 ANE 免掉的每 pass 读盘）。
+
+### 编译与磁盘：比 DiT 轻两个量级，且**与 rows 无关**
+
+- 每张图编译 **0.04~0.18 s**，一个 block 四种投影合计 0.5 s ⇒ 36 block **16 s**
+  冷编译（DiT 整 block 单图是 3.2 s/**block**，50 block ≈ 170 s，见 F14/F15）。
+- 缓存条目实测只含三样：`data` + `net.plist` + `compiled.ok`，其中 `data` 是
+  **编译器的产物常量段**（`bridge_cache_store` 明确跳过 `weights`/`model.mil` 源文件），
+  大小恰好 = N·K·2 字节：24 / 8 / 64 / 32 MiB ⇒ **每 block 128 MiB，36 block = 4.5 GiB**。
+- **128 MiB 在 rows=1797 和 rows=512 两次 run 里完全相同** ⇒ 产物字节只由权重决定，
+  与形状无关（形状只改变 `net.plist`，那是 KB 级）。⇒ 多一个 rows 形状就是**再复制
+  一整份 4.5 GiB**。这条取代 F14 对 fp16 图的估算：DiT 整 block 的 381 MiB/block 是
+  **int8 图特有**（`constexpr_affine_dequantize` 把反量化结果也落进产物），fp16 图是 1× 权重字节。
+- 缓存恢复是**逐位一致**的：`H3_ANE_CACHE=1` 重跑同参数，四条 rel_l2 与 CACHE=0 完全相同。
+
+### rows 形状数：一轮解码只有 1 个（这是 D2 能成立的关键）
+
+`vae->sequence = CHUNK_LATENT_TIME · latent_h · latent_w + SUFFIX`，而 tile 是**等宽平铺**：
+`tile_axis_build` 让相邻 tile 共享 `TILE_OVERLAP_MIN` 重叠而不是把边界 tile 切短，
+`configured_tile_pixels` 只在 `TILE_PIXELS..320`（步长 SPATIAL_RATIO）里选一个全局尺寸。
+⇒ 同一次解码里所有 tile 的 rows 相同；只有当视频比一个 tile 还小时才会退化成
+`axis->length = extent` 的短形状。
+⇒ **D2 应该把 rows 向上取整到固定桶再编译**：多付 ≤1 个桶的算力（1797→2048 是 +14%），
+换来「跨分辨率复用同一份 4.5 GiB 产物」，否则每个新分辨率都要重付一遍 4.5 GiB + 16 s。
+
+### 还没做的（别当成已验证）
+
+- 本 gate 两边都**不带 bias**，真实解码带；激活是 `[-2,2)` 均匀伪随机，不是真实
+  VAE 激活分布（真实分布若有长尾，fp16 相对误差不变但**溢出**风险要重估）。
+- pack/unpack 未在测：CPU 侧填平面在 w2 上要 41 ms（比省下的 19.5 ms 还贵），
+  这是**harness 的 strided gather**，不是引擎路径的账；D1 必须用 Metal pack kernel
+  重测这条，否则结论会被这一项翻掉。
+---
+
+## F17：D1 量完 —— 把 staging 和 bias 都算进去，block 端到端仍然 2.26~2.43×；rows=512 只有 1.88×（2026-09-19 13:20）
+
+D0 的账是"裸图 vs 裸 kernel"，不能拿来做决策。D1 补上引擎真正要走的那条路：
+**Metal pack → ANE 图 → Metal unpack（顺手加 bias）**，对照今天带 bias 的
+`h3_gpu_linear_f32`。
+
+### 新增的东西（都在 gate 之外，是给 D2 用的地基）
+
+- `h3_shaders.metal`：`h3_ane_pack_f32`（row-major F32 → `[kc][plane_rows]` 纯转置）、
+  `h3_ane_unpack_f32`（转回 row-major F32，`with_bias` 时加 `[output_dim]` 通道 bias）。
+  **bias 不进图**：图只表达 reduction，加法放在 unpack，一次读一次写。
+- `h3_gpu.{h,m}`：`h3_gpu_pack_ane_input_f32` / `h3_gpu_unpack_ane_output_f32(bias 可空)`，
+  两个 pipeline 名字加进**显式登记名单**（在 `if (tensorOpsEnabled)` 之外，和 bf16 那两个同一处）。
+- `h3_ane_linear.{h,m}`：`h3_ane_projection_create_f16`（host 端 row-major fp16 权重）
+  和 `h3_ane_projection_apply_f32`；bf16 的 `h3_ane_projection_apply` 现在只是
+  共用 static `ane_projection_apply(..., f32_staging=0)` 的薄壳。
+  调用约定不变：**前置要有开着的命令缓冲，返回时 unpack 还在缓冲里没提交**，由调用方 submit。
+
+### 端到端实测（机器独占，`H3_ANE_CACHE=0`，best 毫秒；比例对照 fp32+bias）
+
+| rows | qkv | out | w1 | w2 | block 合计 | block ratio | staging 合计 |
+|---|---|---|---|---|---|---|---|
+| 1797 | 14.98→6.89 (2.17×) | 5.16→2.99 (**1.73×**) | 39.60→16.84 (2.35×) | 22.65→9.72 (2.33×) | **82.4→36.4** | **2.26×** | 8.9 ms |
+| 1797 复跑（缓存热） | 2.27× | 1.68× | 2.49× | 2.69× | 90.2→37.1 | **2.43×** | 9.1 ms |
+| 512 | 4.26→2.43 (1.76×) | 1.61→1.24 (**1.30×**) | 10.98→5.41 (2.03×) | 6.14→3.18 (1.93×) | 23.0→12.3 | **1.88×** | 3.97 ms |
+
+- **一张图一次的 staging ≈ 1.0~3.7 ms**，四条合计 ≈ 9 ms，相当于在裸图 28 ms 上
+  再加 32% —— 但相对 fp32 仍然是 2.26×。⇒ D0 那个 3.24× 是上限，**决策请用 2.26~2.43×**。
+- 换算：**36 block 一条 pass 2.97 s → 1.31 s**（1797 行）。
+- **误差没被 staging 污染**：端到端 rel_l2 与裸图逐位同级（5.322e-04 vs 5.323e-04），
+  说明 fp32 加 bias 不引入新误差。
+- **最小的那条 `out`（2048×2048）单独看只有 1.68~1.73×**：它裸图 2.0 ms，而两次跨界就要
+  1.0 ms。⇒ 单投影 ≥2× 是错误的闸；闸要放在 **block 合计**，单投影只判"别退化"
+  （测试里改成 ≥1.2× 才报 REGRESSION）。绝对值上 `out` 走 ANE 仍比 fp32 快（2.99 vs 5.16 ms），
+  所以 D2 **不需要**"小投影退回 Metal"的策略。
+- **rows=512 的 block 1.88× 不过 2× 闸**：跨界开销基本固定，GEMM 越小越吃比例。
+  ⇒ 小 tile 要么不路由，要么靠"整 block 一张图"摊掉三次额外跨界（D2 的可选项）。
+
+### 一个必须记住的桥接坑
+
+`h3_ane_bridge.m:181` 的目录名来自 **模型内容 identifier**（`hexStringIdentifier`），
+不含我们传的 `name` ⇒ **同一份 MIL + 权重的两张图会共用同一个 staging 目录**。
+gate 里因此先 `h3_ane_linear_free` 再建 projection（改图名是无效的，试过了）。
+
+### 回归面（改了共享代码，全部重跑）
+
+`h3_tests` 1829 checks ok；`h3_ane_staging_test`、`h3_ane_int8_test`、`h3_convrot_test`
+0 failure；bf16 那条 `h3_ane_block_test 384` 仍 PASS（cos 0.999989，ane 49.0 ms vs
+metal 86.4 ms = 1.76×）⇒ `ane_projection_apply` 重构没动坏。
+`h3_metal_tests` 跑不了：`misc/fixtures/h3_dit.safetensors` 不在（既有状态，非本次改动）。
+
+## F18：D2a 常驻探针量完 —— 硬上限是 126 个存活句柄（不是内存），平面才是内存大头；缓存恢复会偶发失败并自毁条目（2026-09-19 14:20）
+
+探针：`tests/test_ane_vae_residency.c`（`make h3_ane_vae_residency_test`），
+`usage: h3_ane_vae_residency_test VIDEO_VAE_DIR [capacity|reload|pass|window] [ROWS] [BLOCKS] [WINDOW]`。
+为此给共享代码加了：`h3_ane_linear_unload/reload`、`h3_ane_projection_unload/reload`、
+`h3_ane_projection_plane_bytes`、`h3_ane_projection_cache_hit`（都是薄壳，转调 bridge 已有的
+`h3_ane_model_unload/reload`），以及 `h3_ane_bridge.m` 里 `H3_ANE_CACHE_DEBUG=1`
+时打印「cache restored / miss / cached load failed(+原因)」。`h3_video_vae.c` 一行没动。
+
+### 1. 句柄上限 ≈126，park 不能腾名额（决定接线形状）
+
+`capacity 64 36` 与 `window 64 36 8`（后者每张建好立刻 unload，任意时刻只有 1 张连着）
+**都在第 127 张（b31_w1）挂**：
+`createProgramInstanceForModel:...: Program load failure (0x50004)`，
+此时 footprint 只有 412 MiB、可用内存 6.2 GiB、机器 16 GiB —— **不是内存也不是磁盘，是按存活
+model 句柄计数**。⇒ 36 block × 4 投影 = 144 张图**连"建出来放着"都做不到**，
+"全 decoder 常驻"这条路从源头就没有。
+
+### 2. 轮换单价（DiT 的 5/29 ms 确实不能套用）
+
+12 张 rows=2048 图、`reload` 模式 5 轮：**unload 0.47~1.14 ms、reload 3.40~3.77 ms/张**。
+32 张（8 block）全驻留时的 `pass` 模式里 reload=5.15 ms、unload=1.40 ms（张数多了略涨）。
+
+### 3. 端到端 pass 曲线（rows=2048、8 block/32 张、独占机器）
+
+| 调度 | pass | 相对全常驻 |
+|---|---|---|
+| 全常驻 | **333.5 ms**（10.4 ms/张 ⇒ block 41.7 ms） | 1.00 |
+| window=8（每 pass 淘汰 32 次） | 557.5 ms（其中重连 128.8 ms） | **1.67** |
+| 每张每 pass 都 unload+reload | 616.4 ms | **1.85** |
+
+⇒ **ANE 的收益只在"基本不轮换"时成立**：D1 的 2.26× 一旦被每 pass 全量重连吃掉，
+只剩 ≈1.2×。所以接线必须以「常驻不轮换」为默认，轮换只是兜底。
+
+### 4. 平面（planes）才是内存大头，必须跨 block 共享
+
+一张图的常驻 = 烘进去的 fp16 权重 **+ 自己的输入/输出平面**。rows=2048 时每 block
+平面 **320 MiB**（w1 的 `[16384][2048]` 输出平面独占 128 MiB），36 block = **11.5 GiB**
+⇒ "每图自持平面"在 16 GiB 机器上直接判死。而 36 block 形状完全相同，
+**池化后只要 320 MiB**。实测 footprint 边际 ≈200 MiB/block（平面与权重的记账在
+IOSurface/驱动侧不完全落进 phys_footprint，别把 412 MiB/126 张当"权重不占内存"的结论用）。
+⇒ D2 的前置工程量是「让 `h3_ane_linear` 接外部平面」，不是「怎么轮换」。
+
+### 5. 缓存这一条要在接线前修，否则每次冷启动都在赌
+
+- `bridge_cache_store` 是逐文件硬链接（省空间），但 `bridge_cache_restore` 走的是
+  **目录级 `copyItemAtPath`**（目录硬链接不被允许，`bridge_mirror` 的 fallback）。
+- 本机缓存堆到 150 条目 / 系统卷只剩 4.4 GiB 时，实测出现
+  **「cache restored」但 `loadWithQoS` 失败** → 回退重编译；而重编译后的
+  `bridge_cache_store` 会先 `removeItemAtPath(entry)` ⇒ **一次瞬时失败就把这张图的条目抹掉**，
+  下次只能再冷编译。这就是 F16 之前那次"同一个图一会儿命中一会儿不命中"的真相。
+- 本轮结束前已删除自己的可再生缓存 `T/h3-ane-cache`（**5.7 GiB**），系统卷回到 12 GiB 空闲；
+  删完复测冷编译路径：`./h3_ane_block_test 384` PASS（cos 0.999989，compile 0.5~2.3 s/图）。
+  用户目录一个字节没动。
+- ⇒ D2 的 LRU 上限必须先有「restore 用硬链接」+「cached load 失败不许删条目」，
+  否则任何上限都只是把重编译排队。
+
+### 6. 给 D2 的结论（架构定形）
+
+144 > 126 ⇒ 只有两条路：
+1. **block 数封顶**：≤31 block 走 ANE（124 张）且**全常驻不轮换**，其余 block 留 fp32 Metal。
+   按 §3+D1 外推一条 pass：31×41.7 ms + 5×~95 ms ≈ **1.8 s vs 全 Metal ~3.4 s（1.9×）**。
+2. **减少每 block 图数**：把 w1+w2 融成一张 FFN 图 ⇒ 3 张/block = 108 张，全进 ANE。
+   代价：一张图要 4(w1 chunk)+4(w2 chunk)=8 个输入，正好顶满 F1 的 8 输入绑定上限，
+   没有余量；且要新写 MIL + 重做精度关。
+
+推荐先做 ①（平面池化 + 图数上限 + 不轮换），②留作 D2 之后的可选优化。
+
+**未验证**：126 这个数是否随驱动状态/是否创建 `ANERequest` 而变（park 时若连 request
+和 IOSurface 引用一起释放，名额可能回来 —— 下一步最便宜的实验就是这个）。
+
+## F19：D2b 完成 —— 缓存改成硬链接 restore + 原子 store + 5 GiB LRU，rows 分桶实测跨分辨率共用同一批 identifier（2026-09-19 15:10）
+
+用户 2026-09-19 拍板：走**路线①（block 封顶 31）**，并且**先修缓存再把上限定在 5 GiB**。
+改动全部在 `h3_ane_bridge.m`（+ `h3_ane_linear.{h,m}` 一个纯函数、探针几行），
+`h3_video_vae.c` 仍未动。
+
+### 1. restore 不再是目录 copy（磁盘峰值减半，且这是 5 GiB 上限能成立的前提）
+
+`bridge_mirror()` 原来是「目录 `linkItemAtPath`（必然失败）→ 目录 `copyItemAtPath`」，
+所以**每次命中都要把整份产物再抄一遍**：12 张 rows=2048 图 = 384 MiB 变 768 MiB。
+现在改成逐文件硬链接 + 目录递归重建，单文件复制只作 fallback。
+实测 `capacity 2048 3` → `reload` 模式 12 张图 3 轮轮换，缓存全程稳定在 **1.2 GiB**
+（旧实现会涨到 ~1.6 GiB），且 reload 单价不变（unload 0.40~0.45 ms、reload 3.18~4.65 ms
+/张，与 F18 一致 ⇒ 硬链接没有拖慢 load）。
+
+### 2. store 变成「写 `<id>.tmp` → `move` 换入」，好条目不会再被瞬时失败抹掉
+
+原 `bridge_cache_store` 第一件事就是 `removeItemAtPath(entry)`：中途任何失败
+（磁盘紧、链接失败、进程被杀）都会留下**空/半截条目**，下次只能冷编译 —— 这就是 F18 §5
+"一会儿命中一会儿不命中"的机制。现在旧条目只在新条目**完整写好之后**才被替换；
+`compiled.ok` 写成失败也会清掉 `.tmp`。另外每次 trim 顺手清扫 `<id>.tmp` 残留。
+
+### 3. LRU 上限：`H3_ANE_CACHE_MAX_MIB`，默认 **5120**，按 `compiled.ok` mtime 淘汰
+
+restore 会 touch `compiled.ok`，所以排序是「最近使用」而不是「最近编译」。
+`keep` 参数保证刚写的那条不会被自己挤掉。实测把上限设成 1000 MiB 跑一次新形状：
+`evicted 3 entries（252/73/336 MiB）→ 811 MiB`，`du` 复核 917 MiB，符合预期。
+**注意**：淘汰粒度是**单张图**。5 GiB 上限装得下一个 rows 形状（4.5 GiB）但装不下两个，
+所以换分辨率时会把旧形状逐张挤掉 —— 这是有意的（宁可重编译 16 s 也不让系统卷掉到 5 GiB 以下）。
+
+### 4. rows 分桶实测：1797 与 2048 拿到**逐字相同**的图 identifier
+
+`h3_ane_rows_bucket(rows)`（`H3_ANE_ROW_BUCKET`，默认 256，0 关闭）加在
+`h3_ane_linear.{h,m}`，探针启动就套用并打印 `rows=1797 (bucket 2048)`。
+实测四条投影的 identifier（`D6B80868…`/`442F2D29…`/`622B058F…`/`0DECFC1F…`）
+与之前 rows=2048 那轮**完全一致**并全部 `cache restored`，create 10~36 ms、
+compile 0.00~0.10 s ⇒ 「所有分辨率共用一份 4.5 GiB 产物」这条前提坐实。
+
+### 5. 闸复核（rows=2048，缓存热）
+
+block 端到端 **96.2 → 41.2 ms = 2.33×**，36 block 一条 pass **3.46 → 1.48 s**；
+单投影 1.89×（out）~2.44×（w1）；rel_l2 5.1e-4~7.9e-4，fp16 不可表示 0，nonfinite 0。
+与 F17（rows=1797 的 2.26~2.43×）同级。
+
+### 6. 回归与磁盘
+
+`make -j8 all` 无新告警；`h3_ane_int8_test` 的缓存用例（hit/rehit/miss + `bitexact=1`）
+在硬链接/原子 store 之下仍通过；`h3_ane_staging_test` 0 failure；`h3_ane_block_test 384`
+PASS（cos 0.999989）。系统卷 12 GiB 空闲、缓存 926 MiB。本轮只在 `T/` 里增删自己的产物。
+
+## F20：平面池化实测 —— 16 张图 footprint 2340→1379 MiB，池子按形状收一份（2026-09-19 15:35）
+
+`h3_ane_linear.m` 里加了进程内的平面池（`ane_plane_set` 按
+`{chunks, input_bytes, output_bytes}` 索引），`h3_ane_linear.h` 暴露三个口：
+
+```c
+void     h3_ane_planes_share(int enable);  /* 之后建的图共用同形状平面 */
+uint64_t h3_ane_planes_bytes(void);        /* 池子实际持有的字节 */
+void     h3_ane_planes_clear(void);        /* 图都释放之后再清 */
+```
+
+形状不同的图自然拿到不同集合（VAE 四投影 = 4 个集合）；**共享是 opt-in**，
+默认仍走每图自持，所以既有的单图测试语义没变。引用计数：每次 acquire 都给调用方
+自己的一份 `CFRetain`，池子另留一份 ⇒ 释放某张图不会把平面从别的图底下抽走。
+
+实测（`H3_ANE_RESIDENCY_SHARE=1`，rows=2048、4 block/16 张，缓存热）：
+
+| | planes 名义 | 池子实际 | footprint |
+|---|---|---|---|
+| 每图自持 | 1280 MiB | 0（无池） | **2340 MiB** |
+| 池化 | 1280 MiB | **320 MiB** | **1379 MiB** |
+
+释放 16 张图之后两条都回到 1059 MiB，池化那条池子仍留 320 MiB（等 `clear`）
+⇒ 计数正确，没有提前释放也没有泄漏。
+
+**为什么这是 D2 的前置而不是优化**：D2a 的账是 36 block × 320 MiB = 11.5 GiB
+（每图自持平面），本机 16 GiB 直接判死；池化后是固定 320 MiB，与 block 数无关。
+剩下的唯一约束就回到 F18 的 126 句柄上限 ⇒ 路线①（≤31 block）成立。
+
+**并发口径**：`h3_gpu_submit()` 是 commit + `waitUntilCompleted`，
+且 `ane_projection_apply` 在 ANE eval 之前一定 submit 一次 ⇒ 上一张图的 unpack
+已经跑完，下一张同形状图才会写同一块平面 ⇒ 串行链路下共享安全。
+（若将来做 ANE/GPU 流水，这个前提要重新审。）
+
+## F21：路线①实测成立 —— 124 张图 + 池化平面常驻 footprint 1584 MiB、一条 pass 1.78 s；但缓存装不下 31 block（新增磁盘下限）（2026-09-19 16:05）
+
+### 1. 31 block × 4 = 124 张图可以**同时常驻**，且池化后内存有余量
+
+`H3_ANE_RESIDENCY_SHARE=1 ./h3_ane_vae_residency_test $VAE pass 2048 31`：
+124 张图全部建好（离 F18 的 126 上限还剩 2 个名额），
+**footprint 1584 MiB**（权重名义 3968 MiB、平面名义 9920 MiB、池子实际 320 MiB
+⇒ 烘进去的 fp16 常量不落在本任务的 phys_footprint 里，是驱动侧的账）。
+释放 124 张之后 footprint 回到 1406 MiB、池子仍记 320 MiB（等 `clear`）⇒ 计数干净。
+
+### 2. 全常驻 pass 1.78 s，但每张图的成本随常驻图数上升
+
+| 常驻图数 | 全常驻 pass | 每张 | 每 block |
+|---|---|---|---|
+| 32（8 block，池化） | **345.1 ms** | 10.78 ms | 43.1 ms |
+| 124（31 block，池化） | **1780.6 ms** | 14.36 ms | **57.4 ms** |
+
+对照 D1 单 block 端到端 41.2 ms ⇒ **每张图的 ANE 成本随常驻图数线性上涨**
+（拟合 ≈38.2 + 0.62×block 数 ms/block）。轮换（每张每 pass unload+reload）在 124 张时
+2374 ms（reload 5.71 ms/张、unload 0.76 ms/张）⇒ 仍是每 pass 全量重连更贵，但差距
+从 F18 的 1.85× 缩到 1.33×。
+
+**为什么还是选满 31 block**：边际一个 block 在 N=31 处成本 57.4 ms，而它替掉的
+fp32 Metal block 是 96.2 ms ⇒ 每多一个 block 净赚 ≈39 ms，单调更好，上限只由 126 决定。
+一条 36 block 解码 pass：31×57.4 + 5×96.2 ≈ **2.26 s vs 全 Metal 3.46 s = 1.53×**
+（比 F18 §6 外推的 1.9× 低，原因就是上面那条成本上涨）。
+
+### 3. 池化不但省内存，还更快更稳（SHARE=0/1 对照，32 张图）
+
+| | 首轮 pass | 最好 pass | footprint |
+|---|---|---|---|
+| 每图自持平面 | 719.1 ms | 377.2 ms | 4582 MiB |
+| 池化 | **398.8 ms** | **345.1 ms** | **2341 MiB** |
+
+（首轮含预热，池化少写 2.2 GiB 新页。）
+
+### 4. 缓存装不下 31 block：新增 `H3_ANE_CACHE_MIN_FREE_MIB`（默认 6144）
+
+31 block 的一套产物 ≈ **3.9 GiB**，而本机在缓存 4.4 GiB 时系统卷只剩 **5.1 GiB**
+—— 正好是 F18 观测到 ANE load 开始失败的位置。所以「5 GiB 上限」单独不够用：
+它管的是缓存自己多大，不管卷上还有谁在写。改成
+**`target = min(上限, 当前空闲 - 下限 + 缓存字节)`**，并且冷编译前先 `trim` 腾地方。
+实测生效：跑一张新图时连淘 14 条（147/64/32/24/8 MiB…），
+**空闲 5.1 → 6.1 GiB**、缓存 4.4 → 3.3 GiB，日志带上 target 与实时空闲。
+
+⇒ 这台机器的现实约束是：**「31 block 全热缓存」和「留 6 GiB 安全垫」二选一**。
+代价可量化：124 张图冷启动合计 **create 71.4 s**（均值 576 ms/张，缓存命中时 11~46 ms/张），
+所以缓存只在"进程会重启"的场景值钱；常驻服务一次编译就够。
+D2d 接线时不把性能押在缓存命中上（正确性也不依赖它）。
+
+### 5. 回归
+
+`make -j8` 全量无新告警；`h3_ane_int8_test`（含缓存 hit/rehit/miss + bitexact）、
+`h3_ane_staging_test` 0 failure 均通过；`h3_ane_vae_test 2048` 端到端闸 2.33× 复现。
+本轮删改仅限自己的 `T/h3-ane-cache` 与 `T/` 下 ANE staging 目录。
+
+---
+
+## F22（2026-09-19）：D2c —— ANE 图权重的宿主侧读取口转正为 `h3_weight_load_f16_raw`
+
+video VAE 的 36×4 个投影在盘上是 **F32**（`FL2VA/video_vae/source/model.safetensors`，
+10.4 GB），ANE 图要的是 **行主序 fp16 constexpr**；探针里那份临时的
+`read_weight_f16()` 就是缺的那个口，现在落到 `h3_weights.{h,c}`：
+
+```c
+int h3_weight_load_f16_raw(const h3_weight_store *store, const char *name,
+                           uint64_t output_dim, uint64_t input_dim,
+                           uint16_t **weights, char *error, size_t error_size);
+```
+
+- 接受 **F32 与 F16** 两种存储：F32 逐元素 `(__fp16)` 舍入，F16 直接 `pread` 到目标缓冲
+  （已是图要的表示，逐字拷贝）。
+- 为什么保留 F16 分支不是多余设计：`h3_weight_load_f32` 早就支持 F16 存储的 VAE
+  （`load_f16_as_float`），ANE 侧若不接就出现"Metal 能读、ANE 不能读"的存储。
+- 形状/dtype 不符一律拒绝并给出 `name is not F32/F16 [rows][cols]`。
+
+**覆盖**（本机没有 F16 存储的 video VAE，所以分两处测两条分支）：
+1. `h3_ane_vae_test <FL2VA video_vae> 2048`：四个投影逐字节比对
+   `h3_weight_load_f16_raw` 与闸门自算的 fp16 payload ⇒ **F32→fp16 分支一致**
+   （12582912/4194304/33554432/16777216 halves 全 ok），闸门仍 3.24× block、端到端 2.34× PASS。
+2. `h3_int8_raw_test <convrot transformer>`：该分片里有未量化的 F16 矩阵
+   `blocks.0.adaln_proj.linear.weight` [96768][8] ⇒ 用它验 **F16 逐字分支**
+   （`first and last 1048576 bytes match the shard`）＋ **拒绝 I8**。两处 0 failure。
+
+`tests/test_ane_vae_residency.c` 的本地实现删掉、改为调用新口（实测权重字节数
+24/8/64/32 MiB 与 fp16 预期一致，8 张图正常编译执行）。
+
+---
+
+# F23（2026-09-19 17:40）：D2d 接线实测 —— 正确、能优雅回退，但**在这台机器上净亏**
+
+`h3_video_vae.c` 接好后（`H3_ANE_VAE` 默认 off、`H3_ANE_VAE_MIN_ROWS=1024`、
+`H3_ANE_VAE_MAX_BLOCKS=31`、rows 分桶 2048、平面池化、常驻不轮换、逐 block 回退），
+用 `tests/test_ane_vae_decode.c`（新 Makefile 目标 `h3_ane_vae_decode_test`）对同一份
+确定性 latent 做 A/B：先跑 fp32 Metal 当参考，再跑 ANE，逐像素比对并计时。
+`REPEAT` 用来把"首轮建图"和"稳态"分开，否则会把编译成本读成解码成本。
+
+## 1. 正确性：PASS
+
+| ANE block 数 | cosine | rel_l2 | max_abs | 非有限 |
+|---|---|---|---|---|
+| 6 | 1.000000 | 2.178e-04 | 1.505e-03 | 0 |
+| 16 | 1.000000 | 4.926e-04 | 2.858e-03 | 0 |
+| 31（实际停在 30） | 1.000000 | 5.185e-04 | 2.972e-03 | 0 |
+
+门是 `cos>=0.999 && rel_l2<=0.02`，量级与 D1 闸门单投影的 fp16 误差一致（5~8e-4）。
+形状、帧数（12 latent → 39 帧 256×256）、跨 chunk 路径都对。
+
+## 2. 回退：按设计工作
+
+`vae.b26.w1 compile failed` / `vae.b30.w1 compile failed` 时只打印
+"stopped at block N of 31"，该 block 之后的 block 照常 fp32 Metal，输出仍然正确
+（上表 31 那行其实是 30 张常驻 + 6 个 block 回退的结果）。`H3_ANE_VAE_STRICT=1` 才让
+prepare 失败变成硬错误。
+
+## 3. 性能：稳态 0.95~1.00×，即**没有收益**；产物留不住时 0.13~0.38×
+
+latent 12×16×16（2 个 chunk、1797 行 → 2048 桶）、streaming=1：
+
+| ANE block | 稳态墙钟 | 同轮 metal | 比值 | ANE 侧 pack+eval |
+|---|---|---|---|---|
+| 6 | 20.24 / 20.45 / 20.43 s | 20.18 s | **1.00×** | — |
+| 16 | 20.80 / 20.61 s | 19.71 s | **0.95×** | 0.94 + 1.16 s |
+| 8（产物被淘光，每 pass 重编译 32 张） | 56.56 s | 20.58 s | 0.36× | 0.49 + 1.21 s |
+| 31（同上，104~124 张） | 122~158 s | 20.30 s | 0.13~0.17× | — |
+
+三个原因相乘，任何一个都足以否掉收益：
+
+1. **占比太小**：D1 闸门量的"36 block 一条 pass 3.22 s → 1.05 s"只占这次解码墙钟
+   （20 s）的 16%，理论上限 ~2.2 s（11%）。这 20 s 里大头是 10.4 GiB F32 权重的流式读
+   与注意力，不是那四个 GEMM。
+2. **跨界要 drain GPU**：`h3_ane_projection_apply` 前后各一次 `h3_gpu_submit()`
+   （commit + `waitUntilCompleted`）。16 block × 2 chunk = 128 次调用，ANE 侧只花
+   2.10 s，被替换的 Metal GEMM 是 16×2×89.5 ms ≈ 2.86 s，账面该省 0.76 s，
+   实测反而 **+0.9 s** ⇒ 每次调用约 **13 ms 的流水线空泡**（GPU 等 CPU、CPU 等 GPU 排空），
+   正好把理论收益全吃掉。闸门里没有这个空泡，因为它连跑同一张图。
+3. **产物根本留不住**：一个 rows 形状 4.5 GiB，本机系统卷只有 9 GiB 空闲，而
+   `H3_ANE_CACHE_MIN_FREE_MIB` 默认 6144。`bridge_cache_target()` 取
+   "min(上限, 空闲−下限+已有)"，空闲≈下限时 target 塌到 ~0 ⇒ LRU 疯狂淘汰，
+   而被存活图硬链接钉住的条目删掉也不返还空间（代码注释已承认这点），
+   于是**缓存被清空、空闲却没涨**，每轮解码重付 0.6~1.1 s/张的编译。
+   要看稳态只能临时把下限压到 1 GiB（表里 16 block 那行就是这么测的）。
+
+## 4. 唯一能让 ANE 摊薄固定成本的形状，这台机器测不了
+
+收益要成立得靠大 tile（GEMM 时间随时长线性涨，而跨界/建图成本近似不变）。
+但 latent 32×32 ⇒ rows 7173 ⇒ 桶 7424 ⇒ 池化平面按 D2a 的账（rows 2048 时 124 张
+1584 MiB）外推到 ~5.7 GiB，加上 10.4 GiB F32 权重流式读，超过本机 **16 GiB** 统一内存。
+换 rows 形状还要再付一份 4.5 GiB 产物 —— 与第 3 点冲突。
+
+## 5. 由此定下的收尾口径
+
+- 接线保留（正确性、回退、`H3_ANE_VAE_STATS` 分阶段计数都在），**默认 off 不变**。
+- Phase D 不再往"整 block 一张图/融合 FFN"投入：第 1、2 点与图的数量无关，
+  少建几张图只会让第 3 点的编译成本按比例下降，收益上限仍是 11% 减去空泡。
+- 缓存的空闲下限与"钉住条目不返还空间"是**独立缺陷**（DiT/int8 闸门同样受影响），
+  记在这里待单独处理：淘汰前应看 `st_nlink`，或空闲低于下限时干脆不写。
+
+## F23 更正（同一轮，紧接着的复测）：第 3 条原因写重了，产物留不住的**机制没定论**
+
+`H3_ANE_CACHE_DEBUG=1` 复跑两遍（8 block 一次、16 block 一次）：
+**evicted 行 0 条**，16 block 那轮是 64 条 `cache restored` + 0 条 `cache miss`，
+缓存目录稳定在 2186 MiB、系统卷空闲 6334 MiB ⇒ 我上写的"LRU 疯狂淘汰"不成立。
+
+站得住的部分：
+- 默认下限（6144 MiB）下，**31 block 那一轮结束时缓存是 0 字节**、16 block 的三轮
+  （144/150/61 s）结束时是 33 MiB；把下限临时降到 1024 MiB 后，同一形状稳定留住
+  ~2 GiB 产物，稳态才量得到 0.95×。⇒ "默认配置下这套产物不可靠地留不住"是真的。
+- 机制没定：可能是 store 阶段直接失败（`.tmp` 写不进、或被清扫），也可能是
+  会话开头的 trim 一次性清空（最早那轮 6 block 冷编译前空闲确实只有 5.4 GiB < 下限，
+  当时 DEBUG 没开）。要定性得单独开一轮：带 DEBUG 从空缓存起跑，逐条看 miss→store→下轮命中。
+- 因此 **Phase D 的否掉结论只依赖第 1、2 条**（占比 16% 与每次跨界 ~13 ms 空泡），
+  它们与缓存无关；第 3 条只解释"为什么冷跑是 0.13~0.38× 而不是 0.95×"。
+
+# F24 DiT 逐算子剖析（2026-09-21，`H3_DIT_OP_PROFILE=1`）
+
+## 0. 为什么要自己加括号
+整块 DiT 编码进**一条** command chain（`encode_forward` 只在块边界 submit/continue），
+所以没有括号时驱动只报得出"一块多少毫秒"，单个 kernel 看不见。
+新增开关 `h3_dit.c`：`run_block` 内的 `OP()` 在 `H3_DIT_OP_PROFILE=1` 时给每个算子
+补上 `submit`+`begin`，于是每个算子有独立 command buffer 和一个可测窗口。
+只碰 `run_block`——`encode_forward` 里同名 `OP` 的调用本身就是链的 begin/continue/submit。
+读的是 `stats.command_encode_seconds`/`command_wait_seconds` 的增量（主机时钟围着
+`waitUntilCompleted`，可信），**不读** root `GPUEndTime-GPUStartTime`（既有记录注过：MPSGraph 会
+把注意力排进子 buffer，同一配置它曾报过 0.298 s / 0.400 s / 121.995 s，不可信）。
+
+## 1. 测量条件
+`/Users/jay/h3_sys/MiniMax-H3-Convrot`（int8 convrot 权重，本机 M4 16 GB 无 TensorOps
+⇒ 计算走 BF16 路径）、`--ssd-streaming --steps 2 --reuse 1 --seconds 2`、
+`H3_DIT_RESIDENT_BLOCKS=6`（必须钉住：自适应驻留会随当时可用内存漂移，A/B 就不可比）、
+`caffeinate -is`（第一次 576 那两轮
+是机器睡眠把 `MTLCompilerService` 弄死后失败的；`864_unfused` 那一轮墙钟 124 min，
+而同一次运行里用 `CLOCK_MONOTONIC` 计出的括号窗口只有 221 s（macOS 睡眠期间该时钟
+不走），也是同一件事）。
+每标签 100 calls = 2 步 × 50 块。
+
+| 档 | sequence | 每块括号内合计 |
+|---|---|---|
+| 864×480 | 7074 rows | 2451.6 ms |
+| 576×320 | 3249 rows | 921.3 ms |
+
+## 2. 默认路径（融合 MLP + 融合 gate/AdaLN）逐算子
+
+864×480 / 7074 rows：
+
+| 算子 | ms/call | 占比 |
+|---|---|---|
+| DiT fused MLP（FC1+SwiGLU+FC2）| 1109.2 | **45.2%** |
+| DiT QKV projection/norm/RoPE | 607.9 | 24.8% |
+| DiT full attention（SDPA）| 503.4 | 20.5% |
+| DiT attention output | 206.4 | 8.4% |
+| DiT fused MLP gate + next attention AdaLN | 15.8 (×98) | 0.6% |
+| DiT fused attention gate + MLP AdaLN | 7.4 | 0.3% |
+| DiT attention AdaLN（每步第 0 块）| 82.3 (×2) | 0.1% |
+
+576×320 / 3249 rows：MLP 476.8（**51.8%**）、QKV 242.6（26.3%）、SDPA 112.4（12.2%）、
+attention output 85.0（9.2%）、两种 fused gate+AdaLN 各 ~2.0 ms（合计 0.4%）、
+attention AdaLN 14.6 ms（×2）。
+
+⇒ **份额随分辨率移动的方向只有一个：注意力。** SDPA 是 O(M²)，12.2%→20.5%；
+MLP 51.8%→45.2%。两档相加 MLP+QKV 都占 70~78%，AdaLN/gate 全线 ≤1%
+（此前那轮 AdaLN 融合优化已经把这类逐元素算子压到零头，没有余量了）。
+
+## 3. 拆开 FC1 / SwiGLU / FC2（`H3_DISABLE_FUSED_MLP=1 H3_DISABLE_FUSED_GATE_ADALN=1`）
+
+| 算子 | 864 ms/call | 576 ms/call |
+|---|---|---|
+| DiT MLP input（FC1，K=5376→N=28672）| 681.0 | 313.0 |
+| DiT SwiGLU | 13.8 | 3.7 |
+| DiT MLP output（FC2，K=14336→N=5376）| 336.9 | 160.6 |
+| DiT attention gate / MLP AdaLN | 4.4 / 2.1 | 1.5 / 1.1 |
+
+SwiGLU 0.4~0.6%，FC1:FC2 ≈ 2:1（正好是 2×FFN 输出宽度的比）。
+
+## 4. 折算成有效算力（扣掉括号空泡后）
+`TFLOPS` 用 `2·M·K·N`，注意力用 `4·M²·d·heads`：
+
+| 算子 | 864 TFLOPS | 576 TFLOPS |
+|---|---|---|
+| FC1 | 3.29 | 3.39 |
+| FC2 | 3.42 | 3.51 |
+| QKV | 2.77 | 3.45 |
+| attention output | 2.89 | 3.74 |
+| SDPA | 2.96 | 3.19 |
+| fused MLP（一个 kernel 装三件事）| 3.00 | 3.27 |
+
+⇒ **非 TensorOps 的 BF16 路径已经跑到 2.8~3.7 TFLOPS**，各 GEMM 之间只差三成，
+kernel 层没有大肉。省时间的路子只剩两条：**少算**（`--reuse`/`--layers`/
+`--token-reduction`/块稀疏注意力）或**低比特上 TensorOps**（本机 M4 拿不到，
+`h3_gpu.m:378` 的闸门是 M5 或 `H3_VDN_INT8`）。
+唯一可疑的一格：fused MLP 比同一档拆开的两次 GEMM 慢 8~10%，看着像省 405 MB 激活
+（7074×28672 BF16）付出的代价。但**同一次运行外不可比**——见 §6。
+> **修订（同日 F25）**：这一格已由同进程交替 A/B 判为噪声，fused 无可测代价，撤回"慢 8~10%"。
+
+## 5. 剖析自身的失真（必须先量，否则占比是假的）
+576 同配置、只差开关的配对：
+
+| | denoise wall | submissions |
+|---|---|---|
+| 无括号 | 81.410 s | 90 |
+| 有括号 | 92.182 s | 692 |
+
+⇒ 每个括号 `(92.182−81.410)/602 = ` **17.89 ms** 纯排空空泡。
+用它校正：每块 921.3 − 6.02×17.89 = **813.6 ms**，与无括号的 814.1 ms **闭合到 0.06%**；
+且括号内算子合计 92.126 s ≈ 有括号的 denoise 全程 92.182 s（99.9%）
+⇒ 块外算子（embed/final/add/velocity）合计不到 0.1%，不用再单列。
+864 那档扣同一常数后仍比无括号高 5.7%（2343.9 vs 2217.7 ms/块）⇒ M 越大排空越贵。
+
+**读数规矩**：绝对 ms 带 ~18 ms/call 的正偏，≤2 ms 的标签只说明"在括号地板以下"，
+不能判零；占比是同一次运行内的相对量，可信。
+
+## 6. 跨进程同算子能差两成 ⇒ 只在同一次运行内比较
+`DiT QKV projection/norm/RoPE` 在 864 融合那次是 607.9 ms，在不融合那次是 499.3 ms
+（−18%），而它两边都不是被改动路径；`DiT attention AdaLN` 更是 82.3 vs 39.8 ms（×2 次）。
+差异只能来自进程间分配器/MPSGraph 状态。所以 §4 里 "fused MLP 慢 8~10%" 这句话
+的置信度低于这个噪声，要定罪得做同进程 A/B（一次运行内两种 MLP 路径交替）。
+
+## 7. 与 F23 的互相印证，以及下一步的天花板
+- F23 从"6 block 与 16 block 两轮各自反推"得到的 **每次跨界 ~12-13 ms 空泡**，
+  这里被独立量到：一次纯 GPU `submit`+`wait` 括号就是 **17.9 ms**。DiT↔ANE 的
+  每次包边界至少要付这个量级，不是 ANE 特有的开销。
+- 给"再上加速器"划的线：DiT 里值得 offload 的只有 MLP（45~52%）和 QKV（25~26%）；
+  只搬注意力在 864 的天花板是 20.5%、在 576 只有 12.2%，还要先解决上面那条
+  每次跨界 ~18 ms 的空泡（每块 4 次跨界 = 72 ms ≈ 576 一档 MLP 份额的 15%）。
+- 块稀疏/窗口注意力的价值随分辨率单调上升：864 把 SDPA 砍一半 ≈ 全局 −10%，
+  576 只有 −6%。这与既有那条"≥864 时瓶颈在 GPU 计算、≤576 时瓶颈在权重 I/O，
+  所以 `--token-reduction` 只在高分辨率有效"是同一个方向。
+
+## 8. 复现
+```sh
+export H3_DIT_RESIDENT_BLOCKS=6 H3_DIT_OP_PROFILE=1
+export H3_CLIPPROJ_DIR=/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot
+export H3_CLIPPROJ_PROJ=/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3
+caffeinate -is ./h3 -d /Users/jay/h3_sys/MiniMax-H3-Convrot -p "A red fox" \
+    --width 864 --height 480 --seconds 2 --steps 2 --reuse 1 --ssd-streaming --profile \
+    -o /tmp/opprof_864_fused.mp4
+# 拆 FC1/SwiGLU/FC2 与 gate/AdaLN：再加 H3_DISABLE_FUSED_MLP=1 H3_DISABLE_FUSED_GATE_ADALN=1
+```
+原始日志 `/tmp/opprof_{864,576}_{fused,unfused}.log`、`/tmp/opprof_{864,576}_plain.log`。
+
+# F25 同进程 A/B：fused MLP 不比拆开的两次 GEMM 慢（2026-09-21，`h3_mlp_fusion_bench`）
+
+## 0. 要判的案
+F24 §4 留了一格可疑：864 一档 `DiT fused MLP` 1109.2 ms/call，而同一档拆开的
+FC1+SwiGLU+FC2 = 681.0+13.8+336.9 = 1031.7 ms ⇒ fused 看着慢 7.5%。
+但 F24 §6 量到同一个 QKV 算子跨进程能差 18%，这条 7.5% 落在那条噪声带里，
+定罪和释放都不够证据。这一轮把两条路径搬进**同一进程、同一套 buffer、逐轮交替**。
+
+## 1. 工具与口径
+`tests/bench_mlp_fusion.c` → `h3_mlp_fusion_bench`（独立 target，已进 `clean`，不在 `all` 里）。
+- 形状取 DiT 真值：`HIDDEN 5376`、`FFN 14336`、FC1 输出宽度 `2×FFN`；rows 取两档
+  sequence 3249 / 7074。
+- 融合侧一次 `h3_gpu_mlp_bf16`；拆开侧 `h3_gpu_linear_bf16` + `h3_gpu_swiglu_bf16` +
+  `h3_gpu_linear_bf16`，多物化一块 405 MB（7074×28672 BF16）的 FC1 输出。
+- 窗口外 `h3_gpu_begin`，窗口内"编码 + 一次 `submit`（含 `waitUntilCompleted`）"
+  ⇒ 每一测只排空一次，两侧对称，测完链是关着的。
+- 逐轮交替、奇偶轮交换先后 ⇒ 热漂移与时钟偏置均摊到两列。
+- buffer 全部 `memset` 清零，只测时间不测数值。
+- 条件：本机 16 GB M4（`int8 off` ⇒ 走 BF16 MPSGraph）、`caffeinate -is`、
+  跑法 `./h3_mlp_fusion_bench 13 3249 7074`。
+
+## 2. 读数
+| rows | 轮数 | fused 中位 ms | unfused 中位 ms | fused/unfused | 逐轮比值范围 | 单列极差/中位 |
+|---|---|---|---|---|---|---|
+| 3249 | 7 | 432.715 | 437.683 | 0.989 | 0.942..1.002 | 3.9% / 5.3% |
+| 7074 | 7 | 998.180 | 990.884 | 1.007 | 0.970..1.020 | 6.4% / 6.2% |
+| 3249 | 13 | 458.637 | 458.249 | 1.001 | 0.921..1.036 | 8.4% / 10.9% |
+| 7074 | 13 | 1120.313 | 1126.224 | 0.995 | 0.937..1.101 | 11.5% / 11.3% |
+
+四次独立跑（两档 × 两种轮数）的比值：0.989、1.007、1.001、0.995 ⇒ 全在 1.0 的
+1.1% 以内，且两次 7074 的符号相反（0.995 / 1.007）。按 13 轮那组做配对统计：
+7074 一档逐轮比值 mean 1.011、单轮 sd 5.3% ⇒ sem 1.5%、95% 置信区间
+**1.011 ± 3.2%（上限 1.042）**；3249 一档 mean 0.993 ± 1.7%。⇒ F24 那句"慢 8~10%"落在区间外，**排除**；
+能保留的最坏说法是"864 档可能慢 ≤4.2%"，而那已经不是值得动手的量。
+
+## 3. 顺量到的两条噪声性质
+- **同进程逐轮**极差 3.9~11.5%（轮数越多采样越全，暴露的尾部越大），中位数把它压到 1% 级。
+  ⇒ 这台机器上任何单算子 A/B，**少于 3% 的差都得用"同进程 + 交替 + 多轮中位数"**才谈得上。
+- **同一 binary、不同次运行**绝对值仍能差 6~12%：3249 fused 中位 432.7 → 458.6（+6.0%）、
+  7074 fused 中位 998.2 → 1120.3（+12.2%）。这是 F24 §6 那条跨进程噪声在同一 binary 上的重现
+  （电源/热状态），也再次说明**只有同一次运行内的比值可信**。
+
+## 4. 结论与影响
+- **无罪**：fused MLP 图本身没有可测的时间代价 ⇒ `H3_DISABLE_FUSED_MLP=1` 只作为
+  数值对参考的口子保留，默认融合路径不动。省下 405 MB 常驻激活（864 档）这一点白拿。
+- F24 §7 的 offload 池不变（MLP 45~52% + QKV 25~26%），但 MLP 那 45~52% 里
+  **没有 kernel 组织形式的漏**：之前以为"改回两次 GEMM 能白捡 8%"不存在，
+  要动它只剩"少算"或低比特上 TensorOps。
+- 本结论**不覆盖**两种情形：① 块内真实数据/缓存邻居下的相互作用（bench 是零 buffer、
+  孤立窗口，只能判"融合图本身不亏"，不能证明 864 档块内一定零差）；② M5 上的 int8/TensorOps
+  融合 MLP 路径（本机拿不到，`h3_gpu.m:378` 的闸门是 M5 或 `H3_VDN_INT8`）。
+
+# F26 现成窗口注意力内核每对便宜不了：比稠密 SDPA 慢 70~78 倍（2026-09-21，`h3_attention_bench`）
+
+## 0. 要判的案
+F24 §7 之后排在第一位的方向是"块稀疏/窗口注意力在 864 一档占 20.5%，砍一半 ≈ 全局 −10%，
+而且内核现成（`h3_gpu_sdpa_window_mask_bf16` / `h3_flash_attn_windowed` /
+`h3_flash_attn_tiled_windowed`），只差接线 + 画质 A/B"。接线之前先量"每对便宜不便宜"，
+因为整条估算默认**稀疏内核算一对和稠密 MPS 算一对一样贵**——这个前提没人量过。
+
+## 1. 工具与口径
+`tests/bench_attention.c` → `h3_attention_bench`（独立 target，已进 `clean`，不在 `all`）。
+- 同一进程、同一套 q/k/v/out（各 `sequence×56×128` BF16），两侧交替、奇偶轮交换先后；
+  窗口外 `h3_gpu_begin`，窗口内"编码 + 一次 `submit`（含 wait）"（F25 定的那套口径）。
+- A 侧 = DiT 真正在用的 `h3_gpu_sdpa_bf16`（MPSGraph 稠密）；
+  B 侧 = `h3_gpu_flash_attn_bf16`，`causal=0` ⇒ 走 `h3_flash_attn_tiled_windowed`。
+- 几何按 F24 那两档真实分解：`7074 = 189(文本+音频) + 17×405`、`3249 = 189 + 17×180`
+  （两档都是 17 帧 + 189 非视频行，互相印证）。
+- `radius=16` 是**对照**：17 帧全可见，B 侧算的对数和 A 侧基本相同 ⇒ 直接读出每对成本比。
+
+## 2. 读数（3 轮，中位数）
+| sequence | B 侧窗口 | 稠密 A ms | 窗口 B ms | B/A | 该窗口实际算的对数占稠密比 |
+|---|---|---|---|---|---|
+| 7074 | radius 1 | 540.5 | 7169.8 | **13.27** | 18.73% |
+| 7074 | radius 16（对照，几乎全可见） | 569.3 | 38730.0 | **68.03** | 97.40% |
+| 3249 | radius 1 | 103.9 | 1690.8 | **16.28** | 20.86% |
+| 3249 | radius 16（对照） | 125.4 | 8983.1 | **71.63** | 94.52% |
+
+对数占比按内核的可见域逐帧算出（文本行只见文本、视频行见"文本 + 半径内整帧"，
+边缘帧按截断算），不是估的。
+
+**自洽校验**：`(B/A) ÷ 对数占比` = 每对成本比 ——
+7074：13.27/0.1873 = 70.8 对 68.03/0.9740 = 69.8（差 1.4%）；
+3249：16.28/0.2086 = 78.0 对 71.63/0.9452 = 75.8（差 2.9%）。
+两种窗口宽度、两种几何都落在 **每对比稠密 MPS 贵 70~78 倍** ⇒ 这是内核性质，不是巧合。
+
+## 3. 为什么这么慢（读 `h3_shaders.metal:5600-5712`）
+`h3_flash_attn_tiled_windowed` 名字里的 tiled 只是"一个 threadgroup 64 行 query"，
+没有 KV 分块、没有 threadgroup 复用：**一线程一 query 行**，
+- 每个 key 都从 global 读一整行 K（128 通道）再点积，64 个线程各读各的 ⇒ 同一批 K 行被读 64 遍；
+- online softmax 的 `acc[128]` **每个 key 重标一遍**（又多 128 次乘法和一次 V 行读取）；
+- 全程标量 fp32 FMA，无 TensorOps/无 matmul 分块。
+⇒ 带宽而非算力封顶，比 MPSGraph 的融合注意力差两个数量级是必然结果。
+（`h3_flash_attn_windowed`、`test_flash_attn.c` 那一族是同一写法；
+`h3_gpu_sdpa_window_mask_bf16` 只是**造 mask** 再喂稠密 SDPA，一对都不省。）
+另外：`h3_gpu_flash_attn_bf16` 在 `h3_dit.c`/`h3.c` 里**没有任何调用点**，只有测试在用。
+
+## 4. 结论与影响
+- **F24 之后那条"只差接线"的第一优先方向作废**：接线不会带来全局 −10%，
+  会把注意力那一个算子从 540 ms 变成 7170 ms（13.3 倍）——按它 20.5% 的份额，
+  每块时间变成 2.5 倍。
+  块稀疏注意力的 20.5% 天花板仍然成立，但要吃到它得**新写一个分块 flash 内核**
+  （threadgroup 里 tile K/V、matmul 累加、只保留窗口内的 KV tile），
+  这是一周内核工程，不是接线活；且要赢过 2.96 TFLOPS 的稠密 MPS SDPA 才有意义。
+  > **修订（同日 F27）**：这句只对"用库里那个窗口内核"成立。把一次稠密 SDPA 拆成 G 次
+  > 小稠密 SDPA 时，每对成本在 540 行以上不涨（0.8~0.9×），"新写 flash 内核"不是前置；
+  > 真正缺的是让 SDPA 支持 query 行数 ≠ key 行数（现在是方阵）。见 F27 §2、§4。
+- 顺带校准了剖析口径的**绝对**可信度：本 bench 的稠密中位（7074 档 540.5 ms）
+  对上 F24 块内括号读到的 503.4 ms（同一算子、不同进程），差 7% —— 与 F25 §3
+  那条"同 binary 两次运行差 6~12%"一致，绝对值仍只当量级用。
+- 对"还有没有肉"的回答没有变：MLP 45~52% + QKV 25~26% 的 offload 池、
+  以及"少算 / 低比特上 TensorOps"这两条省时路子（F24 §4）不受影响。
+
+# F27 把一次稠密 SDPA 拆成 G 次小稠密 SDPA：每对成本几乎不涨（2026-09-21）
+
+## 0. 问题从哪来
+F26 §4 的结论是"要吃到注意力那 20.5% 就得新写一个分块 flash 内核，一周工程"。
+那句话只覆盖了"用库里那个窗口内核"这一条路。块稀疏真正的成本问句是：
+**同样跑稠密 MPSGraph SDPA，把一次 M×M 拆成 G 次 (M/G)×(M/G)，每对 token 还值多少钱？**
+- 每对成本随 M 变小而明显上涨 ⇒ 稀疏必须新内核，F26 成立；
+- 每对成本基本不变 ⇒ G 次小稠密调用本身就是现成的稀疏内核，"一周内核工程"不存在。
+
+## 1. 工具与口径
+`tests/bench_attention.c` 重写为三档：`dense`（一次全序列，产品路径）、
+`split`（G 次小稠密）、`window`（F26 那个库内核，只作对照，默认不跑）。
+- `split` 用 **G 套各自独立**的小 buffer（不是复用同一组，免得做出人造的热 cache）；
+  G 次编码进**同一条** chain，一次 `submit`（commit+wait）计一段墙钟。
+- 每个 shape 首次使用要编自己的 MPSGraph ⇒ 先各 warm 一次再进计时轮。
+- 5 轮、轮间轮换顺序、取中位；每档另报 CPU 编码 / GPU 排空两段。
+- 同进程配对，符合 F25 §3 那条规矩（绝对 ms 只当量级，比值才是结论）。
+
+## 2. 结果
+| M | keep=1/G → 每次行数 | time × | pairs × | 每对 × | 相对稠密效率 |
+|---|---|---|---|---|---|
+| 7074 | 3 → 2358 行 | 0.293 | 0.333 | 0.9 | 1.14 |
+| 7074 | 6 → 1179 | 0.140 | 0.167 | 0.8 | 1.19 |
+| 7074 | 9 → 786 | 0.099 | 0.111 | 0.9 | 1.12 |
+| 7074 | 12 → 589 | 0.079 | 0.083 | 0.9 | 1.06 |
+| 7074 | 18 → 393 | 0.059 | 0.056 | 1.1 | 0.94 |
+| 7074 | 24 → 294 | 0.044 | 0.041 | 1.1 | 0.94 |
+| 3249 | 3 → 1083 行 | 0.309 | 0.333 | 0.9 | 1.08 |
+| 3249 | 6 → 541 | 0.164 | 0.166 | 1.0 | 1.02 |
+| 3249 | 9 → 361 | 0.129 | 0.111 | 1.2 | 0.86 |
+| 3249 | 12 → 270 | 0.098 | 0.083 | 1.2 | 0.84 |
+| 3249 | 18 → 180 | 0.075 | 0.055 | 1.4 | 0.74 |
+| 3249 | 24 → 135 | 0.073 | 0.041 | 1.8 | 0.57 |
+
+绝对值（中位，ms）：7074 稠密 623.9~652.2，split G=6 89.6 / G=12 50.1 / G=24 28.8；
+3249 稠密 120.5~125.7，split G=6 20.6 / G=12 12.3 / G=24 8.8。
+
+⇒ **每对成本在 ~540 行以上完全不掉（0.8~0.9×，甚至略赚）**，540 行以下才开始涨，
+到 135 行涨到 1.8×。对照 F26 那个窗口内核的 **70~78×**：同一个"少看几对"的需求，
+一条路贵两个数量级，一条路免费。轮间散布 ±3~6%，G=3/6/9/12 那几档的"每对 0.8~1.0"
+是稳的，1.1/1.2 这种一档之别落在噪声里，不必细抠。
+
+## 3. 折算天花板（配上 F24 的份额）
+F24：864×480 / 7074 档每块括号内 2451.6 ms，其中 full attention 503.4 ms = **20.5%**；
+576×320 / 3249 档每块 921.3 ms，SDPA 112.4 ms = **12.2%**。
+
+| keep | 864 SDPA → ms/块 | 864 全局省 | 576 SDPA → ms/块 | 576 全局省 |
+|---|---|---|---|---|
+| 1/6 | 70.5 | **−17.7%** | 18.4 | **−10.2%** |
+| 1/12 | 39.8 | −18.9% | 11.0 | −11.0% |
+| 1/24 | 22.2 | −19.6% | 8.8 | −11.2% |
+
+（份额取自 F24 另一个进程，比值取自本进程，属于跨来源相乘，按 6~12% 的绝对噪声读；
+量级结论不受影响。）此前"窗口注意力最多全局 −10%"那句是保守了：
+按 1/6 keep 且不吃质量亏，864 一档的上限是 −17~18%，keep 再狠也只多拿不到 2 个点
+⇒ **这项的取舍几乎全在质量侧，不在速度侧**。
+
+## 4. 那么缺的是形状，不是内核
+`h3_gpu_sdpa_bf16` 只能算**方阵**：`h3_gpu.m:1542-1568` 建图时 Q 与 K/V 共用同一个
+`sequence`，`:1693` 又把 batch 钉成 1。
+"每个 query 块看它 top-k 选中的 key 块" = (B 行 query) × (k·B 行 key)，是**矩形**；
+方阵只表达得出**块对角**（每个 query 块只看自己那一片）。
+块对角对视频几乎必然判死：帧与帧之间看不到，视频行还看不到那 189 行文本条件。
+⇒ 前置改动是给 SDPA 支持 `query_rows ≠ key_rows`（顺手 batch>1）。
+gather 侧**不需要**新内核：选中的 key 块都是连续段，现成的
+`h3_gpu_copy_bf16(gpu, dst, dst_offset, src, src_offset, elements)` 就能打包，
+流量 O(rows·d) 对算力 O(rows·key·d) 可忽略。
+另外确认了一件省心的：G 次调用的 CPU 编码只有 0.1~1.3 ms（G=24 时 1.0~1.3），
+全编码进同一条 command buffer，**不付** F24 §5 那 17.9 ms/括号。
+
+## 5. 已知未测
+- 矩形 (B × kB) 的每对成本**没测** —— 现在的 API 表达不了它。加完 API 第一件事就是量它，
+  尤其 kB 远大于 B 时（query 少 key 多）是不是还平。
+
+  > **修订（同日 F28）**：API 已加（`h3_gpu_sdpa_rect_bf16`）并测完 —— 7074 档每个形状
+  > 每对都是 **0.9~1.0×** 稠密，带打包流量也不涨；唯一变贵的是"单次调用活量 <~100k 对"。
+  > 结论从"最多 −17.7%"改到 **−19.4%**（keep 5%），见 F28 §2/§4。
+- 50 层各用不同 keep ⇒ 几十个不同 shape 的 MPSGraph 编译：首步 warm-up 时间与
+  `sdpaCache` 的显存占用没量（16 GB 机器上这条必须先量再上）。
+- buffer 全 0：这些内核没有数据相关早退，理论上耗时与值无关，但没排除 MPSGraph
+  按值选 kernel 的可能。
+- 质量：块对角 / 窗口 / top-k 选块都要真实渲染 A/B，这一步省不掉。
+  按 §3，速度侧 1/6 keep 就基本吃满，所以**该从最保守的 keep 起测**。
+
+## 6. 复现
+```sh
+make -j8 h3_attention_bench
+caffeinate -is ./h3_attention_bench 5 ds \
+  7074:189:17:405:0:3 7074:189:17:405:0:6 7074:189:17:405:0:9 \
+  7074:189:17:405:0:12 7074:189:17:405:0:18 7074:189:17:405:0:24 \
+  3249:189:17:180:0:3 3249:189:17:180:0:6 3249:189:17:180:0:9 \
+  3249:189:17:180:0:12 3249:189:17:180:0:18 3249:189:17:180:0:24
+# MODE = SEQUENCE:TEXT:FRAMES:TOKENS_PER_FRAME:RADIUS:GROUPS，radius 0 关掉窗口对照
+```
+原始日志 `/tmp/split_dense.log`。
+
+# F28 矩形 SDPA 每对成本 = 稠密：块稀疏的定价彻底改口，代价只在质量侧（2026-09-21，`h3_gpu_sdpa_rect_bf16` + `h3_attention_bench`）
+
+## 0. 这一轮补的是 F27 §5 的第一条
+F27 只测了方阵（`kB = B`），因为老 API 表达不了别的形状。它留下的问句是：
+**query 少、key 多的矩形调用是不是还平？** 现在的稀疏方案全是这个形状
+（一个 query 块只看它选中的几片 key），如果不平，F27 那张表就用不上。
+本轮先补 API，再立刻量它。
+
+## 1. 改了什么
+- `h3_gpu.m`：建图函数拆出 `key_sequence`，Q 与 K/V 各自的行数和 shape
+  （`H3SDPA` 多一个 `keyShape`，cache key 多一个字段），新增
+  `h3_gpu_sdpa_rect_bf16(gpu, out, q, k, v, query_rows, key_rows, heads, dim, scale)`。
+  原 `h3_gpu_sdpa_bf16` 走 `sequence, sequence`，产品路径不变。
+- `tests/test_flash_attn.c`：`test_sdpa_rectangular` —— 不依赖 safetensors fixture 的数值闸
+  （已接进 `make test`）。三件事：rect(5,5) 与老方阵调用**逐位相同**；
+  rect(5,11) 是 dense(11) 前 5 行的子集；把两段不连续的 key 行用
+  `h3_gpu_copy_bf16` 打包成 11 行再喂 rect，结果对 BF16 CPU 参考仍只有 2.2e-04 误差。
+  ⇒ 打包 gather 不需要新内核这点是**验过**的，不是推测。
+- `tests/bench_attention.c`：加 `rect`（纯调用，key 视为已打包）和 `rectg`
+  （每次调用前真的从全尺寸 K/V 里 `copy_bf16` 出这段窗口），MODE 多一个 `KEY_ROWS` 字段。
+  一轮里同时出 dense / split / rect / rectg 四档，同进程配对。
+
+## 2. 结果：每对成本就是 1.0×
+`time × / pairs ×`，189 文本行、17 帧、5 轮中位；`rect` 是纯注意力，`rectg` 带上打包流量。
+
+| M | 调用 × B 行 × S key | keep(=pairs) | split 每对 | rect 每对 | rectg 每对 |
+|---|---|---|---|---|---|
+| 7074 | 6 × 1179 × 354 | 0.050 | 0.9 | **1.0** | **1.0** |
+| 7074 | 6 × 1179 × 707 | 0.100 | 0.9 | **0.9** | **0.9** |
+| 7074 | 12 × 589 × 354 | 0.050 | 1.0 | **1.0** | 1.1 |
+| 7074 | 18 × 393 × 354 | 0.050 | 1.0 | **1.0** | 1.2 |
+| 7074 | 18 × 393 × 707 | 0.100 | 1.0 | **1.0** | 1.2 |
+| 7074 | 18 × 393 × 1179 | 0.167 | 1.1 | **0.9** | 1.1 |
+| 3249 | 6 × 541 × 361 | 0.111 | 1.0 | **1.0** | 1.2 |
+| 3249 | 6 × 541 × 180 | 0.055 | 1.0 | 1.2 | 1.3 |
+| 3249 | 9 × 361 × 361 | 0.111 | 1.1 | 1.1 | 1.3 |
+| 3249 | 9 × 361 × 180 | 0.055 | 1.2 | 1.4 | 1.4 |
+| 3249 | 18 × 180 × 180 | 0.055 | 1.4 | 1.3 | 1.6 |
+
+7074 档绝对值：稠密中位 564~613 ms；keep=5% 的 rect **30.0 ms**（rectg 30.3~35.9）。
+⇒ "少看 key"这件事本身**不再收钱**：F26 那个库窗口内核每对 70~78×，
+稠密小调用每对 1.0×。同一需求的价格差从两个数量级变成零。
+
+## 3. 贵的只剩一件事：每次调用的算力太小
+把三档放一起看，掉不分块的形状、也不掉 B 或 S 单独的大小，掉的是**单次调用的活量**：
+- 每次 ≥ ~140k 对（≈4 GFLOP，如 393×354、541×361、1179×354）⇒ 每对 0.9~1.0；
+- 每次 ~97k 对（541×180）⇒ 1.2；~65k（361×180）⇒ 1.4；~32k（180×180）⇒ 1.3~1.6。
+所以 3249 一档想吃到 5% keep，**不要**用 18 个小块（那是 split 只能给的对角形状），
+要用 6 个大 query 块 × 180 key。这条直接就是"块怎么划"的选型依据。
+
+顺带一条 F27 没点破的：方阵 split 只能表达**块对角**且 keep 被钉死成 1/G；
+矩形把 keep 和调用次数解耦了 —— 上表 6×1179×354 用 6 次调用做到 5% keep，
+方阵要 20 次调用才勉强凑出同样的 keep，而且形状还是错的（帧间不可见）。
+
+## 4. 折算天花板（份额仍取自 F24）
+864×480：SDPA 占块内 20.5%（503.4 / 2451.6 ms）；576×320：12.2%（112.4 / 921.3）。
+
+| keep | 864 最优形状的 rectg time× | 864 全局省 | 576 最优 | 576 全局省 |
+|---|---|---|---|---|
+| 5% | 0.051（6×1179×354） | **−19.4%** | 0.073（6×541×180） | **−11.3%** |
+| 10% | 0.093（6×1179×707） | −18.6% | 0.133（6×541×361） | −10.6% |
+| 16.7% | 0.181（18×393×1179） | −16.8% | — | — |
+
+和 F27 §3 的估计同量级，但这张表**已经把打包流量算进去了**（keep 越小、块越多，
+gather 占比越明显：18 块 5% keep 时 rect→rectg 是 30.1→35.9 ms，+19%；
+6 块时 30.0→30.3 ms，几乎为零）。⇒ 结论没变、更硬：**速度侧已经吃满，
+剩下 −19% / −11% 能不能拿，全看质量**。再往 20% 以下压 keep 只多不到 1 个点，
+不值得为它冒画质风险。
+
+## 5. 显存：真实管线要的比 bench 少两个数量级
+bench 给每个块配一套独立 buffer（最狠的一档 18×393×1179 ≈ 813 MB），
+是为了不造人造热 cache。真实路径里 copy→SDPA 是**串行消费**同一块 scratch 的：
+一整套打包 K/V 只要 `2 × S × 56 × 128 × 2` 字节，S=707 时 **20.3 MB**。
+未验：同一条 chain 里复用同一块 scratch 是否被正确排序（要不要像 rect 那样补一个
+逐位比对闸）。上真机前必须先把这条闸做出来。
+
+> **修订（同日 F29）**：闸已补（`test_sdpa_scratch_reuse`，进 `make test`）—— 3 块
+> 共用一块 scratch、含两段 gather，误差与"每块独立 buffer"完全相同（2.18e-04），
+> 相邻块输出不逐位相同。串行复用成立，20.3 MB 那笔账可以用。
+
+## 6. 已知未测
+- 真实稀疏模式（文本列全看 + 帧窗口 + 局部）下 50 层的**渲染质量** A/B —— 现在才有
+  了可测的形状，之前连表达都表达不出来。
+- 每块多段不连续 key（3~5 段）时的编码开销：本轮 rectg 每块只搬 1 段，
+  段数上去后 copy 的 op 数翻倍，字节数不变，估计吃的是 CPU 编码那 0.1~1.3 ms。
+- 50 层各异 keep ⇒ 几十个不同 shape 的 MPSGraph：首步编译时间 + `sdpaCache` 常驻，
+  16 GB 机器上这条**先于**任何逐层表接线。
+- buffer 全 0：这些内核没有数据相关早退，理论上与值无关，但没排除 MPSGraph 按值选 kernel。
+- 单块内 top-k 选块（谁是那 354 行）需要一个打分通路，本轮完全不涉及。
+
+## 7. 复现
+```sh
+make -j8 h3_attention_bench h3_flash_attn_tests && ./h3_flash_attn_tests
+caffeinate -is ./h3_attention_bench 5 dsgr \
+  7074:189:17:405:0:18:354 7074:189:17:405:0:18:707 7074:189:17:405:0:18:1179 \
+  7074:189:17:405:0:12:354 7074:189:17:405:0:6:354 7074:189:17:405:0:6:707
+caffeinate -is ./h3_attention_bench 5 dsgr \
+  3249:189:17:180:0:18:180 3249:189:17:180:0:9:180 3249:189:17:180:0:6:180 \
+  3249:189:17:180:0:6:361 3249:189:17:180:0:9:361
+# MODE = SEQUENCE:TEXT:FRAMES:TOKENS_PER_FRAME:RADIUS:GROUPS:KEY_ROWS
+# 变体 d 稠密 / s 方阵拆分 / r 矩形纯调用 / g 矩形带打包 / w 库窗口内核（默认不跑）
+```
+原始日志 `/tmp/attn_rect_7074.log`、`/tmp/attn_rect_3249.log`。
+
+# F29 打包 K/V 可以全块共用一块 scratch：显存账从 813 MB 掉到 20 MB（2026-09-21，`test_sdpa_scratch_reuse`）
+
+## 1. 为什么先量这个
+F28 §5 留了一条"未验"：bench 为了不做人造热 cache，给每个 query 块配一整套
+打包 buffer，最狠的一档（18 × 393 × 1179）光 slice 就 813 MB。
+真实逐块循环只需要**一套** scratch —— 前提是同一条 command buffer 里
+`copy → SDPA` 的读写序被 Metal 守住。这条不成立的话，块稀疏在 16 GB 机器上
+要么改每块一套（显存吃掉一大截），要么每块之间插排空（把 F24 §5 那 17.9 ms/括号
+重新请回来）。所以它排在质量 A/B 前面。
+
+## 2. 闸怎么做
+`tests/test_flash_attn.c::test_sdpa_scratch_reuse`（跟着 `make test` 跑）：
+13 行源 K/V、11 行打包 scratch、3 个 query 块**共用这一块**，每块先写 scratch
+再紧跟自己那次 `h3_gpu_sdpa_rect_bf16`，全在一条 chain、一次 submit。
+三块选的行互不相同，其中一块是**两段**（5..12 + 0..2），顺带把多段 gather 的
+正确性也占了。判据两层：
+- 每块输出对它自己的选行参考：`max_err=2.18e-04`，与 F28 里"每块独立 buffer"
+  那次 packed 路径的误差**一模一样** ⇒ 没有串味；
+- 相邻两块输出不得逐位相同 ⇒ 挡住"三次都算了最后一次内容"这种退化。
+
+## 3. 结论与影响
+- 复用安全，`copy` 与后续 rect 的序守住了 ⇒ 打包 K/V 常驻只要
+  `2 × S × 56 × 128 × 2` 字节：S=707 时 **20.3 MB**（F28 §5 那笔账成立）。
+- 每块**多段**（本轮 2 段）不需要额外 buffer，只是多几条 copy 编码；
+  编码字节数没变，代价落在 CPU 编码那 0.1~1.3 ms 上，量它仍是未测项。
+- 这不外推的东西：跨 command buffer / 跨层的复用、以及几十个不同 shape 图
+  的编译与 `sdpaCache` 常驻 —— 那条仍是逐层表接线前的硬闸（F28 §6）。
+
+## 4. 复现
+```sh
+make h3_flash_attn_tests && ./h3_flash_attn_tests
+# 期望：sdpa_scratch_reuse: OK (... two-segment gather included) max_err=0.000218
+```
+
+---
+
+# F30 逐层各异 keep 的三道前置闸：图缓存显存、首步编译、多段 gather 编码（2026-09-21）
+
+## 0. 这一轮要答什么
+F27 §5、F28 §6、F29 §3 留的是同两句：**50 层各用不同 keep ⇒ 几十个不同 shape 的
+MPSGraph 首步编译时间和 `sdpaCache` 常驻没量过**；**每块 3~6 段不连续 key 的 gather
+编码开销没量过**。16 GB 机器上这两条不过关，逐层静态表就只能退回"全层共用一个 keep"，
+§task#20 之后没有空间。
+
+## 1. 先把"显存归因"做对，否则结论是反的
+第一次量：50 个 shape 跑完 resident 801 → 4042 MB ⇒ 看着像 65 MB/shape，
+结论会是"逐层表直接毙"。
+**对照组**：把 50 个不同 shape 换成**同一个 shape 重复 50 轮**，resident 一样爬到
+4835 MB，而 `engine tensors` 全程钉在 774/774 MB。
+⇒ 那个斜坡是 bench 自己每个 MODE 重新 alloc/free 一套 buffer 池的**抖动**，跟 shape
+数无关。修法：给 bench 加共享池 —— 所有 MODE 的 `sequence` 和 `groups` 相同才启用，
+按最大的 `key_rows` 开一套给全部 shape 复用，这样 resident 的增量才只剩"图缓存"一个来源。
+（共享池只在 sequence+groups 一致时开；不同 groups 混进来 slice 尺寸会失真。）
+
+## 2. 闸一：图缓存 ≈ 1 MB/shape —— 绿灯
+共享池、50 个不同 `key_rows` 的 shape：resident **794 → 842 MB**，即
+**50 张图合计 +48 MB ≈ 1 MB/shape**；`engine tensors` 全程 774/774 MB（就是那套池本身）
+⇒ 新 shape 的图**没有**带进额外常驻 buffer。16 GB 机器上"逐层 50 张图"是几十 MB 量级，
+不是 GB 量级 ⇒ 不构成否决。
+
+## 3. 闸二：首步编译 3.9 ms/shape，50 层一次性 201 ms —— 绿灯
+每个新 shape 第一次用的 CPU 侧 `enc` = 2.9~7.2 ms（中位 3.9），50 个合计 **201 ms**；
+shape 缓存命中后每次 re-encode 0.3~0.9 ms。
+对照 F24 §5：一个纯 GPU 括号 17.89 ms ⇒ 50 层各编一张图约等于一个括头，且**只在首步付一次**。
+
+## 4. 闸三：段数不花钱 —— 绿灯
+| 形状 | 段 1 | 2 | 3 | 4 | 6 | 8 |
+|---|---|---|---|---|---|---|
+| 6 块 ×1179 行 ×707 key | 54.6 | 55.5 | 55.3 | 56.4 | 56.8 | 55.5 |
+| 18 块 ×393 行 ×354 key | 34.6 | — | — | 34.6 | — | 34.4 |
+
+毫秒，5 轮中位；**每对成本全程 0.9 / 1.1，段数从 1 到 8 没有可测代价**。
+CPU 编码：段 1 那档 12 条 copy → 0.3~0.5 ms；段 8 且 18 块那档 **288 条 copy + 18 次
+rect → 0.8 ms**。一次 submit 不变 ⇒ 不会把 F24 §5 那 17.89 ms/括号请回来。
+⇒ "每块看 帧窗口 + 那 189 行文本 + 若干段" 这种真实选块模式，gather 侧真的只是记账。
+
+## 5. keep 带曲线补全：固定 B 动 S，从 6.8% 到 16.7% 一条直线
+`B=1179` 固定，只动 `key_rows`（这就是"层数不变、只调 keep"的形状）：
+
+| key_rows | 480 | 560 | 640 | 720 | 800 | 880 | 960 | 1040 | 1120 | 1180 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ms | 35.3 | 42.0 | 45.8 | 53.8 | 58.4 | 64.9 | 71.0 | 76.5 | 78.7 | 85.6 |
+| 每对 × | 0.8 | 0.9 | 0.9 | 0.9 | 0.8 | 0.8 | 0.8 | 0.8 | 0.8 | 0.8 |
+
+**单调、无悬崖，每对 0.8~0.9**（5 轮中位，dense 对照全程 591~629 ms）。
+拟合：每 1% keep ≈ 5.1 ms/块，与 F28 的 keep=5% → 30.0 ms 相接。
+⇒ 逐层表里每层 keep 可以**任意取值**，不需要为"避开坏 shape"做量化对齐。
+
+## 6. 踩坑：机器状态会伪造一个 shape 悬崖，而且"同进程配对"救不了它（方法学）
+第一轮 50 shape 扫描（`rounds=1`）跑到第 15 个 shape，**全序列 dense 对照**从
+547~589 ms 变成 900~1200 ms，此后 20 多分钟不恢复（90 s 空闲、换更小 geometry 都没用；
+3249 dense 也从 F28 的 120.5~125.7 ms 变成 168~209 ms）。当时看到
+"S=440→500 每对成本跳 4×"，差点记成"MPSGraph 在某个 key_rows 上换了内核"。
+两点把它证伪：
+- 同一 shape（6×1179×707）在好窗口是 time ×0.092 / 每对 0.9，坏窗口 ×0.145 / 每对 1.5
+  ⇒ **小调用比大调用在争用下亏得更多**，所以坏窗口的"每对成本"系统性偏高，
+  F25/F27 那条"同进程配对"只保证同状态内可比，**跨状态不守恒**；
+- §4/§5 在好窗口重测（5 轮）完全单调，且那组里 dense 满载连跑 27 s 都没退化
+  ⇒ 退化不是我自己压出来的，是外部占用（`pmset -g therm` 无告警、`h3-mlx` 已退出，
+  在场的是 WindowServer / Qoder Helper / UURemoteServer / VTEncoderXPCService）。
+⇒ 闸已经写进 bench：每个 sweep 自带的那次全序列 dense 就是探针，中位超过**本次运行同
+sequence 最快 dense 的 1.1×** 就打 `NOTE: ... discard the ratios above`。
+以后凡是跨 sweep 比 shape 的扫描（`rounds=1` 那种），先扫有没有 NOTE 再看数字。
+坏窗口日志只保留 `resident` 与 `enc` 这两类**非 GPU 计时**字段（§2/§3 用的正是它们，
+所以不受影响）。
+
+## 7. 结论：逐层静态表现在只剩质量一道门
+三道前置闸全绿：图缓存 +48 MB/50 shape、一次性编译 201 ms、多段 gather 编码 ≤0.8 ms，
+外加 keep 任意取值不掉性能。工程可行性这条不用再验；剩下的全在 F28 §4 的天花板
+（864 −19.4% / 576 −11.3%）和 task#20 的渲染质量 A/B 上。
+
+## 8. 复现
+```sh
+make -j8 h3_attention_bench
+# 闸一/二：50 个不同 key_rows，sequence+groups 一致才吃得到共享池
+typeset -a modes; for i in {1..50}; do modes+=("7074:189:17:405:0:6:$((180 + i * 20)):1"); done
+caffeinate -is ./h3_attention_bench 1 dr "${modes[@]}"   # 只看 resident 与 enc 两列
+# 闸三：段数
+typeset -a seg; for s in 1 2 3 4 6 8; do seg+=("7074:189:17:405:0:6:707:${s}"); done
+for s in 1 4 8; do seg+=("7074:189:17:405:0:18:354:${s}"); done
+caffeinate -is ./h3_attention_bench 5 dg "${seg[@]}"
+# keep 带
+typeset -a band; for k in 480 560 640 720 800 880 960 1040 1120 1180; do
+  band+=("7074:189:17:405:0:6:${k}:1"); done
+caffeinate -is ./h3_attention_bench 5 dr "${band[@]}"
+```
+MODE 现在是 8 段：`SEQUENCE:TEXT:FRAMES:TOKENS_PER_FRAME:RADIUS:GROUPS:KEY_ROWS:SEGMENTS`。
+原始日志：`/tmp/attn_shapes50_shared.log`（闸一/二，S≥480 段的计时作废）、
+`/tmp/attn_shapes50.log` 与 `/tmp/attn_shapecontrol.log`（§1 归因对照）、
+`/tmp/attn_segments4.log`（闸三）、`/tmp/attn_keepband.log`（§5）、
+`/tmp/attn_segments3.log`（整份作废，§6）。
+
+---
+
+# F31 固定 keep 的块稀疏接通产品路径：等价闸位精确，但质量在有利可图的区间就崩了（2026-09-21）
+
+## 1. 接线（`h3_dit.c`，`H3_SPARSE_ATTN=BLOCK_FRAMES[:RADIUS]`）
+
+- video 行按帧分块：每块查询看"自己这 block 的帧 ± RADIUS 帧"的窗口，**外加所有非 video 行**
+  （文本/音频条件对每块都全量可见，所以条件不会被稀疏掉）。
+- 条件行只打包一次进共享 scratch，每块只重写窗口那一段；video 段之外（前 133/189 行与尾行）
+  直接用原始 K/V 走"矩形稠密 key"调用，不打包。
+- 默认 off；`--token-reduction`、VDN、几何不整除、`BLOCK_FRAMES > 总帧数` 时自动回退稠密。
+  `H3_SPARSE_ATTN=0:0` 这类非法值在 DiT 创建时就报错退出。
+- 走稀疏时强制放弃 head-major 的 int8 注意力输出消费（rect 输出是 row-major，布局不兼容），
+  所以 A/B 两边要么都 `--use-slower-bf16-attention-output`，要么承认消费路径也不同数值。
+
+## 2. 等价闸：keep=100% 时逐位相同
+
+576×320/1 s（12 帧 × 180 行，序列 2293），`H3_SPARSE_ATTN=12:0` ⇒ 每块看到全部 2293 行。
+layer 0 的注意力输出（`H3_DUMP_ACT`，512 行）对比稠密：
+
+| 行段 | max\|d\| | cos |
+|---|---|---|
+| video 行 | 0.0000 | 1.000000（逐位相同） |
+| 条件行 | 0.0156 | 1.000000（稠密自身读回抖动 0.0076%） |
+
+⇒ 打包、偏移、写回、块序全对。后面所有差异都只能归因于 keep，不是接线 bug。
+
+## 3. 隔离算子增量（同 seed、输入逐位相同）
+
+`qkv.00.bin`（注意力输入）在稠密/稀疏两边 max|d|=0.0000 ⇒ 这一层的差异纯粹是"少看了 key"。
+layer 0 video 行的 cos：
+
+| keep | 13.7% | 29.4% | 45.1% | 100% |
+|---|---|---|---|---|
+| layer0 video cos | 0.729 | 0.842 | 0.892 | 1.000 |
+
+13.7% 那档逐层往下：layer0 0.729 → layer34 0.453，连条件行都从 1.000 漂到 0.76~0.80
+（隐状态已经被改掉，不再是"只有注意力变"）。
+
+## 4. 端到端 A/B（864×480/2 s，50 层，2 步，reuse 1，ssd-streaming，resident 6）
+
+| 配置 | keep | Euler denoise | Δ | 最终 latent cos | detail | sat | sharp |
+|---|---|---|---|---|---|---|---|
+| dense | 100% | 209.7 s | — | 1.000 | 6.30 | 41.74 | 8.77 |
+| `1:0` | 8.4% | 164.6 s | **−21.5%** | 0.639 | 9.23 | 78.71 | 13.96 |
+| `1:1` | 19.8% | 172.2 s | −17.9% | 0.748 | 4.09 | 62.76 | 5.87 |
+| `1:2` | 31.3% | 176.6 s | −15.8% | 0.801 | 3.94 | 53.18 | 5.43 |
+| `1:3` | 42.7% | 178.9 s | −14.7% | 0.851 | 3.99 | 50.29 | 5.46 |
+
+图（帧 0/8/16 肉眼）：`1:0` 主体散架成条纹噪渣；`1:1` 鬼影、脸没了；`1:2`/`1:3` 构图与主体在，
+但毛皮糊掉、饱和度整体偏高（dense 帧 8 是清晰的脸，`1:2` 同帧是糊的）。
+detail/sat/sharp 是 17 帧 PPM 上的梯度、饱和度、拉普拉斯均值；2 步下"换了个样本"也会动这些数，
+所以它们只能和图一起读，不能单独当结论。
+
+## 5. 结论
+
+- 省的时长基本线性 ≈ 23%×(1−keep)，和 F28 的天花板一致；CPU 编码 3.0~3.2 s（1800 次调用），
+  F30 的"多段 gather 编码不要钱"在产品路径上成立。
+- 但质量的可用点在 keep ≳ 43%，那里只剩 −14.7%；而 −45.9% 用 `--reuse 2`（20 步实测）不碰注意力就能拿到。
+  **固定 keep（时间窗）这条路在能赚钱的区间被质量卡死 ⇒ 关掉，不再投。**
+- 唯一还站得住的变体不是"看近的几个块"，而是"看对的块"（top-k / 离线标注的逐层 keep 表）。
+  判据这轮量化了：要在 keep ≤ 30% 把 detail/sat 拉回 dense 水平、layer0 video cos 从 0.80 提到 ~0.95+。
+  时间窗做不到这件事，说明远块里带着近块补不回来的信息（全局构图/颜色），这正是 top-k 的假设前提。
+- 接线本身留着（默认 off）：等价闸证明它对，将来做 top-k 直接换"选哪些 key"即可，不必再动通路。
+
+## 6. 复现
+
+```sh
+export H3_DIT_RESIDENT_BLOCKS=6
+export H3_CLIPPROJ_DIR=/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot
+export H3_CLIPPROJ_PROJ=/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3
+H3_SPARSE_ATTN=1:3 caffeinate -is ./h3 -d ~/h3_sys/MiniMax-H3-Convrot -p "A red fox" \
+  --width 864 --height 480 --seconds 2 --steps 2 --reuse 1 --ssd-streaming --profile \
+  --latent-out /tmp/x.bin --frames-dir /tmp/x -o /tmp/x.mp4
+# 隔离算子增量（输入位同 ⇒ 差异纯来自算子）：
+H3_DUMP_ACT=/tmp/dump H3_DUMP_ACT_ROWS=512 H3_DUMP_ACT_LIMIT=1 ... --use-slower-bf16-attention-output
+# 比 qkv.00.bin（输入）与 out.00.bin（输出），bf16 用 (u16<<16).view(f32) 解析
+```
+
+本轮 wall 数在负载 7~16 的窗口里测，只用于同窗口内相对比较；latent 与图像指标不受负载影响。
+
+---
+
+# F32 reuse 的收益只取决于"评估几次"，形状上均匀优于堆尾（2026-09-21）
+
+## 0. 先纠 F31 的一处归因
+
+F31/续 18/README 里写的"`H3_REUSE_STEPS=2` 已 −45.9%"是错的：−45.9% 来自 CLI **`--reuse 2`**
+（20 步实测，见本文早先 §四）。`H3_REUSE_STEPS` 是"自定义哪几步真的评估"的步号列表
+（h3_dit.c:5042 `parse_reuse_steps`），且**只有 `--reuse ≥2` 时才生效**（`reuse_interval > 1` 才会去 parse），
+值必须递增且包含 0 与 steps-1，否则报错。它此前从未被测过，README 也没写。四处文字已就地改正。
+
+## 1. 设计：把"评估次数"和"调度形状"分开
+
+864×480/2 s、`--steps 6`、50 层、`--ssd-streaming`、`H3_DIT_RESIDENT_BLOCKS=6`、同种子。
+
+| 配置 | 调度 | 新鲜评估 | 形状 |
+|---|---|---|---|
+| `base6` | `--reuse 1` | 6/6 | 全新鲜（参照） |
+| `auto4` | `--reuse 2` ⇒ 0,2,4,5 | 4/6 | 均匀 |
+| `lated4` | `--reuse 2 H3_REUSE_STEPS=0,3,4,5` | 4/6 | 堆尾 |
+| `r3` | `--reuse 3` ⇒ 0,3,5 | 3/6 | 均匀 |
+
+`auto4` 与 `lated4` 是**等成本对照**：评估次数相同，只换哪几步新鲜。
+
+## 2. 结果
+
+| 配置 | Euler denoise | vs base | s/评估 | detail | sat | 拉普拉斯 | 帧间差 | latent cos |
+|---|---|---|---|---|---|---|---|---|
+| base6 | 685.2 s | — | 114.2 | 7.51 | 44.03 | 9.83 | 4.29 | 1.0000 |
+| auto4 | 480.7 s | −29.8% | 120.2 | 6.77 (−9.9%) | 43.66 (−0.8%) | 8.55 | 4.61 | 0.9158 |
+| lated4 | 542.0 s | −20.9% | 135.5 | 5.73 (−23.7%) | 41.21 (−6.4%) | 7.01 | 4.55 | 0.8884 |
+| r3 | 355.7 s | −48.1% | 118.6 | 5.99 (−20.3%) | 38.10 (−13.5%) | 7.39 | 4.87 | 0.8603 |
+
+`s/评估` 这一列兼作窗口自检：114.2 / 120.2 / **135.5** / 118.6 —— `lated4` 那一档整段慢约 12%，
+所以它的 −20.9% 不能和 `auto4` 的 −29.8% 比时长（F30 的教训在渲染上同样成立）。
+**形状结论不受影响**：两边评估次数相同、做的功相同，只有质量指标可比。
+
+## 3. 结论
+
+1. **收益 = 少做几次整网评估**，与实现无关：省下的比例 ≈ 1 − 评估数/步数。
+   6 步下 4 评估 −29.8%、3 评估 −48.1%；20 步下 `--reuse 2`（11 评估）−45.9% —— 同一条规律。
+2. **等成本下形状有代价**：均匀 0,2,4,5 比堆尾 0,3,4,5 的 detail 高 13.8 pt、sat 高 5.6 pt、
+   latent cos 0.916 vs 0.888。中间步的速度外推一旦过期，尾部补得再密也换不回结构。
+   ⇒ 默认就用自动间隔调度；`H3_REUSE_STEPS` 只在"明确知道某几步必须新鲜"时才手写，且**不要拿它把预算堆到尾部**。
+3. 目视（帧 8）：`auto4` 与 base 同锐度同曝光，只是头位相略偏；`r3` 主体仍完整，眼睛偏糊、胸前多几缕拉丝。
+   ⇒ 6 步这一档 `--reuse 2` 基本是免费午餐，`--reuse 3` 开始要付质量。
+4. 与 F31 并读：固定 keep 稀疏省 14.7% 时 detail 已经 −37%；`--reuse 2` 省 29.8% 时 detail 只 −9.9%。
+   **同样"少算"，用时间外推做比砍注意力做性价比高一个数量级** ⇒ 注意力线让位给 reuse。
+5. 未控变量，别外推：`detail`（梯度能量）对质量非单调 —— F31 的 2 步 dense detail 6.30 就高于本轮 r3 的 5.99，
+   而两者步数不同、σ 轨迹不同。跨步数比较需要另设对照，本轮不下结论。
+
+## 4. 默认建议
+
+- `--steps ≥ 4` 时保持 `--reuse 2` 为默认（README 已如此标注，本轮支持）。
+- `--steps 2..3` 下 `--reuse` 无步可跳，实测 +0.6% 噪声 ⇒ 别在低步数下指望它。
+- 要更快：`--steps 6 --reuse 3`（3 评估，−48.1%，眼睛略糊）优于继续砍注意力。
+- `H3_REUSE_STEPS` 保持"高级覆写"定位，不进预设表。
+
+## 5. 复现
+
+```sh
+export H3_DIT_RESIDENT_BLOCKS=6
+export H3_CLIPPROJ_DIR=/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct-int8-convrot
+export H3_CLIPPROJ_PROJ=/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3
+./h3 -d ~/h3_sys/MiniMax-H3-Convrot -p "A red fox" --width 864 --height 480 --seconds 2 \
+  --steps 6 --reuse 2 --ssd-streaming --profile --frames-dir /tmp/reuse/auto4 --latent-out /tmp/reuse/auto4.bin
+H3_REUSE_STEPS=0,3,4,5 ... --reuse 2          # 等成本换形状
+```
+日志与帧：`/tmp/reuse/{base6,auto4,lated4,r3}.{log,bin,mp4}` 及同名目录；分析脚本 `/tmp/reuse/analyze.py`。
+
+## 6. 补（同轮）：把 detail 拆成主体/背景，并目视 lated4 —— 形状结论成立，但量级要改口
+
+上一节只报了全图梯度能量。因为 `lated4` 那一档我其实没看过帧，且"均匀调度基本不伤主体"这句
+是从全图数字推的，需要验证：损伤落在主体还是背景？
+
+**做法**（零 GPU 开销，只用已有 `/tmp/reuse/*/frame-*.ppm`）：在 `base6` 上取固定主体掩膜
+—— 多帧平均 chroma > 60 **且** R−B > 20，占画面 20.0%；同一掩膜套到四档，水平/垂直梯度分别只在
+"两端都落在该区域"的相邻像素对上求均值（掩膜对齐到差分网格，避免边界串区）。
+全图那一列与 F32 §2 的 detail 完全吻合（7.514/6.768/5.734/5.986），所以差异只来自区域划分。
+
+| 配置 | 全图 detail | 主体梯度 | 背景梯度 |
+|---|---|---|---|
+| base6 | 7.514 | 14.847 | 5.723 |
+| auto4 | −9.9% | **−19.0%** | −4.2% |
+| lated4 | −23.7% | **−37.4%** | −15.0% |
+| r3 | −20.3% | **−43.6%** | −5.6% |
+
+三条结论：
+
+1. **损伤集中在主体**。`r3` 的背景几乎没变（−5.6%），主体掉了 43.6% —— 目视看到的"眼睛糊、
+   胸前拉丝"就是这一列。速度外推过期时，先塌的是运动中的主体细节，不是背景纹理。
+2. **全图 detail 会低估主体损失**（−20.3% 对应主体 −43.6%），因为它被大面积低梯度背景稀释。
+   ⇒ 后续 reuse/稀疏 A/B 必须至少报主体区域梯度，全图单指标不够判。
+3. **形状结论方向不变、量级改口**：均匀 0,2,4,5 相对堆尾 0,3,4,5，主体 19.0% vs 37.4%、
+   背景 4.2% vs 15.0%，两个区域都是均匀更优 ⇒ §3.2 的判据仍然成立。但"均匀 ≈ 免费"要收回：
+   均匀那一档主体也掉了 19.0%。
+
+目视（帧 8，`/tmp/reuse/{base6,auto4,lated4,r3}-0008.png`）：`lated4` 的红狐构图完整、曝光正确，
+但眼圈/口鼻明显比 `auto4`、`base6` 软，胸前毛偏泥 —— 与主体那一列一致。
+
+复现：`python3 /tmp/reuse/regions.py`（同时重算全图列，作为与 `analyze.py` 的一致性检查）。
+
+# F33（2026-09-21 23:54）：等预算下"少步全新鲜"优于"多步 + reuse 外推" —— 低步数档应砍 steps，不是砍 reuse
+
+## 0. 问题
+
+F32 比的是**同步数下换形状**（哪几步新鲜）。没比过的是另一根轴：**同样 4 次整网评估**，
+预算该买"更密的 σ 网格 + 外推"（`--steps 6 --reuse 2`）还是"更粗的网格但每步都真算"
+（`--steps 4 --reuse 1`）。这直接决定低步数预设推荐哪一个。
+
+## 1. 设计与附带对照
+
+864×480/2 s/50 层/`--ssd-streaming`/`H3_DIT_RESIDENT_BLOCKS=6`/默认种子，两档**同一时间窗串行**跑。
+`--steps 6 --reuse 2` 这一档是 **F32 `auto4` 的完全重复**（同配置同种子），顺带给出跨窗口对照。
+
+两侧做的功相同，由 profile 计数证明：`submissions=180 direct=628 linear=800 attention=200` 完全一致
+（外推那两步不跑网络，只跑 Euler 更新，可忽略）。
+
+## 2. 结果
+
+| 配置 | steps | 新鲜评估 | Euler denoise | s/评估 | 全图 detail | 主体梯度 | 背景梯度 | sat | latent cos | 帧间差 | 二阶差 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| base6（参照） | 6 | 6 | 685.2 s | 114.2 | 7.514 | 14.847 | 5.723 | 44.029 | 1.0000 | 4.287 | 6.292 |
+| `--steps 4 --reuse 1` | 4 | 4 | 479.2 s | 119.8 | 6.832 (−9.1%) | **13.032 (−12.2%)** | 5.318 (−7.1%) | 43.281 (−1.7%) | **0.9656** | 3.814 | 5.727 |
+| `--steps 6 --reuse 2`（本轮） | 6 | 4 | 419.9 s | 105.0 | 6.768 (−9.9%) | **12.027 (−19.0%)** | 5.483 (−4.2%) | 43.657 (−0.8%) | **0.9158** | 4.605 | 6.659 |
+| 同上（F32 auto4，另一窗口） | 6 | 4 | 480.7 s | 120.2 | 6.768 (−9.9%) | 12.027 (−19.0%) | 5.483 (−4.2%) | 43.657 (−0.8%) | 0.9158 | — | — |
+
+主体/背景口径与 F32 §6 完全一致（`base6` 上 chroma>60 且 R−B>20 的固定掩膜，占画面 20.0%）。
+
+## 3. 结论
+
+1. **等预算下少步全新鲜更好**：主体梯度 −12.2% vs −19.0%，latent cos 0.9656 vs 0.9158，
+   运动也更平滑（帧间差 3.814 vs 4.605，二阶差 5.727 vs 6.659 —— 外推档帧间跳得更多）。
+   唯一反向的是背景梯度（−7.1% vs −4.2%）：4 点网格让背景纹理略少，但幅度小。
+   ⇒ **整网速度外推的误差，比"少走一步 σ"的离散化误差更贵**。
+2. 与 F32 并读，低预算这条轴上排序清楚了：同样 4 次评估，`steps4 密集 −12.2%` <
+   `steps6 均匀外推 −19.0%` < `steps6 堆尾外推 −37.4%`；3 次评估的 `--reuse 3` 是 −43.6%。
+   ⇒ **20 步档 `--reuse 2` 仍然划算**（那里网格本来就密，外推只是省重复），
+   但**低步数档要砍 `--steps` 并保持 `--reuse 1`**，而不是留着 reuse 去换步数。
+3. 目视（帧 8，`/tmp/eqcost/{s4dense,s6reuse2}-0008.png`）：两档主体都完整、曝光正确；
+   `s4dense` 的口鼻须毛和胸前毛更利落，`s6reuse2` 偏"绘画感"、头位相与背景石头位置不同。与数字一致。
+
+## 4. 计时学（F30 规则的又一次确认，这次是免费对照）
+
+同一配置、同一种子在两个窗口：**质量指标逐位相同**（6.768/12.027/5.483/43.657/0.9158 完全一致），
+**时长差 12.6%**（480.7 s vs 419.9 s）。所以渲染质量指标可跨窗口比，wall 不行。
+同一窗口内还有**顺序效应**：先跑的 `s4dense` 119.8 s/评估，后跑的 `s6reuse2` 105.0 s/评估。
+可见的一部分来自流式路径预热（`cpu-unrotate` 44.8 s → 37.1 s，video VAE 110.1 s → 103.4 s）。
+⇒ 本轮**不解读**"479 vs 420 = 密集档更慢"，两侧算子计数相同，成本按构造相等；
+以后同窗串行要把待比较的两档**各跑两次换序**，或者干脆只报算子计数。
+
+## 5. 复现
+
+```sh
+# 见 /tmp/eqcost/matrix.sh（串行两档，caffeinate -is，同种子）
+python3 /tmp/eqcost/analyze.py    # 三列梯度 + sat + latent cos，参照 /tmp/reuse/base6
+python3 /tmp/eqcost/flicker.py    # 帧间差 / 二阶差
+```
+产物：`/tmp/eqcost/{s4dense,s6reuse2}.{log,bin,mp4}` 与同名帧目录、`*-0008.png`。
+
+# F34（2026-09-22 00:25）：F33 在第二个 shape 上复现且更强 —— 但 576×320/1 s 上 reuse 外推直接把主体压塌，且指标抓不到
+
+## 0. 问题
+
+F33 的"等预算下少步密集优于多步外推"只在 864×480/2 s + 一个提示词上成立，而它已经写进预设表。
+本轮补外部有效性：换 576×320/1 s（sequence 2293 = 133 上下文 + 12×180）重跑同一组对照。
+
+## 1. 设计与一处口径警告
+
+同窗串行三档：`d6`（`--steps 6 --reuse 1`，参照）、`s4dense`（`--steps 4 --reuse 1`）、
+`s6reuse2`（`--steps 6 --reuse 2`），同种子、`--ssd-streaming`、`H3_DIT_RESIDENT_BLOCKS=6`、50 层。
+
+**主体/背景拆分不能跨 shape 照搬**：F32 §6 的掩膜口径（chroma>60 且 R−B>20）在 864 上选出 20.0% 的狐身，
+在这次的 576 画面（草地 + 全身小狐）上选出 71.1%，而且"主体"梯度 9.587 **低于**"背景"18.210 ——
+掩膜抓到的是草叶。所以本轮主体/背景两列**只作参考**，判定用全图 detail、latent cos 和目视。
+
+## 2. 结果
+
+| 配置 | steps | 新鲜评估 | Euler denoise | s/评估 | 全图 detail | sat | latent cos | 帧间差 | 二阶差 |
+|---|---|---|---|---|---|---|---|---|---|
+| d6（参照） | 6 | 6 | 193.3 s | 32.2 | 12.214 | 64.246 | 1.0000 | 3.077 | 5.018 |
+| `--steps 4 --reuse 1` | 4 | 4 | 130.2 s | 32.5 | **12.133 (−0.7%)** | 60.849 (−5.3%) | **0.9682** | 2.992 | 5.016 |
+| `--steps 6 --reuse 2` | 6 | 4 | 130.9 s | 32.7 | **10.907 (−10.7%)** | 63.127 (−1.7%) | **0.9171** | 2.531 | 4.278 |
+
+目视（帧 0/6/10/16 拼贴 `/tmp/eq576/{s4dense,s6reuse2}-tile.png`）：
+`s4dense` 四帧都是完整锐利的红狐（与 `d6` 同级）；**`s6reuse2` 每一帧都是压塌的双头狐身**，
+不是单帧抖动也不是构图偏移 —— 结构性崩坏。
+
+## 3. 结论
+
+1. **F33 复现，且幅度更大**：等 4 次评估下，4 步密集档的全图 detail 离 6 评估参照只差 −0.7%
+   （864 上是 −9.1%），外推档 −10.7%。⇒ "少走一步 σ 的离散化误差 < 整网外推误差"在两个 shape 上都成立。
+2. **`--reuse ≥2` 在低步数下是风险开关，不是免费午餐**。F32 说的"6 步下 `--reuse 2` 目视免费"
+   只在 864×480/2 s 成立；换 576×320/1 s 同配置直接崩主体。
+   低步数档的推荐因此收紧为 `--steps 4 --reuse 1`（两个 shape 都验过）。
+3. **指标抓不到崩塌（本轮最重要的方法论收获）**：崩掉的 `s6reuse2` latent cos 0.9171，
+   和 864 那次"质量可接受"的 0.9158 几乎一样；sat 只 −1.7%。
+   因为 cos/detail 量的是**与参照轨迹的偏离度**，分不出"不同但合理"与"结构错误"。
+   ⇒ 渲染质量判定**必须目视**，指标只能当筛选器；跨 shape 时尤其不能只报数字。
+4. **计时学补强**：这一窗三档 s/评估 32.2/32.5/32.7（1.5% 内），两个等成本档 wall 130.2 vs 130.9（差 0.5%）。
+   ⇒ 反过来印证 F33 里 864 那 14% 的差是窗口/顺序噪声，不是成本差；也说明"窗口是否稳定"可以用
+   s/评估 的极差当场判定（极差 >5% 就别报绝对时长）。
+5. 未定：`--reuse 2` 在 20 步档是否也在小 shape 上不安全，本轮没测 —— 而 20 步 + `--reuse 2` 正是 README 的默认档。
+
+## 4. 复现
+
+```sh
+# /tmp/eq576/matrix.sh（三档串行，caffeinate -is，同种子）
+python3 /tmp/eq576/analyze.py
+ffmpeg -y -i /tmp/eq576/s6reuse2.mp4 -vf "select='eq(n,0)+eq(n,6)+eq(n,10)+eq(n,16)',tile=2x2" -frames:v 1 /tmp/eq576/tile.png
+```
+产物：`/tmp/eq576/{d6,s4dense,s6reuse2}.{log,bin,mp4}` 与帧目录、`*-tile.png`。
+
+# F35（2026-09-22 07:10）：20 步 + `--reuse 2` 在 576×320/1 s 上安全 —— 省 46.6%、目视无差，默认档站住
+
+## 0. 问题
+
+F34 让 `--reuse 2` 在 6 步档（4 次评估）于小 shape 上崩了主体，而 README 的默认档是 20 步 + `--reuse 2`。
+那一档只在 864×480/2 s 与 512 方形上验过 ⇒ 必须在刚崩过的那个 shape 上复验，否则"默认"两个字没有依据。
+
+## 1. 结果
+
+576×320/1 s、50 层、同种子、同窗串行（`d20` 先跑）。
+
+| 配置 | steps | 新鲜评估 | Euler denoise | s/评估 | 全图 detail | sat | latent cos | 帧间差 | 二阶差 |
+|---|---|---|---|---|---|---|---|---|---|
+| `--steps 20 --reuse 1` | 20 | 20 | 644.0 s | 32.2 | 12.743 | 70.605 | 1.0000 | 1.921 | 3.277 |
+| `--steps 20 --reuse 2` | 20 | 11 | 343.6 s | 31.2 | 12.920 (+1.4%) | 68.502 (−3.0%) | **0.9767** | 2.667 | 4.295 |
+
+时长省 −46.6%，与 F32 §3.1 的规律吻合（1 − 11/20 = 45%）。
+窗口自检：s/评估 32.2 vs 31.2（极差 3%），可用。
+目视（帧 0/6/10/16 拼贴 `/tmp/eq20/{d20,r20x2}-tile.png`）：两档都是同一只站立的红狐、同一姿态，
+锐度与曝光同级，`r20x2` 只是毛色偏冷一点。**没有崩塌、没有鬼影。**
+
+## 2. 结论
+
+1. **`--reuse 2` 的危险不在"步数"，在"新鲜评估次数"**：4 次评估（6 步 + reuse 2）在小 shape 上塌主体；
+   11 次评估（20 步 + reuse 2）在同一个 shape 上目视无差。⇒ README 默认档（20 步 + `--reuse 2`）站住。
+2. **两个 shape 的边界说法统一了**：低预算要"少步 + `--reuse 1`"（F33/F34），
+   20 步这一档"多评估 + reuse"是划算的（F32/F35）。中间地带（8~16 步）没测，暂不外推。
+3. 顺带：`d20` 的帧间差 1.921 明显低于 `d6` 的 3.077（同 shape 同步数不同的另一条证据：
+   20 步轨迹更平滑），但 reuse 档的帧间差方向在 6 步/20 步两例里相反 ⇒ 再次确认帧间差不能当质量判据。
+4. latent cos 这次与目视同向（0.9767 = 安全；对照 F34 的 0.9171 = 崩塌）。
+   但**单点同向不构成可用阈值** —— 864 那次 0.9158 目视是可接受的。cos 只能当筛选器，判定仍要目视。
+
+## 3. 复现
+
+```sh
+# /tmp/eq20/matrix.sh（两档串行，caffeinate -is，同种子）
+python3 /tmp/eq20/analyze.py
+ffmpeg -y -i /tmp/eq20/r20x2.mp4 -vf "select='eq(n,0)+eq(n,6)+eq(n,10)+eq(n,16)',tile=2x2" -frames:v 1 /tmp/eq20/tile.png
+```
+产物：`/tmp/eq20/{d20,r20x2}.{log,bin,mp4}` 与帧目录、`*-tile.png`。
+
+# F36（2026-09-22 08:00）：中间档补测 —— 7 次新鲜评估下两种调度都合格，"密集优于外推"只在 4 次那一档成立
+
+## 0. 问题
+
+"新鲜评估次数"这条轴上只有两个端点：4 次（6 步 + reuse 2，小 shape 塌主体，F34）和 11 次
+（20 步 + reuse 2，目视无差，F35）。产品上最常用的是中间那一档，且 F33/F34 得出的
+"等成本下少步密集优于多步外推"只在 4 次评估处验过 —— 换一个新鲜次数复验，才知道那条结论是规律还是端点效应。
+
+576×320/1 s、50 层、同种子、串行同窗：`--steps 7 --reuse 1`（7 次评估）vs `--steps 12 --reuse 2`（7 次评估）。
+
+## 1. 等成本成立
+
+两档算子计数完全相同：`submissions=315 direct=1099 linear=1400 attention=350`。
+`s12x2` 日志有 `selected reuse schedule has 7 evaluations`。
+
+## 2. 结果
+
+| 配置 | steps | 新鲜评估 | Euler denoise | s/评估 | 全图 detail | sat | 帧间差 | latent cos（对 d20） |
+|---|---|---|---|---|---|---|---|---|
+| `--steps 20 --reuse 1`（参照） | 20 | 20 | 644.0 s | 32.2 | 12.743 | 70.605 | 1.921 | 1.0000 |
+| `--steps 7 --reuse 1` | 7 | 7 | 225.9 s | 32.3 | 12.506 (−1.9%) | 65.224 (−7.6%) | 3.141 | 0.9039 |
+| `--steps 12 --reuse 2` | 12 | 7 | 219.6 s | 31.4 | 12.852 (+0.9%) | 66.493 (−5.8%) | 2.692 | 0.8719 |
+
+窗口自检：三档 s/评估 32.2/32.3/31.4（极差 2.8%），可用。两个等成本档 wall 差 −2.8%，在窗口噪声内。
+相对 20 步全新鲜：7 次评估省 −65%（644 → 222 s）。
+
+**目视（帧 0/5/11/16 拼贴 `/tmp/mid/{d20,s7dense,s12x2}-tile.png`）：两档都是结构完整的狐狸**，
+单头、四腿、黑掌、毛皮锐利，无崩塌无鬼影。两档彼此也同场景同姿态（低头叼食），
+但都与 20 步参照（抬头站立）不同 —— 这是新鲜次数少带来的**内容漂移**，不是模糊化。
+
+## 3. 结论
+
+1. **崩塌阈值夹在 4 与 7 之间**：4 次评估 + 外推会塌主体，7 次评估 + 外推目视合格。
+   ⇒ README 原先"新鲜次数低于约 8 就把 `--reuse >= 2` 当风险开关"偏保守，据本轮改为"低于 7 未验、4 已证崩"。
+2. **"少步密集优于多步外推"不是普适规律，是 4 次评估那一档的端点效应**。7 次评估处两档互有胜负：
+   外推档 detail +0.9% vs 密集档 −1.9%、sat −5.8% vs −7.6%（外推略好），
+   只有 latent cos 密集档更高（0.9039 vs 0.8719）。而 cos 已被 F34 证明分不出"不同"与"错"
+   ⇒ 这一档两者都可用，按 F34 §3 的规矩以目视为准。
+3. **帧间差第三次翻方向**：本轮外推档 2.692 < 密集档 3.141，F33 里却是 4.605 > 3.814。
+   ⇒ 彻底废弃"帧间差当质量判据"；它只反映运动幅度，与调度好坏无单调关系。
+4. **内容漂移是低评估数的真实代价**：7 次评估的两档都换了一个姿态。
+   对"要复现某条片子"的用法，这一条比 detail/sat 的百分位更重要。
+
+## 4. 复现
+
+```sh
+# /tmp/mid/matrix.sh（两档串行，caffeinate -is，同种子）
+python3 /tmp/mid/analyze.py
+python3 /tmp/mid/tile.py
+```
+产物：`/tmp/mid/{s7dense,s12x2}.{log,bin,mp4}` 与帧目录、`*-tile.png`；
+参照 latent/帧复用 `/tmp/eq20/d20*`。
+
+# F37（2026-09-22 08:12）：5 与 6 次新鲜评估（外推档）都不崩 —— 但"危险变量是新鲜次数"这条被本轮削弱
+
+## 0. 问题
+
+F36 把崩塌阈值夹在"4 次崩、7 次安全"之间，中间 5~6 次没测；运行时闸的阈值要落在这个区间里，
+所以必须补。576×320/1 s、50 层、同种子、`caffeinate -is` 串行同窗：
+`--steps 8 --reuse 2`（日志 5 evaluations）与 `--steps 10 --reuse 2`（6 evaluations）。
+密集档不重复测：4 次（F34 `s4dense`）与 7 次（F36 `s7dense`）都已证安全，5/6 属内插。
+算子计数按评估数线性缩放（5 次 225/785/1000/250，6 次 270/942/1200/300），调度无异常。
+
+## 1. 完整阶梯（全部锚在 `d20`：20 步全新鲜，同 shape 同种子）
+
+| 配置 | steps | 新鲜评估 | Euler denoise | s/评估 | detail | sat | 帧间差 | lat cos | 目视 |
+|---|---|---|---|---|---|---|---|---|---|
+| `--steps 20 --reuse 1` | 20 | 20 | 644.0 | 32.2 | 12.743 | 70.605 | 1.921 | 1.0000 | 参照 |
+| `--steps 6 --reuse 2` | 6 | 4 | 130.9 | 32.7 | −14.4% | −10.6% | 2.531 | 0.8655 | **塌主体（双头）** |
+| `--steps 8 --reuse 2` | 8 | 5 | 161.4 | 32.3 | **+10.2%** | −6.7% | 3.482 | 0.8557 | 完整狐狸 |
+| `--steps 10 --reuse 2` | 10 | 6 | 193.9 | 32.3 | −0.4% | −3.8% | 3.358 | 0.8709 | 完整狐狸 |
+| `--steps 12 --reuse 2` | 12 | 7 | 219.6 | 31.4 | +0.9% | −5.8% | 2.692 | 0.8719 | 完整狐狸 |
+| `--steps 20 --reuse 2` | 20 | 11 | 343.6 | 31.2 | +1.4% | −3.0% | 2.667 | 0.9767 | 完整狐狸 |
+
+窗口自检：五档 s/评估 32.7/32.3/32.3/31.4/31.2，极差 4.8%（阈值 5% 内）。
+`--steps 6 --reuse 2` 一行的 detail/cos 与 F34 报的 −10.7%/0.9171 不同 —— 因为锚点从 6 步 dense 换成了 20 步，
+本轮表内所有比值同锚，可横向比。
+
+目视（帧 0/5/11/16 拼贴 `/tmp/boundary/{s8x2,s10x2}-tile.png`）：两档都是单头、四腿、黑掌、毛皮锐利的完整狐狸，
+姿态是低头嗅地/叼物，与 F36 的 7 次档同一类内容，与 20 步参照（抬头站立）不同。
+
+## 2. 结论
+
+1. **崩塌只发生在 4 次评估那一档，5 次就没了** ⇒ 危险区比 F36 猜的窄得多，不是"<7 都危险"。
+2. **但"危险变量是新鲜评估次数"这条不能照抄**：本轮三个变量完全同向共线 ——
+   步数 6→8→10→12→20 与新鲜次数 4→5→6→7→11 一起变，没有任何一档把它们拆开。
+   所以"是次数还是步数在决定崩塌"目前**未证**，F35 §2.1 的表述要降级为"至少与步数相关"。
+   可判别的实验（~3 min）：`--steps 8 --reuse 3`（调度 0,3,6,7 = 4 次评估、但网格比 6 步密）。
+   若它安全 ⇒ 决定量是**网格粗细/步数**；若它崩 ⇒ 决定量确实是新鲜次数。运行时闸的写法取决于这个答案。
+3. **cos 不只是"看不出崩塌"，在 4 次 vs 5 次这一对上是反着的**：崩掉的 0.8655 高于安全的 0.8557。
+   4~7 次这一整段 cos 几乎平的（0.856~0.872），11 次才跳到 0.977 ⇒ cos 只能区分"低预算 vs 高预算"，
+   在低预算段内部没有任何排序能力。判定必须目视（第四次确认）。
+4. **detail 再次证明不可用作单调指标**：5 次评估那档 detail +10.2%（比参照还"高"），
+   而它并不比 6/7 次档更好 —— 高出来的部分是草地/杂讯梯度，不是主体细节。
+5. 帧间差第四次翻方向（4 次档 2.531 反而低于 5/6 次档的 3.482/3.358）⇒ 该判据彻底废弃（F36 §3.3 再确认）。
+6. 收益侧：5 次评估比 20 次省 −74.9%，6 次省 −69.9%（同窗 s/评估一致，可信）。
+
+## 3. 复现
+
+```sh
+# /tmp/boundary/matrix.sh（两档串行，caffeinate -is，同种子）
+python3 /tmp/boundary/analyze.py   # 打印 4/5/6/7/11/20 全阶梯，锚 d20
+python3 /tmp/boundary/tile.py
+```
+产物：`/tmp/boundary/{s8x2,s10x2}.{log,bin,mp4}` 与帧目录、`*-tile.png`；
+其余档位复用 `/tmp/eq576/s6reuse2`、`/tmp/mid/s12x2`、`/tmp/eq20/{d20,r20x2}`。
+
+# F38（2026-09-22 08:42）：判别档 `--steps 8 --reuse 3` —— 4 次新鲜评估换网格仍崩 ⇒ 决定量是新鲜次数
+
+## 0. 设计
+
+F37 留下的问题：阶梯上步数与新鲜次数全程共线（6/4、8/5、10/6、12/7、20/11），
+"崩不崩由谁决定"未证。判别实验 = 固定网格 8 步、把新鲜次数压回 4：`--steps 8 --reuse 3`
+（调度 0,3,6,7，日志核对 `selected reuse schedule has 4 evaluations`）。
+576×320/1 s、50 层、同种子；与 `--steps 6 --reuse 2`（4 次、崩）和 `--steps 8 --reuse 2`（5 次、安全）直接对照。
+
+## 1. 结果
+
+| 配置 | steps | 新鲜评估 | Euler denoise | s/评估 | detail | sat | 帧间差 | lat cos | 目视 |
+|---|---|---|---|---|---|---|---|---|---|
+| `--steps 20 --reuse 1` | 20 | 20 | 644.0 | 32.2 | 12.743 | 70.605 | 1.921 | 1.0000 | 参照 |
+| `--steps 6 --reuse 2` | 6 | 4 | 130.9 | 32.7 | −14.4% | −10.6% | 2.531 | 0.8655 | 塌主体（双头） |
+| `--steps 8 --reuse 3` | 8 | 4 | 112.1 | 28.0 | **−18.7%** | **−17.2%** | 1.530 | **0.8181** | **面部畸形 + 全身条带状伪影** |
+| `--steps 8 --reuse 2` | 8 | 5 | 161.4 | 32.3 | +10.2% | −6.7% | 3.482 | 0.8557 | 完整狐狸 |
+| `--steps 10 --reuse 2` | 10 | 6 | 193.9 | 32.3 | −0.4% | −3.8% | 3.358 | 0.8709 | 完整狐狸 |
+| `--steps 12 --reuse 2` | 12 | 7 | 219.6 | 31.4 | +0.9% | −5.8% | 2.692 | 0.8719 | 完整狐狸 |
+| `--steps 20 --reuse 2` | 20 | 11 | 343.6 | 31.2 | +1.4% | −3.0% | 2.667 | 0.9767 | 完整狐狸 |
+
+目视（`/tmp/discrim/s8x3-tile.png`，帧 0/5/11/16）：趴着的躯体上覆盖深色的横向条带（编织感），
+脸部塌陷、两眼变成黑色块，四帧几乎同一姿势。这是**结构性失败**，不是"偏软"。
+计时注记：本档 s/评估 28.0，比同窗其它档（31~33）低 13% —— 单档墙钟不可跨窗比，
+本轮结论只依赖目视与比值型指标（质量指标是确定性的）。
+
+## 2. 结论
+
+1. **决定量是"新鲜评估次数"，不是步数/网格粗细**：同样 4 次评估，6 步网格崩（双头）、
+   8 步网格也崩（面部畸形 + 条带），且 8 步那档三项指标全部更差（cos 0.8181 为全阶梯最低、
+   sat −17.2%）。⇒ F37 §2.2 提出的共线疑问**当场关掉**，F35 §2.1 的原始表述恢复成立（这次是有判别实验的版本）。
+2. **边界收紧为"4 次崩、5 次起安全"**：5/6/7/11 四个新鲜次数点（含两种网格）目视全部合格。
+   ⇒ 运行时闸的判据可以定了：`reuse_interval >= 2` 且算出的新鲜次数 < 5 时降级为 `--reuse 1` 或直接报错。
+   该条件覆盖的实际组合：`--reuse 2` 的 steps 4..7（3~4 次）、`--reuse 3` 的 steps 6..10（3~4 次）。
+3. **指标这次与目视同向，但不能当阈值**：cos 0.8181（崩）< 0.8557（安全）是本轮唯一的正向案例，
+   而 F37 已经出现过 0.8655（崩）> 0.8557（安全）的反例 ⇒ 同向只是巧合级别，判定仍必须看帧。
+4. **帧间差第五次失效**：崩溃档给出全阶梯最低值 1.530（低于 20 步参照 1.921），
+   原因只是四帧几乎静止。⇒ 该指标已彻底废弃，本轮再次确认。
+
+## 3. 复现
+
+```sh
+# /tmp/discrim/matrix.sh（caffeinate -is，同种子）
+python3 /tmp/discrim/analyze.py   # 打印 4(6步)/4(8步)/5/6/7/11 全阶梯
+python3 /tmp/discrim/tile.py
+```
+产物：`/tmp/discrim/s8x3.{log,bin,mp4}` 与帧目录、`s8x3-tile.png`；
+其余档位复用 `/tmp/eq576/s6reuse2`、`/tmp/boundary/{s8x2,s10x2}`、`/tmp/mid/s12x2`、`/tmp/eq20/{d20,r20x2}`。

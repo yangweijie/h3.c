@@ -187,7 +187,7 @@ These controls are independent unless noted otherwise:
 | Control | Slow reference | Default | Aggressive | Main impact |
 |---|---:|---:|---:|---|
 | Denoising passes | `--steps 50` | `--steps 20` | `--steps 4..7` | The number always names actual denoising passes. |
-| Whole denoiser reuse | `--reuse 1` | `--reuse 2` | `--reuse 3` | At 20 steps: 20, 11, or 8 fresh DiT evaluations. |
+| Whole denoiser reuse | `--reuse 1` | `--reuse 2` | `--reuse 3` | At 20 steps: 20, 11, or 8 fresh DiT evaluations. At 2..3 steps there is nothing left to skip, so the saving is zero. Below 5 fresh passes the subject breaks (verified on both a 6-step and an 8-step grid at 576x320); from 5 up both schedules rendered sound. |
 | Active DiT blocks | `--layers 50` | `--layers 45` | `--layers 40` | Fewer blocks reduce compute and resident transformer weights. |
 | Core residual reuse | `--core-reuse 1` | `--core-reuse 4` | `--core-reuse 6` | Refreshes patch/head work every step but runs the expensive core less often. |
 | Token reduction | off | optional | `--token-reduction` | Pairs horizontal video tokens inside middle blocks; faster but may change composition. |
@@ -252,6 +252,63 @@ patch and output heads fresh at every transition:
 
 Use `--core-reuse 6` only as an aggressive preview. Values above 6 are not
 exposed because validation lost subject fidelity.
+
+At the low-budget end, buy speed with fewer denoising passes and keep
+`--reuse 1`. Two paths that run exactly the same number of fresh DiT evaluations
+were measured on 864x480 at 2 s (the profile counts prove equal work: 180
+submissions and 200 attention calls each): `--steps 4 --reuse 1` kept 87.8% of
+the reference subject-region gradient, while `--steps 6 --reuse 2` (4 fresh
+passes spread evenly, the other two extrapolated) kept 81.0%. Whole-velocity
+extrapolation costs more than one coarser grid step, so spend the budget on real
+passes there.
+
+The margin is shape-dependent and the failure is not graceful: at 576x320 / 1 s
+the same `--steps 6 --reuse 2` schedule collapsed the subject outright (a merged,
+two-headed fox in every sampled frame) while `--steps 4 --reuse 1` stayed within
+0.7% of its 6-pass reference detail. Eyeball the output when you go that low --
+the divergence-style metrics miss this (latent cosine 0.917 for the collapsed render
+versus 0.916 for an acceptable one at the same cost). The budget that matters is
+the number of passes that actually run the network: at 576x320 / 1 s
+`--steps 20 --reuse 2` (11 fresh passes) was -46.6% against 20 all-fresh passes
+with no visible loss -- same pose, same sharpness, latent cosine 0.977. So
+`--reuse 2` stays the default partner for `--steps 20`.
+
+Below five fresh passes the denoiser no longer extrapolates: `h3_generate` raises
+reuse to all-fresh and prints why, so `--steps 6 --reuse 2` runs the six passes it
+was asked for. `H3_REUSE_STEPS` suppresses the check because it selects its own
+mask.
+
+The dense-over-extrapolating preference is specific to the coarse end. At 7 fresh
+evaluations on the same 576x320 / 1 s shape (`--steps 7 --reuse 1` against
+`--steps 12 --reuse 2`, identical operator counts) both foxes were structurally
+sound and the two schedules split the measurements within noise: +0.9% full-frame
+gradient for the extrapolating one against -1.9% for the dense one, -5.8% versus
+-7.6% saturation, and only latent cosine favouring dense (0.904 against 0.872).
+Widening the ladder, `--steps 8 --reuse 2` (5 fresh evaluations) and
+`--steps 10 --reuse 2` (6) also rendered complete foxes. Holding the grid at 8 steps
+while dropping back to 4 fresh evaluations (`--steps 8 --reuse 3`) broke the render
+again -- malformed face, dark banded texture across the body -- so the variable that
+governs the failure is the number of passes that run the network, not the step
+count: 4 fresh evaluations fail on both grids, 5 and up render sound. What a small
+budget does cost above that boundary is content rather than sharpness: at 5 through 7
+fresh passes every schedule put the fox in a different pose from the 20-pass
+reference -- a different but valid clip, which matters more than any of these
+percentages if you need to reproduce a specific shot.
+
+```sh
+./h3 --profile \
+  -d ./MiniMax-H3 \
+  -p "A red fox walking through snow, realistic, tracking shot." \
+  --width 864 --height 480 --seconds 2 \
+  --steps 4 --layers 50 --reuse 1 \
+  -o outputs/fox-faster.mp4
+```
+
+For reference, what the reuse ladder costs at `--steps 6` with the same seed: 4
+fresh passes are -29.8% wall and give up 9.9% of full-frame gradient detail, 3
+passes -48.1% and 20.3%. The loss lands on the moving subject first (subject
+gradient -19.0% and -43.6%, background only -4.2% and -5.6%): softer eyes, a few
+stringy hairs. `--reuse` has no step left to skip at `--steps 2..3`.
 
 ### 5. Pick resolution and duration
 
@@ -542,7 +599,69 @@ The default sampler uses the released shifted video/audio schedule. `--steps`
 always names the number of denoising passes, with terminal zero added after the
 last pass. Whole-denoiser reuse evaluates the first and last pass plus every
 requested interval, then extrapolates skipped video and audio velocities on
-their independent schedules. With very small step counts, keep `--reuse 1`.
+their independent schedules. At `--steps 2..3` there is no step left to skip, so
+keep `--reuse 1` there and save time by lowering `--steps` instead.
+
+Measured on 864x480, 2 s, 50 blocks, same seed (`--steps 6`): 6 fresh passes
+685.2 s, 4 passes 480.7 s (-29.8%), 3 passes 355.7 s (-48.1%). The saving is
+just the pass count, so time saved ~= 1 - fresh passes / steps, and the same law
+reproduces the -45.9% that `--reuse 2` gives at 20 steps (11 fresh passes).
+Quality follows the *shape* of the schedule at equal cost: with four fresh
+passes, spreading them (0,2,4,5) gave up 9.9% of the reference gradient detail,
+while clustering them at the end (0,3,4,5) gave up 23.7% -- a stale mid-run
+velocity extrapolation cannot be bought back by a dense tail. Splitting the same
+frames into subject and background shows the damage is mostly on the subject:
+the spread schedule lost 19.0% subject gradient and 4.2% background, the
+tail-heavy one 37.4% and 15.0%, and the 3-pass schedule 43.6% and 5.6%. Full
+frame detail understates this because it is diluted by low-gradient background.
+Visually `--reuse 2` at 6 passes looked close to the
+all-fresh reference in sharpness and exposure at that shape, while `--reuse 3`
+started to pay (soft eyes, a few stringy chest hairs). Smaller shapes are not
+kinder -- see the 576x320 result below.
+
+Equal *cost* means equal fresh passes, not equal `--steps`. `--steps 4 --reuse 1`
+and `--steps 6 --reuse 2` both run the network four times (the profile shows
+identical operator counts), and at 864x480 the all-fresh four-pass grid kept 87.8%
+of the reference subject gradient against 81.0% for the extrapolating one. Whole-
+velocity extrapolation is therefore dearer than one coarser grid step at that
+budget: with only 4 fresh passes, lower `--steps` and leave `--reuse 1`.
+
+That preference got stronger, not weaker, at 576x320 / 1 s: there the 4-pass dense
+grid gave up 0.7% of full-frame detail against its own 6-pass reference, while
+`--steps 6 --reuse 2` gave up 10.7% and collapsed the subject into a merged
+two-headed fox in every sampled frame. The divergence metrics did not flag the
+collapse (latent cosine 0.917, versus 0.916 for the acceptable 864 render at the
+same cost), so a quality call needs an eyeball on the frames; and the inter-frame
+difference moved the opposite way in the two shapes, so that number is not a law
+either. Passes that run the network are what sets the cost: at that same 576x320
+shape, `--steps 20 --reuse 2` (11 fresh passes) lost nothing visible against 20
+all-fresh passes and saved -46.6%, which is why `--reuse 2` remains the default
+partner for `--steps 20`.
+
+The middle of that range is now measured too. `--steps 7 --reuse 1` and
+`--steps 12 --reuse 2` both run the network 7 times at 576x320 / 1 s, and neither
+schedule won outright: both frames were structurally sound foxes, the extrapolating
+one measured +0.9% full-frame gradient against the dense one's -1.9%, and cosine
+(0.904 dense, 0.872 extrapolating) was the only metric preferring dense. Going down
+that ladder, `--steps 8 --reuse 2` (5 fresh passes, -74.9% against 20 all-fresh) and
+`--steps 10 --reuse 2` (6, -69.9%) also rendered complete foxes. Since step count and
+fresh-pass count move together across all of those, one run holds the grid still and
+moves only the budget: `--steps 8 --reuse 3` keeps 8 steps with 4 fresh passes, and it
+broke the same way -- malformed face, dark banded texture across the body, worst
+cosine (0.818) and saturation (-17.2%) of the whole ladder. So the governing variable
+is the number of passes that run the network: 4 fails on either grid, 5 through 11
+renders sound. Two caveats stay in force: cosine has no reliable ordering inside the
+low-budget band (the earlier collapsed 4-pass render scored 0.866, above the sound
+5-pass render at 0.856), and full-frame gradient is not monotone either (the sound
+5-pass render measured +10.2%, higher than the reference). What a small budget
+reliably does cost above the boundary is content: at 5 through 7 fresh passes every
+schedule showed the fox in a different pose from the 20-pass reference.
+
+`H3_REUSE_STEPS=0,3,5` overrides which passes stay fresh instead of the interval
+schedule. It requires `--reuse >= 2` to be active, takes an increasing comma list
+that must include step 0 and the last step, and errors out otherwise. Treat it as
+an expert override: the automatic interval schedule is the better shape at equal
+cost, so no preset uses it.
 
 For the low-budget path, the released linear base grid won against
 actual-video-sigma linear spacing,
