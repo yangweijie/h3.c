@@ -2095,3 +2095,33 @@ evaluations, which breaks the subject; running all N passes instead`，并把 `e
 编译：`make h3` 干净，`h3.c`/`main.c` 无新增告警（`main.c:20` 那条 usage 字符串超长的
 `-Woverlength-strings` 是既有问题，与本轮无关）。
 文档：README §4 补了闸的行为与 `H3_REUSE_STEPS` 例外。产物 `/tmp/guard/`。
+
+## 续 28（2026-09-22 13:05）：未提交改动按主题拆成 5 个提交
+
+用户拍板"按你的方案拆开提交"。`git status` 实际比上次的记录更多：除十余项 modified，还有 21 项
+untracked（`h3_ane_*`、`h3_convrot.*`、7 个 ANE gate、2 个 bench、`test_int8_raw.c`、2 个 dbg 脚本、
+`ANE_PORT_SUMMARY.md`）。先扫过一遍密钥（`api[_-]?key|typesafe|sk-|bearer`）—— 无命中。
+
+拆分结果（`d52faa1` 之后，未 push）：
+
+| 提交 | 主题 | 文件 |
+|---|---|---|
+| `0b9c038` | 矩形 SDPA + 时序块稀疏原型 + 逐算子剖析与基准 | `h3_dit.c`、`tests/{test_flash_attn,bench_attention,bench_mlp_fusion}.c`、`h3_gpu.{h,m}` 的矩形部分、README 稀疏/剖析两节 |
+| `b6bb4a0` | ANE 移植（默认关闭） | `h3_ane_{bridge,linear,block}.*`、`h3_convrot.*`、`h3_weights.{c,h}`、`h3_video_vae.c`、`h3_shaders.metal`、`h3_gpu.{h,m}` 的 ANE 暂存部分、ANE/convrot/int8 测试、`dbg_*.py`、`ANE_PORT_SUMMARY.md`、Makefile 的库源文件+`-framework IOSurface` |
+| `133cdc5` | 构建接线 | Makefile 余下 7 个 hunk（测试目标、`DIT_MODEL`、`make test` 列表、`clean`、`ACCELERATE_NEW_LAPACK`） |
+| `2aafd31` | reuse 低预算运行时闸 | `h3.c` +16 / `main.c` −6 |
+| `27081aa` | F36~F38 测量归档与低预算文档改写 | `README.md`（reuse 三处）、`findings.md`、`progress.md`、`task_plan.md` |
+
+**混合文件按 hunk 拆**：`h3_gpu.h`（矩形声明 vs ANE 声明）、`h3_gpu.m`（H3SDPA keyShape + SDPA 矩形化 vs
+dispatch 名单 + ANE 暂存实现）、`Makefile`（库接线 vs 测试目标）、`README.md`（稀疏/剖析文档 vs reuse 文档）。
+工具是临时写的 `/tmp/split/hunk.py`（列 hunk / 按序号拼出可选子集，喂 `git apply --cached`）；注意部分暂存后
+`git diff` 变成"相对 index"，hunk 序号会重排，第二个提交那批一开始按旧序号选导致空补丁。
+`h3_dit.c`、`h3_weights.*`、`h3_video_vae.c` 无交叉，整文件走。
+
+**校验**：① 每个中间提交用 `git archive` 解到临时目录，对 `h3_gpu.m`/`h3_dit.c`/`h3_video_vae.c`
+`-fsyntax-only`（A、B 两档均通过），并对暂存后的 `h3_dit.c`/`h3_video_vae.c` 做符号对照（调用的
+`h3_*` 全部能在同提交可见的声明里找到）—— 保证拆分不是"看起来分好了"；② C 档 `make -n test`
+能展开新目标；③ `git diff d52faa1..HEAD` = 37 files / 13470+ / 73−，与原工作区改动（tracked 16 files
+5218+/73− 加 21 个新文件）一致，工作区现已干净。
+ANE 有 4 个新文件在磁盘上是 755 位（`h3_ane_block.{h,m}`、`tests/test_ane_block.c`、
+`tests/test_ane_full_block.c`，拷贝带来的可执行位），已按原样入库，未顺手改权限。
