@@ -1421,6 +1421,22 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (eff.video_vae_streaming < 0) eff.video_vae_streaming = 0;
     params = &eff;
     if (!h3_valid_params(ctx, params)) return NULL;
+    /* Four fresh evaluations break the subject on both a 6-step and an 8-step
+     * grid; five is the lowest count measured to render sound. H3_REUSE_STEPS
+     * picks its own mask and is an expert override, so it stays untouched. */
+    const char *reuse_steps = getenv("H3_REUSE_STEPS");
+    if (params->denoise_reuse > 1 && (!reuse_steps || !*reuse_steps)) {
+        uint8_t fresh[H3_MAX_STEPS];
+        int evaluations = h3_dit_reuse_schedule(params->steps,
+            params->denoise_reuse, fresh, sizeof(fresh));
+        if (evaluations >= 0 && evaluations < 5) {
+            fprintf(stderr, "h3: reuse %d at %d denoising steps leaves only %d "
+                    "fresh model evaluations, which breaks the subject; running "
+                    "all %d passes instead\n", params->denoise_reuse,
+                    params->steps, evaluations, params->steps);
+            eff.denoise_reuse = 1;
+        }
+    }
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :

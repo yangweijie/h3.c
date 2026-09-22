@@ -594,12 +594,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "h3: --seconds and --frames are mutually exclusive\n");
         return 2;
     }
-    if (prompt && params.steps >= 2 && params.steps <= 7 &&
-        params.denoise_reuse > 1) {
-        fprintf(stderr,
-            "h3: warning: --reuse with only %d denoising steps leaves very "
-            "few fresh model evaluations\n", params.steps);
-    }
     params.references = references;
     params.reference_count = reference_count;
     if (cli.frames_dir && mkdir(cli.frames_dir, 0755) != 0 &&
