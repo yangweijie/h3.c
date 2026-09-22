@@ -1,5 +1,7 @@
 #include "h3_weights.h"
 
+#include "h3_convrot.h"
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -337,6 +339,197 @@ static h3_gpu_tensor *load_int8_dequantized(const h3_weight_store *store,
              h3_gpu_error(gpu));
     return result;
 }
+
+/* --- Raw comfy-quants int8_tensorwise projection --------------------------
+ * The ANE path needs the codes and the per-row scales untouched: the graph
+ * does its own `constexpr_affine_dequantize` from int8 plus an fp16 per-row
+ * scale, so dequantising on the host and requantising for the Neural Engine
+ * would only add a rounding step.  The ConvRot group size comes from the
+ * `{base}.comfy_quant` JSON sidecar rather than an environment default,
+ * because the same checkpoint mixes rotated and unrotated tensors. */
+
+/* "<base>.weight" -> "<base>.<suffix>", the sidecar naming of the exporter. */
+static int weight_sidecar_name(const char *name, const char *suffix,
+                               char *out, size_t out_size) {
+    static const char weight[] = ".weight";
+    size_t length = strlen(name);
+    if (length <= sizeof(weight) - 1 ||
+        strcmp(name + length - (sizeof(weight) - 1), weight) != 0) return 0;
+    size_t base = length - (sizeof(weight) - 1);
+    if (base + 1 + strlen(suffix) + 1 > out_size) return 0;
+    memcpy(out, name, base);
+    out[base] = '.';
+    strcpy(out + base + 1, suffix);
+    return 1;
+}
+
+/* 0 when the rows are stored unrotated, the group size when they are ConvRot
+ * rows, -1 on any contract violation. */
+static int comfy_quant_group_size(const h3_weight_store *store,
+                                 const char *weight_name,
+                                 char *error, size_t error_size) {
+    char name[256];
+    if (!weight_sidecar_name(weight_name, "comfy_quant", name, sizeof(name))) {
+        fail(error, error_size, "cannot derive comfy_quant name for %s",
+             weight_name);
+        return -1;
+    }
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    uint64_t bytes = tensor ? h3_st_tensor_elements(tensor) : 0;
+    if (!tensor || tensor->dtype != H3_DTYPE_U8 || !bytes || bytes > 512) {
+        fail(error, error_size, "int8 weight %s has no comfy_quant marker",
+             weight_name);
+        return -1;
+    }
+    char marker[513];
+    if (!pread_bytes(header->path, tensor->file_offset, marker, (size_t)bytes)) {
+        fail(error, error_size, "cannot read comfy_quant marker for %s",
+             weight_name);
+        return -1;
+    }
+    marker[bytes] = '\0';
+    if (!strstr(marker, "\"format\": \"int8_tensorwise\"")) {
+        fail(error, error_size, "weight %s uses an unsupported quant format: %s",
+             weight_name, marker);
+        return -1;
+    }
+    if (!strstr(marker, "\"convrot\": true")) return 0;
+    const char *field = strstr(marker, "\"convrot_groupsize\":");
+    int group_size = field ? atoi(field + strlen("\"convrot_groupsize\":")) : 0;
+    if (group_size <= 0 || !h3_convrot_hadamard(group_size)) {
+        fail(error, error_size, "weight %s has an unusable convrot group size",
+             weight_name);
+        return -1;
+    }
+    return group_size;
+}
+
+/* Per-output-row F32 scales, laid out [rows,1] or [rows]; caller frees. */
+static float *read_int8_scales(const h3_weight_store *store,
+                               const char *weight_name, uint64_t rows,
+                               char *error, size_t error_size) {
+    char name[512];
+    int written = snprintf(name, sizeof(name), "%s_scale", weight_name);
+    if (written < 0 || (size_t)written >= sizeof(name)) {
+        fail(error, error_size, "weight name is too long: %s", weight_name);
+        return NULL;
+    }
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || tensor->dtype != H3_DTYPE_F32 ||
+        h3_st_tensor_elements(tensor) != rows) {
+        fail(error, error_size, "int8 weight %s needs F32 weight_scale[%llu]",
+             weight_name, (unsigned long long)rows);
+        return NULL;
+    }
+    float *scales = malloc(sizeof(float) * (size_t)rows);
+    if (!scales) {
+        fail(error, error_size, "out of memory reading scales for %s",
+             weight_name);
+        return NULL;
+    }
+    if (!pread_bytes(header->path, tensor->file_offset, scales,
+                     sizeof(float) * (size_t)rows)) {
+        fail(error, error_size, "cannot read weight_scale for %s", weight_name);
+        free(scales);
+        return NULL;
+    }
+    return scales;
+}
+
+int h3_weight_load_int8_raw(const h3_weight_store *store, const char *name,
+                            uint64_t rows, uint64_t columns,
+                            int8_t **quantized, float **scales,
+                            int *convrot_group_size,
+                            char *error, size_t error_size) {
+    *quantized = NULL;
+    *scales = NULL;
+    *convrot_group_size = 0;
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || tensor->dtype != H3_DTYPE_I8 || tensor->ndim != 2 ||
+        tensor->shape[0] != rows || tensor->shape[1] != columns) {
+        fail(error, error_size, "int8 weight %s is not I8 [%llu][%llu]", name,
+             (unsigned long long)rows, (unsigned long long)columns);
+        return 0;
+    }
+    int group_size = comfy_quant_group_size(store, name, error, error_size);
+    if (group_size < 0) return 0;
+    if (group_size && columns % (uint64_t)group_size) {
+        fail(error, error_size, "weight %s columns are not a convrot multiple",
+             name);
+        return 0;
+    }
+    float *row_scales = read_int8_scales(store, name, rows, error, error_size);
+    if (!row_scales) return 0;
+    size_t bytes = (size_t)rows * columns;
+    int8_t *data = malloc(bytes);
+    if (!data || !pread_bytes(header->path, tensor->file_offset, data, bytes)) {
+        fail(error, error_size, "%s",
+             data ? "cannot read int8 payload" : "out of memory reading an int8 weight");
+        free(data);
+        free(row_scales);
+        return 0;
+    }
+    *quantized = data;
+    *scales = row_scales;
+    *convrot_group_size = group_size;
+    return 1;
+}
+
+int h3_weight_load_f16_raw(const h3_weight_store *store, const char *name,
+                           uint64_t output_dim, uint64_t input_dim,
+                           uint16_t **weights, char *error, size_t error_size) {
+    *weights = NULL;
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || tensor->ndim != 2 || tensor->shape[0] != output_dim ||
+        tensor->shape[1] != input_dim ||
+        (tensor->dtype != H3_DTYPE_F32 && tensor->dtype != H3_DTYPE_F16)) {
+        fail(error, error_size, "weight %s is not F32/F16 [%llu][%llu]", name,
+             (unsigned long long)output_dim, (unsigned long long)input_dim);
+        return 0;
+    }
+    size_t elements = (size_t)output_dim * input_dim;
+    uint16_t *halves = malloc(sizeof(uint16_t) * elements);
+    if (!halves) {
+        fail(error, error_size, "out of memory reading fp16 weight %s", name);
+        return 0;
+    }
+    if (tensor->dtype == H3_DTYPE_F16) {
+        /* Already the exact representation the graph wants: bit-for-bit copy. */
+        if (!pread_bytes(header->path, tensor->file_offset, halves,
+                         sizeof(uint16_t) * elements)) {
+            fail(error, error_size, "cannot read fp16 payload for %s", name);
+            free(halves);
+            return 0;
+        }
+        *weights = halves;
+        return 1;
+    }
+    float *source = malloc(sizeof(float) * elements);
+    if (!source) {
+        fail(error, error_size, "out of memory reading f32 weight %s", name);
+        free(halves);
+        return 0;
+    }
+    if (!pread_bytes(header->path, tensor->file_offset, source,
+                     sizeof(float) * elements)) {
+        fail(error, error_size, "cannot read f32 payload for %s", name);
+        free(source);
+        free(halves);
+        return 0;
+    }
+    for (size_t index = 0; index < elements; index++) {
+        __fp16 rounded = (__fp16)source[index];
+        memcpy(&halves[index], &rounded, sizeof(rounded));
+    }
+    free(source);
+    *weights = halves;
+    return 1;
+}
+
 /* FP16 -> F32/BF16 widening.  The video VAE shipped in the INT8-ConvRot bundle
  * is FP16 (4.85 GiB, exactly half the F32 original) rather than INT8, so it
  * needs a widen-on-load path instead of the dequantize path above. */

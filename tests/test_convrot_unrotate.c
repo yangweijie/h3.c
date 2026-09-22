@@ -1,4 +1,5 @@
 #include "h3_gpu.h"
+#include "h3_convrot.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -179,6 +180,40 @@ int main(void) {
         }
     printf("cpu-ref(int8) vs wtrue: max_abs=%.5f\n", ref_max);
     printf("cpu exact(wrot) unrotate vs wtrue: max_abs=%.5f\n", exact_max);
+
+    /* h3_convrot.c derives the same matrix as a Kronecker power of H4 while the
+     * engine's un-rotation runs a radix-4 butterfly over the identity.  Both
+     * feed weight recovery (the ANE graphs take the table, the streaming path
+     * takes the butterfly), so they must agree entry for entry: the entries are
+     * +-1/16, which bf16 stores exactly. */
+    const float *table = h3_convrot_hadamard(BLOCK);
+    if (!table) {
+        fprintf(stderr, "FAIL: no Hadamard table for %d\n", BLOCK);
+        return 1;
+    }
+    double table_max = 0.0;
+    for (int i = 0; i < BLOCK * BLOCK; i++) {
+        double d = fabs((double)table[i] - (double)bf16_to_f32(h[i]));
+        if (d > table_max) table_max = d;
+    }
+    printf("convrot table vs radix-4 butterfly: max_abs=%.3e\n", table_max);
+
+    /* The table-based derotation of the stored weight must reproduce the
+     * reference column products above. */
+    float *probe = malloc(sizeof(float) * ROWS * COLS);
+    double derotate_max = 0.0;
+    if (!probe || !h3_convrot_derotate_f32(
+            memcpy(probe, wrot, sizeof(float) * ROWS * COLS), ROWS, COLS,
+            BLOCK)) {
+        fprintf(stderr, "FAIL: table derotation rejected\n");
+        return 1;
+    }
+    for (int i = 0; i < ROWS * COLS; i++) {
+        double d = fabs((double)probe[i] - (double)exact[i]);
+        if (d > derotate_max) derotate_max = d;
+    }
+    free(probe);
+    printf("table derotate vs cpu exact: max_abs=%.3e\n", derotate_max);
     /* verify H@H == I */
     double hh = 0.0;
     for (int a = 0; a < BLOCK; a++)
@@ -256,7 +291,8 @@ int main(void) {
            cpu_max, cpu_vs_gpu);
 
     int ok = max_abs < 0.05 * (double)amax_global &&
-             cpu_max < 0.05 * (double)amax_global;
+             cpu_max < 0.05 * (double)amax_global &&
+             table_max < 1e-6 && derotate_max < 1e-3;
     h3_gpu_tensor_free(weight);
     h3_gpu_tensor_free(sc);
     h3_gpu_tensor_free(had);

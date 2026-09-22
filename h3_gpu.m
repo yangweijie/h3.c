@@ -534,6 +534,12 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
                 @"h3_linear_int8_grouped_local_nax_r128x128"];
 
         }
+        /* ANE staging moves activations in and out of the Neural Engine's
+         * planes regardless of which Metal matmul backend is selected. */
+        [names addObject:@"h3_ane_pack_bf16"];
+        [names addObject:@"h3_ane_unpack_bf16"];
+        [names addObject:@"h3_ane_pack_f32"];
+        [names addObject:@"h3_ane_unpack_f32"];
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
             id<MTLFunction> function = [gpu.library newFunctionWithName:name];
@@ -6004,5 +6010,124 @@ int h3_gpu_vdn_readout(h3_gpu *opaque, h3_gpu_tensor *out,
             [encoder setBytes:&tokens_per_frame
                        length:sizeof(tokens_per_frame) atIndex:7];
             [encoder setBytes:&head_dim length:sizeof(head_dim) atIndex:8];
+        });
+}
+
+/* --- Neural Engine staging ---------------------------------------------- */
+
+/* Adopt page-aligned external storage, such as an IOSurface plane shared with
+ * the Neural Engine, so Metal kernels read and write it in place.  The stats
+ * bookkeeping matches h3_gpu_tensor_new() so h3_gpu_tensor_free() balances it,
+ * even though these bytes cost Metal nothing to allocate. */
+h3_gpu_tensor *h3_gpu_tensor_wrap_f32(h3_gpu *opaque, void *base,
+                                      size_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !base || !elements) return NULL;
+    size_t bytes = elements * sizeof(float);
+    id<MTLBuffer> buffer = [gpu.device
+        newBufferWithBytesNoCopy:base length:bytes
+                         options:MTLResourceStorageModeShared
+                     deallocator:nil];
+    if (!buffer) {
+        h3_gpu_set_error(gpu, @"cannot wrap %zu shared bytes", bytes);
+        return NULL;
+    }
+    H3Tensor *tensor = [[H3Tensor alloc] init];
+    tensor.elements = elements;
+    tensor.bytes = bytes;
+    tensor.dtype = H3_GPU_F32;
+    tensor.buffer = buffer;
+    tensor.owner = gpu;
+    h3_gpu_stats stats = gpu.stats;
+    stats.allocated_bytes += bytes;
+    stats.live_bytes += bytes;
+    if (stats.live_bytes > stats.peak_live_bytes)
+        stats.peak_live_bytes = stats.live_bytes;
+    stats.tensor_allocations++;
+    gpu.stats = stats;
+    return (__bridge_retained h3_gpu_tensor *)tensor;
+}
+
+const void *h3_gpu_tensor_host_pointer(const h3_gpu_tensor *opaque) {
+    if (!opaque) return NULL;
+    return TENSOR(opaque).buffer.contents;
+}
+
+int h3_gpu_pack_ane_input_bf16(h3_gpu *opaque, h3_gpu_tensor *plane,
+                               const h3_gpu_tensor *input, uint32_t rows,
+                               uint32_t input_dim, uint32_t base,
+                               uint32_t chunk_dim, uint32_t plane_rows) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"ANE pack input") ||
+        !h3_gpu_require_elements(gpu, plane, (size_t)plane_rows * chunk_dim,
+                                 @"ANE pack plane")) return 0;
+    struct { uint32_t rows, input_dim, base, chunk_dim, plane_rows; } args = {
+        rows, input_dim, base, chunk_dim, plane_rows};
+    return h3_gpu_dispatch_2d(gpu, @"h3_ane_pack_bf16", plane_rows, chunk_dim,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_unpack_ane_output_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *plane, uint32_t rows,
+                                  uint32_t output_dim, uint32_t plane_rows) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, plane, (size_t)plane_rows * output_dim,
+                                 @"ANE unpack plane") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"ANE unpack output")) return 0;
+    struct { uint32_t rows, output_dim, plane_rows; } args = {
+        rows, output_dim, plane_rows};
+    return h3_gpu_dispatch_2d(gpu, @"h3_ane_unpack_bf16", rows, output_dim,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_pack_ane_input_f32(h3_gpu *opaque, h3_gpu_tensor *plane,
+                              const h3_gpu_tensor *input, uint32_t rows,
+                              uint32_t input_dim, uint32_t base,
+                              uint32_t chunk_dim, uint32_t plane_rows) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_f32(gpu, input, (size_t)rows * input_dim,
+                            @"ANE F32 pack input") ||
+        !h3_gpu_require_elements(gpu, plane, (size_t)plane_rows * chunk_dim,
+                                 @"ANE F32 pack plane")) return 0;
+    struct { uint32_t rows, input_dim, base, chunk_dim, plane_rows; } args = {
+        rows, input_dim, base, chunk_dim, plane_rows};
+    return h3_gpu_dispatch_2d(gpu, @"h3_ane_pack_f32", plane_rows, chunk_dim,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_unpack_ane_output_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *plane,
+                                 const h3_gpu_tensor *bias, uint32_t rows,
+                                 uint32_t output_dim, uint32_t plane_rows) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, plane, (size_t)plane_rows * output_dim,
+                                 @"ANE F32 unpack plane") ||
+        !h3_gpu_require_f32(gpu, output, (size_t)rows * output_dim,
+                            @"ANE F32 unpack output") ||
+        (bias && !h3_gpu_require_f32(gpu, bias, output_dim,
+                                     @"ANE F32 unpack bias"))) return 0;
+    struct { uint32_t rows, output_dim, plane_rows, with_bias; } args = {
+        rows, output_dim, plane_rows, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : plane;
+    return h3_gpu_dispatch_2d(gpu, @"h3_ane_unpack_f32", rows, output_dim,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(plane).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+            [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
         });
 }

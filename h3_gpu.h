@@ -935,4 +935,36 @@ int h3_gpu_flash_attn_minimal(h3_gpu *gpu, h3_gpu_tensor *output,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, int head_major);
 
+/* --- Neural Engine staging ----------------------------------------------
+ * An ANE graph reads and writes F32 planes that are laid out channel-major
+ * (`[1, channels, 1, rows]`), while every tensor in this engine is row-major
+ * BF16.  The pack kernel moves one K slice of an activation into a plane, the
+ * unpack kernel turns a plane back into row-major BF16.
+ *
+ * h3_gpu_tensor_wrap_f32 adopts page-aligned external storage (an IOSurface's
+ * base address) without copying, so the same memory is an IOSurface to the
+ * Neural Engine and an MTLBuffer to the Metal staging kernels.  The caller
+ * keeps the storage alive for the tensor's lifetime; freeing the tensor does
+ * not unmap it. */
+h3_gpu_tensor *h3_gpu_tensor_wrap_f32(h3_gpu *gpu, void *base, size_t elements);
+const void *h3_gpu_tensor_host_pointer(const h3_gpu_tensor *tensor);
+int h3_gpu_pack_ane_input_bf16(h3_gpu *gpu, h3_gpu_tensor *plane,
+                               const h3_gpu_tensor *input, uint32_t rows,
+                               uint32_t input_dim, uint32_t base,
+                               uint32_t chunk_dim, uint32_t plane_rows);
+int h3_gpu_unpack_ane_output_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *plane, uint32_t rows,
+                                  uint32_t output_dim, uint32_t plane_rows);
+/* F32 staging for the modules that keep their activations in F32 (the video
+ * VAE). The bias is folded into the unpack because the Neural Engine graph
+ * models only the reduction. */
+int h3_gpu_pack_ane_input_f32(h3_gpu *gpu, h3_gpu_tensor *plane,
+                              const h3_gpu_tensor *input, uint32_t rows,
+                              uint32_t input_dim, uint32_t base,
+                              uint32_t chunk_dim, uint32_t plane_rows);
+int h3_gpu_unpack_ane_output_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *plane,
+                                 const h3_gpu_tensor *bias, uint32_t rows,
+                                 uint32_t output_dim, uint32_t plane_rows);
+
 #endif

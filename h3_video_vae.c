@@ -1,5 +1,6 @@
 #include "h3_video_vae.h"
 
+#include "h3_ane_linear.h"
 #include "h3_host.h"
 #include "h3_weights.h"
 
@@ -53,6 +54,15 @@ typedef struct {
     h3_gpu_tensor *scale2;
 } vae_block;
 
+/* The four reductions a decoder block performs on the Neural Engine, in the
+ * order run_block reaches them. Everything else in a block (norms, RoPE,
+ * attention, SwiGLU, residuals) stays on Metal. */
+enum { ANE_QKV = 0, ANE_OUT, ANE_W1, ANE_W2, ANE_PROJECTIONS };
+
+typedef struct {
+    h3_ane_projection *projections[ANE_PROJECTIONS];
+} vae_ane_block;
+
 typedef struct {
     h3_gpu *gpu;
     h3_weight_store *weights;
@@ -92,6 +102,13 @@ typedef struct {
      * tile instead of being preloaded resident for the whole session. Trades
      * re-reads for a much smaller fixed memory footprint. */
     int streaming;
+    /* Neural Engine replacement for the block stack's four reductions. The
+     * graphs bake their weights and their row count, so they are built once per
+     * decode session and kept alive; `ane_rows` records the compiled row
+     * bucket. Blocks without graphs run the fp32 Metal reductions. */
+    vae_ane_block ane[LAYERS];
+    uint32_t ane_rows;
+    int ane_prepared;
 } vae_context;
 
 static size_t tensor_bytes(h3_gpu_tensor *t) {
@@ -163,8 +180,165 @@ static void free_block(vae_block *block) {
     free_tensor(&block->w2_b); free_tensor(&block->scale2);
 }
 
+/* --- Neural Engine reductions --------------------------------------------
+ * Opt in with H3_ANE_VAE=1. A graph bakes its weights and its row count, so the
+ * only workable policy for a 36-block stack that all shares one shape is to
+ * build the graphs once per decode session and keep every one of them resident:
+ * the Neural Engine holds ~126 live graphs per process and parking one does not
+ * free a slot, which caps the ANE share at 31 blocks (31 x 4 = 124). Below
+ * H3_ANE_VAE_MIN_ROWS the tile does not amortize a graph, and blocks past the cap
+ * have no handle left to spare, so both keep the fp32 Metal path. */
+static int environment_integer(const char *name, int fallback) {
+    const char *text = getenv(name);
+    if (!text || !*text) return fallback;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    return end && *end == '\0' ? (int)value : fallback;
+}
+
+static const uint32_t ANE_INPUT_DIM[ANE_PROJECTIONS] = {HIDDEN, INNER, HIDDEN,
+                                                        FFN};
+static const uint32_t ANE_OUTPUT_DIM[ANE_PROJECTIONS] = {INNER * 3, HIDDEN,
+                                                         FFN * 2, HIDDEN};
+static const char *const ANE_WEIGHT_SUFFIX[ANE_PROJECTIONS] = {
+    "attn.to_qkv.weight", "attn.to_out.weight", "ff.w1.weight", "ff.w2.weight"};
+static const char *const ANE_SHORT_NAME[ANE_PROJECTIONS] = {"qkv", "out", "w1",
+                                                            "w2"};
+
+static int ane_ready(const vae_context *vae, int index) {
+    if (!vae->ane_rows) return 0;
+    for (int projection = 0; projection < ANE_PROJECTIONS; projection++)
+        if (!vae->ane[index].projections[projection]) return 0;
+    return 1;
+}
+
+static void ane_release_block(vae_ane_block *block) {
+    for (int projection = 0; projection < ANE_PROJECTIONS; projection++) {
+        h3_ane_projection_free(block->projections[projection]);
+        block->projections[projection] = NULL;
+    }
+}
+
+static void ane_release(vae_context *vae) {
+    if (!vae->ane_rows) return;
+    if (getenv("H3_ANE_VAE_STATS")) {
+        /* Splits the ANE share of the decode into staging and evaluation, which
+         * is the difference between "the Neural Engine is slow" and "the engine
+         * has to wake up between the Metal ops". */
+        double pack = 0.0, eval = 0.0, unpack = 0.0, sync = 0.0;
+        uint64_t calls = 0;
+        for (int index = 0; index < LAYERS; index++)
+            for (int projection = 0; projection < ANE_PROJECTIONS; projection++) {
+                h3_ane_projection *graph = vae->ane[index].projections[projection];
+                double one_sync = 0.0, one_pack = 0.0, one_eval = 0.0;
+                double one_unpack = 0.0;
+                uint64_t one_calls = 0;
+                if (!graph) continue;
+                h3_ane_projection_stage_timings(graph, &one_sync, &one_pack,
+                                                &one_eval, &one_unpack,
+                                                &one_calls);
+                sync += one_sync;
+                pack += one_pack;
+                eval += one_eval;
+                unpack += one_unpack;
+                calls += one_calls;
+            }
+        fprintf(stderr, "h3: video VAE ANE stats: %llu calls, sync %.3f s, "
+                "pack %.3f s, eval %.3f s, unpack %.3f s\n",
+                (unsigned long long)calls, sync, pack, eval, unpack);
+    }
+    for (int index = 0; index < LAYERS; index++)
+        ane_release_block(&vae->ane[index]);
+    vae->ane_rows = 0;
+    /* The pooled planes only exist for the graphs above, so they go with them. */
+    h3_ane_planes_clear();
+}
+
+static int ane_prepare_block(vae_context *vae, int index, uint32_t rows,
+                             char *error, size_t error_size) {
+    char prefix[96], weight_name[160], label[48];
+    snprintf(prefix, sizeof(prefix), "decoder.transformer_blocks.%d.", index);
+    for (int projection = 0; projection < ANE_PROJECTIONS; projection++) {
+        snprintf(weight_name, sizeof(weight_name), "%s%s", prefix,
+                 ANE_WEIGHT_SUFFIX[projection]);
+        uint16_t *weights = NULL;
+        if (!h3_weight_load_f16_raw(vae->weights, weight_name,
+                                    ANE_OUTPUT_DIM[projection],
+                                    ANE_INPUT_DIM[projection], &weights,
+                                    error, error_size))
+            return 0;
+        snprintf(label, sizeof(label), "vae.b%d.%s", index,
+                 ANE_SHORT_NAME[projection]);
+        h3_ane_projection *graph = h3_ane_projection_create_f16(
+            vae->gpu, label, weights, ANE_INPUT_DIM[projection],
+            ANE_OUTPUT_DIM[projection], rows,
+            h3_ane_linear_default_chunk(ANE_INPUT_DIM[projection]),
+            error, error_size);
+        free(weights);
+        if (!graph) return 0;
+        if (!h3_ane_projection_set_activation_rows(graph, vae->sequence)) {
+            h3_ane_projection_free(graph);
+            fail(error, error_size, "%s does not fit a %u row graph", label,
+                 rows);
+            return 0;
+        }
+        vae->ane[index].projections[projection] = graph;
+    }
+    return 1;
+}
+
+static int ane_prepare(vae_context *vae, char *error, size_t error_size) {
+    if (vae->ane_prepared) return 1;
+    vae->ane_prepared = 1;
+    if (!environment_integer("H3_ANE_VAE", 0)) return 1;
+    if (!h3_ane_linear_available()) {
+        fprintf(stderr, "h3: H3_ANE_VAE is set but the Neural Engine is "
+                "unavailable; decoding on Metal\n");
+        return 1;
+    }
+    const int row_floor = environment_integer("H3_ANE_VAE_MIN_ROWS", 1024);
+    if ((int)vae->sequence < row_floor) {
+        fprintf(stderr, "h3: video VAE tiles are %u rows, below the %d row "
+                "ANE floor; decoding on Metal\n", vae->sequence, row_floor);
+        return 1;
+    }
+    int blocks = environment_integer("H3_ANE_VAE_MAX_BLOCKS", 31);
+    if (blocks > LAYERS) blocks = LAYERS;
+    if (blocks < 0) blocks = 0;
+    vae->ane_rows = h3_ane_rows_bucket(vae->sequence);
+    /* Every block has the same four shapes and only one projection of one block
+     * is live at a time, so same-shaped graphs borrow one plane set each. */
+    h3_ane_planes_share(1);
+    int prepared = 0;
+    for (int index = 0; index < blocks; index++) {
+        if (ane_prepare_block(vae, index, vae->ane_rows, error, error_size)) {
+            prepared++;
+            continue;
+        }
+        ane_release_block(&vae->ane[index]);
+        if (environment_integer("H3_ANE_VAE_STRICT", 0)) {
+            h3_ane_planes_share(0);
+            ane_release(vae);
+            return 0;
+        }
+        /* The blocks from here on still have to load their fp32 weights, and
+         * nothing has claimed a handle for them, so this degrades cleanly. */
+        fprintf(stderr, "h3: video VAE Neural Engine stopped at block %d of %d "
+                "(%s); the remaining blocks decode on fp32 Metal\n", index,
+                blocks, error);
+        error[0] = '\0';
+        break;
+    }
+    h3_ane_planes_share(0);
+    fprintf(stderr, "h3: video VAE decoder: %d of %d blocks on the Neural "
+            "Engine at %u rows\n", prepared, LAYERS, vae->ane_rows);
+    return 1;
+}
+
 static void cleanup(vae_context *vae) {
     if (!vae) return;
+    /* Before h3_gpu_free: the graphs hold Metal views of their planes. */
+    ane_release(vae);
     for (int index = 0; index < LAYERS; index++) free_block(&vae->blocks[index]);
     free_tensor(&vae->post_w); free_tensor(&vae->post_b);
     free_tensor(&vae->embed_w); free_tensor(&vae->embed_b);
@@ -198,15 +372,20 @@ static int load_block(vae_context *vae, int index, char *error,
     if (!block->field) return 0;                                                \
 } while (0)
     F1(norm1, "norm1.weight", HIDDEN);
-    F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN);
+    /* An ANE-served block bakes its four matrices into its graphs at prepare
+     * time, so uploading the fp32 copies would cost 256 MiB of device memory
+     * and a 1 GiB disk read for weights nothing on the Metal side touches. */
+    if (!ane_ready(vae, index)) {
+        F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN);
+        F2(out_w, "attn.to_out.weight", HIDDEN, INNER);
+        F2(w1, "ff.w1.weight", FFN * 2, HIDDEN);
+        F2(w2, "ff.w2.weight", HIDDEN, FFN);
+    }
     F1(qkv_b, "attn.to_qkv.bias", INNER * 3);
-    F2(out_w, "attn.to_out.weight", HIDDEN, INNER);
     F1(out_b, "attn.to_out.bias", HIDDEN);
     F1(scale1, "scale1", HIDDEN);
     F1(norm2, "norm2.weight", HIDDEN);
-    F2(w1, "ff.w1.weight", FFN * 2, HIDDEN);
     F1(w1_b, "ff.w1.bias", FFN * 2);
-    F2(w2, "ff.w2.weight", HIDDEN, FFN);
     F1(w2_b, "ff.w2.bias", HIDDEN);
     F1(scale2, "scale2", HIDDEN);
 #undef F1
@@ -446,33 +625,44 @@ static int run_block(vae_context *vae, int index, char *error,
                      size_t error_size) {
     vae_block *weight = &vae->blocks[index];
     uint32_t rows = vae->sequence;
+    const int ane = ane_ready(vae, index);
 #define OP(call, label) do {                                                    \
     if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
 } while (0)
+/* One reduction on either engine. The ANE variant already fills `error` when it
+ * fails, and its graphs add the channel bias during the unpack. */
+#define GEMM(graphs, output, input, matrix, bias, label, inner, outer) do {     \
+    if (ane) {                                                                  \
+        if (!h3_ane_projection_apply_f32(vae->ane[index].projections[graphs],   \
+                vae->gpu, output, input, bias, error, error_size)) return 0;    \
+    } else if (!gpu_op(vae, h3_gpu_linear_f32(vae->gpu, output, input, matrix,  \
+            bias, rows, inner, outer), error, error_size, label)) return 0;     \
+} while (0)
     OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm1,
         rows, HIDDEN, 1e-5f), "video VAE attention norm");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
-        weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
+    GEMM(ANE_QKV, vae->qkv, vae->norm, weight->qkv_w, weight->qkv_b,
+         "video VAE QKV", HIDDEN, INNER * 3);
     OP(h3_gpu_video_qkv_rope_f32(vae->gpu, vae->query, vae->key, vae->value,
         vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS, HEAD_DIM,
         ROPE_HALF, 1e-5f), "video VAE QK norm/RoPE");
     OP(h3_gpu_sdpa_f32(vae->gpu, vae->heads, vae->query, vae->key, vae->value,
         rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "video VAE attention");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->heads, weight->out_w,
-        weight->out_b, rows, INNER, HIDDEN), "video VAE attention output");
+    GEMM(ANE_OUT, vae->branch, vae->heads, weight->out_w, weight->out_b,
+         "video VAE attention output", INNER, HIDDEN);
     OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
         weight->scale1, rows, HIDDEN), "video VAE attention residual");
     OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm2,
         rows, HIDDEN, 1e-5f), "video VAE MLP norm");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->ff1, vae->norm, weight->w1,
-        weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
+    GEMM(ANE_W1, vae->ff1, vae->norm, weight->w1, weight->w1_b,
+         "video VAE MLP input", HIDDEN, FFN * 2);
     OP(h3_gpu_swiglu_f32(vae->gpu, vae->activated, vae->ff1, rows, FFN),
        "video VAE SwiGLU");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->activated, weight->w2,
-        weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
+    GEMM(ANE_W2, vae->branch, vae->activated, weight->w2, weight->w2_b,
+         "video VAE MLP output", FFN, HIDDEN);
     OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
         weight->scale2, rows, HIDDEN), "video VAE MLP residual");
+#undef GEMM
 #undef OP
     return 1;
 }
@@ -480,6 +670,9 @@ static int run_block(vae_context *vae, int index, char *error,
 static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
                        void *progress_opaque, char *error,
                        size_t error_size) {
+    /* This path builds the block stack per tile and never goes through
+     * load_resident_weights, so it prepares the graphs itself. */
+    if (!ane_prepare(vae, error, error_size)) return 0;
     float zeros[HIDDEN];
     memset(zeros, 0, sizeof(zeros));
     h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
@@ -541,6 +734,9 @@ static int load_resident_weights(vae_context *vae,
                                  h3_video_vae_progress progress,
                                  void *progress_opaque, char *error,
                                  size_t error_size) {
+    /* First, so a block that lands on the Neural Engine is known by the time
+     * its fp32 matrices would have been uploaded. */
+    if (!ane_prepare(vae, error, error_size)) return 0;
     if (!load_input_weights(vae, error, error_size)) return 0;
     if (!vae->streaming) {
         /* Resident mode: preload every transformer block once and keep it for

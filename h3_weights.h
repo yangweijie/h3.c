@@ -37,6 +37,25 @@ h3_gpu_tensor *h3_weight_load_i8(const h3_weight_store *store, h3_gpu *gpu,
                                  const char *name, int ndim, const uint64_t *shape,
                                  char *error, size_t error_size);
 
+/* Raw comfy-quants int8_tensorwise projection: the I8 codes and the F32
+ * per-output-row scales exactly as stored, for consumers that quantise inside
+ * their own kernel (the Neural Engine graphs).  The caller frees both buffers.
+ * `convrot_group_size` is 0 when the stored rows are unrotated, otherwise the
+ * Hadamard group size from the `{base}.comfy_quant` sidecar. */
+int h3_weight_load_int8_raw(const h3_weight_store *store, const char *name,
+                            uint64_t rows, uint64_t columns,
+                            int8_t **quantized, float **scales,
+                            int *convrot_group_size,
+                            char *error, size_t error_size);
+
+/* Raw row-major fp16 projection: [output_dim][input_dim] halves, rounded from
+ * an F32 tensor or taken verbatim from an F16 one.  The Neural Engine graphs
+ * bake their weights as fp16 constexprs, so they need this instead of the
+ * Metal upload path.  The caller frees the buffer. */
+int h3_weight_load_f16_raw(const h3_weight_store *store, const char *name,
+                           uint64_t output_dim, uint64_t input_dim,
+                           uint16_t **weights, char *error, size_t error_size);
+
 /* --- Packed group-quantized weights -------------------------------------
  * A second quantized representation, written by
  * fastvideo_qad/scripts/export_h3_int6_native.py, that stores the codes

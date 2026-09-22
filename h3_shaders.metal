@@ -6299,3 +6299,81 @@ kernel void h3_vdn_readout(device const bfloat *state [[buffer(0)]],
         h3_f32_to_bf16(out + out_base + v, normalized * g);
     }
 }
+
+/* --- Neural Engine staging ---------------------------------------------- */
+
+struct ane_pack_args {
+    uint rows;
+    uint input_dim;
+    uint base;
+    uint chunk_dim;
+    uint plane_rows;
+};
+
+/* Row-major BF16 activations to one channel-major F32 reduction plane. The
+ * Neural Engine reads [1, chunk_dim, 1, rows], so the token axis is innermost
+ * and the padded tail of the K axis is zero. */
+kernel void h3_ane_pack_bf16(device const ushort *input [[buffer(0)]],
+                             device float *plane [[buffer(1)]],
+                             constant ane_pack_args &args [[buffer(2)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint channel = gid.y;
+    if (row >= args.plane_rows || channel >= args.chunk_dim) return;
+    uint column = args.base + channel;
+    plane[channel * args.plane_rows + row] =
+        (row < args.rows && column < args.input_dim) ?
+        h3_bf16_to_f32(input[row * args.input_dim + column]) : 0.0f;
+}
+
+struct ane_unpack_args {
+    uint rows;
+    uint output_dim;
+    uint plane_rows;
+};
+
+kernel void h3_ane_unpack_bf16(device const float *plane [[buffer(0)]],
+                               device ushort *output [[buffer(1)]],
+                               constant ane_unpack_args &args [[buffer(2)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint channel = gid.y;
+    if (row >= args.rows || channel >= args.output_dim) return;
+    output[row * args.output_dim + channel] =
+        h3_f32_to_bf16(plane[channel * args.plane_rows + row]);
+}
+
+/* The video VAE keeps its hidden states in F32, so its staging is a pure
+ * transpose plus the channel bias the Neural Engine graph does not model. */
+kernel void h3_ane_pack_f32(device const float *input [[buffer(0)]],
+                            device float *plane [[buffer(1)]],
+                            constant ane_pack_args &args [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint channel = gid.y;
+    if (row >= args.plane_rows || channel >= args.chunk_dim) return;
+    uint column = args.base + channel;
+    plane[channel * args.plane_rows + row] =
+        (row < args.rows && column < args.input_dim) ?
+        input[row * args.input_dim + column] : 0.0f;
+}
+
+struct ane_unpack_f32_args {
+    uint rows;
+    uint output_dim;
+    uint plane_rows;
+    uint with_bias;
+};
+
+kernel void h3_ane_unpack_f32(device const float *plane [[buffer(0)]],
+                              device float *output [[buffer(1)]],
+                              constant ane_unpack_f32_args &args [[buffer(2)]],
+                              device const float *bias [[buffer(3)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint channel = gid.y;
+    if (row >= args.rows || channel >= args.output_dim) return;
+    float value = plane[channel * args.plane_rows + row];
+    output[row * args.output_dim + channel] =
+        args.with_bias ? value + bias[channel] : value;
+}

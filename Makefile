@@ -5,15 +5,17 @@ CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework Metal \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
-	-framework Accelerate
+	-framework IOSurface -framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
-LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
+LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_convrot.c \
+	h3_text_encoder.c \
 	h3_dit_schedule.c h3_dit.c h3_lora.c h3_memory_plan.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
-LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
+LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m h3_ane_bridge.m h3_ane_linear.m \
+	h3_ane_block.m
 
 # ClipProj golden fidelity check (in-engine B vs offline A_local harness)
 QWEN4B ?= /Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct
