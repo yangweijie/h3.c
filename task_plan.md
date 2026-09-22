@@ -2173,3 +2173,26 @@ README 两处 + 预设表已按此改写。
 3. 可选收尾：ANE 的 4 个新文件带 755 位入库（拷贝遗留），要改成 644 需单独确认；`~/h3_sys`、缓存目录按红线不动。
 4. 已关闭：固定 keep 时间窗稀疏（F31）；库自带 windowed kernel（F26）；ANE 线（用户决定）；
    reuse 阶梯与主因（F32~F38）；低预算运行时闸；本轮未提交改用的主题拆分。
+
+
+## 新增（2026-09-22 13:20）：注意力 top-k 线做完离线可行性闸，判死（F39 / progress 续 29）
+
+挂起的"top-k / 逐层 keep 表"按用户指示打开一次，全程不渲染（新增默认 off 的
+`H3_DUMP_ATTN_LAYERS` 抓 SDPA 的 Q/K/V，离线重放选择器）。结论见 F39：可打包的
+head 共享形式与固定时间窗打平（13.7% 档还更差），能达标的形式要么不可打包，
+要么按 1.8 ms/次的实测编码算净负。
+
+重排后的待办：
+1. 抓取件已按用户拍板"一起提交"入库（`H3_DUMP_ATTN_LAYERS` + `dump_bf16_capture` 抽取，默认 off）；
+   提交前复验：重抓的 `attn_{q,k,v}.00.bin` 与 F39 用的那份逐字节相同。
+   保留理由：F39 的判据换算全靠它，将来若真有 GPU 侧 per-head gather 可直接重价而不用重渲染。
+2. 注意力线**关闭**（两条独立死因：F31 固定 keep 不够省；F39 打包粒度装不下有用的稀疏性）。
+   重新打开的前提不是"更好的打分器"，而是"更细的打包单位"——即 GPU 侧 per-head/per-row gather
+   与每调用 ~1.8 ms 编码的解耦；在那之前不再排测量轮。
+3. 杂务：`/Volumes/data/tmp/topk`（本轮 dump，约 500 MB：15 个 attn_*.bin × 32.9 MB + 50 层
+   qkv/out/fc*）、`/tmp/topk/{study*.py,result*.txt,dump.sh}`（F39 复现小节引用）。
+   旧账仍在：`/tmp/reuse` `/tmp/eqcost` `/tmp/eq576` `/tmp/eq20` `/tmp/mid` `/tmp/boundary`
+   `/tmp/discrim` `/tmp/guard`，优先删 `/tmp/eqcost`。
+4. 可选收尾：ANE 的 4 个新文件 755 位入库（要改 644 需单独确认）；`~/h3_sys`、缓存目录按红线不动。
+5. 已关闭：固定 keep 时间窗稀疏（F31）与 top-k / 逐层 keep 表（F39）；库自带 windowed kernel（F26）；
+   ANE 线（用户决定）；reuse 阶梯与主因（F32~F38）；低预算运行时闸；未提交改动的主题拆分。

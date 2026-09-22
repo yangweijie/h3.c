@@ -2125,3 +2125,46 @@ dispatch 名单 + ANE 暂存实现）、`Makefile`（库接线 vs 测试目标�
 5218+/73− 加 21 个新文件）一致，工作区现已干净。
 ANE 有 4 个新文件在磁盘上是 755 位（`h3_ane_block.{h,m}`、`tests/test_ane_block.c`、
 `tests/test_ane_full_block.c`，拷贝带来的可执行位），已按原样入库，未顺手改权限。
+
+## 续 29（2026-09-22 13:20）：注意力 top-k 线开了一次离线闸，判死在打包粒度上（F39）
+
+用户"继续：挂起的注意力 top-k / 逐层 keep 表" ⇒ 把这条线从挂起里取出来，先做一次不渲染的可行性闸。
+
+**做了什么**
+1. `h3_dit.c` 加 `H3_DUMP_ATTN_LAYERS`（默认 off）：抓 norm/RoPE 之后、SDPA 真正消费的
+   Q/K/V 全量行（2293×7168 bf16，每层每字段一次），并把原 `dump_activation` 里的
+   "读回→写文件"抽成 `dump_bf16_capture` 供两处共用。`make h3` 干净（新增变量曾撞
+   `-Wshadow`，改名后无新 warning）。
+2. 渲染抓数：`/tmp/topk/dump.sh`（576×320/1 s、`--steps 2 --reuse 1`、层 0/12/25/38/49、
+   `H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT=1`）。第一次排队失败：`--steps 1` 被参数校验拒
+   （`[2, 1000]`）；改 `--steps 2` 后 exit 0，落 15 个 attn_*.bin × 32.9 MB。
+   另一会话在同一仓库同一二进制上渲染时**未抢占**，用 `/tmp/topk/waitrun.sh` 等空闲。
+3. 离线 harness 四个脚本（纯 numpy，不渲染）：`study.py` 逐行逐头三选择器 + 与引擎
+   `out.NN.bin` 位对拍（**5 层全 cos=1.0000**，先证明解码/布局/通路对）；
+   `study2.py` 可打包形式 oraclehs/poolhs/glob；`study3.py` 同 harness 重算固定窗 +
+   全体头顶并集；`study4.py` G 组（1/2/4/8/16/56）的 keep↔cos 曲线。
+   三个脚本先用合成数据（故意长程耦合）做过冒烟测，能区分形式好坏才敢上真实 dump。
+
+**结论（判死，且死因与 F31 不同）**
+- 可打包形式里 `poolhs ≈ oraclehs`（L0 的 13.7%/29.4% 两档三位小数相同）⇒ 打分器不是瓶颈，**跨头共享本身是瓶颈**，
+  逐层 keep 表/学习打分不用再投。
+- 与固定时间窗在等 keep 下：13.7% 档 top-k **差 0.014**、29.4% 档**好 0.006**（五层均值），
+  L38 全程落后 ⇒ 在能打包的粒度上"看对的块"对"看近的块"没有净收益。
+- 56 个头各取 top-2 的并集覆盖 **97.4%** 的 token ⇒ 头部偏好近乎不相交，有用的稀疏性长在 head/row 维。
+- 逃生口 G=16（16 份 scratch、16× 调用）到 cos 0.95 需 keep ~42%(L0)/48%(L38)，
+  按 F31 实测 ≈1.8 ms/次的编码，代价 +48 s 换收益 1.9~4.4% 时长 ⇒ **净负 4~7 倍**。
+- 判据换成可复用的形式：同 harness 到 0.95 所需 keep = 固定窗 ~64% / poolhs ~55% / G=16 ~42~48%。
+
+**顺手改的在案说法**：README 稀疏小节原文"留作将来 top-k 的载体"已被本轮否掉，就地改成 "F39 离线验过：可打包的选择形式与固定窗打平，稀疏性长在 head 维、打包装不下"。
+
+**提交前的返工与复验**（用户拍板"一起提交"之后）：解析块改成无空分支的嵌套写法，并补一行
+`h3: attention Q/K/V capture on for %u files...`（`all` 会写 150 个整序列文件，先报数量再落盘）。
+`make h3` 干净。两条行为探针（`/tmp/topk/probe.sh`，跑完删产物）：
+未设 `H3_DUMP_ACT` 时按预期打印 "needs H3_DUMP_ACT=<dir>; ignoring" 并忽略；
+`H3_DUMP_ATTN_LAYERS=0` 重抓的 `attn_{q,k,v}.00.bin` 与 F39 用的那份 dump **逐字节相同**
+⇒ 返工没有改动抓取语义，F39 的全部数字对提交后的代码依然成立。
+（探针第一版失败：`export` 不跨 Bash 调用保留，丢了 `H3_CLIPPROJ_DIR` 报
+`text_encoder: no safetensors files`；把环境变量写进脚本才通。）
+
+**提交**：用户拍板"一起提交"⇒ `h3_dit.c` 的 `H3_DUMP_ATTN_LAYERS`（默认 off）、README 稀疏小节、
+`findings.md`/`progress.md`/`task_plan.md` 同一个提交，未 push。

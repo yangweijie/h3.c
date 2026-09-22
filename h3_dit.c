@@ -186,6 +186,12 @@ struct h3_dit {
     unsigned dump_rows;
     unsigned dump_limit;
     unsigned dump_calls[H3_DIT_BLOCKS][STREAM_MATRICES];
+    /* H3_DUMP_ATTN_LAYERS additionally captures the post norm/RoPE Q, K and V of
+     * the listed blocks at full row count -- what SDPA actually consumes -- so a
+     * key-selection study can run offline on real activations.  One capture per
+     * layer and field per run.  These are rows x INNER per field rather than the
+     * calibration dump's rows x HIDDEN, which is why the layer list is explicit. */
+    uint8_t dump_attn[H3_DIT_BLOCKS][3];
     int vdn;
     h3_vdn_state *vdn_state;
     int keep_bf16_mlp;
@@ -3424,6 +3430,46 @@ static h3_dit *load_dit(const char *weight_directory,
                     dit->dump_rows, dit->dump_limit);
         }
     }
+    memset(dit->dump_attn, 0, sizeof(dit->dump_attn));
+    {
+        const char *value = getenv("H3_DUMP_ATTN_LAYERS");
+        unsigned captures = 0;
+        if (value && *value) {
+            if (!dit->dump_dir[0]) {
+                fprintf(stderr, "h3: H3_DUMP_ATTN_LAYERS needs H3_DUMP_ACT=<dir>; "
+                        "ignoring\n");
+            } else if (!strcmp(value, "all")) {
+                for (unsigned layer = 0; layer < H3_DIT_BLOCKS; layer++)
+                    for (int field = 0; field < 3; field++)
+                        dit->dump_attn[layer][field] = 1;
+            } else {
+                const char *list = value;
+                while (*list) {
+                    char *end = NULL;
+                    long layer = strtol(list, &end, 10);
+                    if (end == list || layer < 0 || layer >= H3_DIT_BLOCKS) {
+                        fprintf(stderr, "h3: H3_DUMP_ATTN_LAYERS wants a comma "
+                                "list of block indices or 'all'; ignoring\n");
+                        memset(dit->dump_attn, 0, sizeof(dit->dump_attn));
+                        break;
+                    }
+                    for (int field = 0; field < 3; field++)
+                        dit->dump_attn[(unsigned)layer][field] = 1;
+                    if (!*end) break;
+                    list = (*end == ',') ? end + 1 : end;
+                }
+            }
+            for (unsigned layer = 0; layer < H3_DIT_BLOCKS; layer++)
+                for (int field = 0; field < 3; field++)
+                    captures += dit->dump_attn[layer][field];
+            /* One file per capture holds every row of that field, so 'all' costs
+             * 150 x sequence x 14336 bytes -- worth stating before it fills the
+             * volume the weights already live on. */
+            if (captures)
+                fprintf(stderr, "h3: attention Q/K/V capture on for %u files, "
+                        "each one full sequence x 7168 bf16\n", captures);
+        }
+    }
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
@@ -3973,6 +4019,29 @@ static const char *dump_field_name(unsigned field) {
     }
 }
 
+static int dump_bf16_capture(h3_dit *dit, const char *name, unsigned layer,
+                             h3_gpu_tensor *tensor, uint32_t rows,
+                             uint32_t columns, int append) {
+    size_t elements = (size_t)rows * columns;
+    if (elements > SIZE_MAX / sizeof(uint16_t)) return 0;
+    uint16_t *host = malloc(elements * sizeof(uint16_t));
+    if (!host) return 0;
+    int written = 0;
+    if (h3_gpu_submit(dit->gpu) &&
+        h3_gpu_tensor_read_bf16_range(tensor, 0, host, elements)) {
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%s.%02u.bin", dit->dump_dir, name,
+                 layer);
+        FILE *handle = fopen(path, append ? "ab" : "wb");
+        if (handle) {
+            written = fwrite(host, sizeof(uint16_t), elements, handle) == elements;
+            fclose(handle);
+        }
+    }
+    free(host);
+    return written;
+}
+
 static void dump_activation(h3_dit *dit, unsigned layer, unsigned field,
                             h3_gpu_tensor *tensor, uint32_t rows,
                             uint32_t columns) {
@@ -3980,23 +4049,9 @@ static void dump_activation(h3_dit *dit, unsigned layer, unsigned field,
     if (layer >= H3_DIT_BLOCKS || field >= STREAM_MATRICES) return;
     if (dit->dump_calls[layer][field] >= dit->dump_limit) return;
     uint32_t take = rows < dit->dump_rows ? rows : dit->dump_rows;
-    size_t elements = (size_t)take * columns;
-    if (elements > SIZE_MAX / sizeof(uint16_t)) return;
-    uint16_t *host = malloc(elements * sizeof(uint16_t));
-    if (!host) return;
-    int written = 0;
-    if (h3_gpu_submit(dit->gpu) &&
-        h3_gpu_tensor_read_bf16_range(tensor, 0, host, elements)) {
-        char path[600];
-        snprintf(path, sizeof(path), "%s/%s.%02u.bin", dit->dump_dir,
-                 dump_field_name(field), layer);
-        FILE *handle = fopen(path, dit->dump_calls[layer][field] ? "ab" : "wb");
-        if (handle) {
-            written = fwrite(host, sizeof(uint16_t), elements, handle) == elements;
-            fclose(handle);
-        }
-    }
-    free(host);
+    int written = dump_bf16_capture(dit, dump_field_name(field), layer, tensor,
+                                    take, columns,
+                                    dit->dump_calls[layer][field] != 0);
     if (!h3_gpu_begin(dit->gpu)) {
         fprintf(stderr, "h3: cannot reopen the command chain after a calibration "
                         "dump; disabling H3_DUMP_ACT\n");
@@ -4004,6 +4059,24 @@ static void dump_activation(h3_dit *dit, unsigned layer, unsigned field,
         return;
     }
     if (written) dit->dump_calls[layer][field]++;
+}
+
+/* The attention-input capture keeps the same submit/read/reopen bracket but
+ * writes whole rows: a selection study needs every key row of the layer. */
+static void dump_attention_input(h3_dit *dit, unsigned layer, int field,
+                                 h3_gpu_tensor *tensor, uint32_t rows) {
+    static const char *const names[3] = {"attn_q", "attn_k", "attn_v"};
+    if (!dit->dump_dir[0] || !tensor || !rows) return;
+    if (layer >= H3_DIT_BLOCKS || !dit->dump_attn[layer][field]) return;
+    int written = dump_bf16_capture(dit, names[field], layer, tensor, rows,
+                                    INNER, 0);
+    if (!h3_gpu_begin(dit->gpu)) {
+        fprintf(stderr, "h3: cannot reopen the command chain after an attention "
+                        "dump; disabling H3_DUMP_ACT\n");
+        dit->dump_dir[0] = '\0';
+        return;
+    }
+    if (written) dit->dump_attn[layer][field] = 0;
 }
 
 /* H3_DIT_OP_PROFILE=1 gives every op of run_block its own command buffer.
@@ -4279,6 +4352,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
+    dump_attention_input(dit, index, 0, dit->query, rows);
+    dump_attention_input(dit, index, 1, dit->key, rows);
+    dump_attention_input(dit, index, 2, dit->value, rows);
     int int8_attention_output = dit->int8_attention_out && !vdn &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int sparse_active = sparse_attention_applicable(dit);

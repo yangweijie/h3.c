@@ -904,8 +904,16 @@ is bit-identical to the dense call. Time saved is close to linear in dropped pai
 42.7% `-14.7%` on Euler denoise. Quality, though, breaks before that pays off -- at
 19.8% keep the subject ghosts apart, and even at 42.7% keep the frames lose ~37% of the
 dense gradient energy while saturation sits 20% high. `-14.7%` is worse than what
-`--reuse 2` buys at 20 steps without touching attention, so this stays a prototype: keep it
-as the carrier for a future *selected*-key scheme (top-k), not as a shipping knob.
+`--reuse 2` buys at 20 steps without touching attention, so this stays a prototype.
+The obvious successor was also tested, and offline: replaying captured post-RoPE Q/K/V
+(576x320/1 s, 5 layers, offline-dense reference verified against the engine at
+cosine 1.0000) through key-selection schemes shows that *any* selection the packing can
+express -- one token set per temporal block, shared by all 56 heads -- is a wash against
+this fixed window (5-layer mean `-0.014` cosine at 13.7% keep, `+0.006` at 29.4%), and an
+oracle over the same form is within 0.036 of an affordable scorer. The useful sparsity is
+on the head axis, where it cannot be packed (56 heads' top-2 union covers 97.4% of the
+tokens), and buying granularity costs rect-SDPA calls at ~1.8 ms of CPU encode each. Keep
+this wiring as the bit-exact reference for sparse shapes, not as a shipping knob (F31, F39).
 
 ### Metal 4 and TensorOps paths
 
