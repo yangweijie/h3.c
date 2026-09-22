@@ -767,6 +767,27 @@ One correctness trap worth keeping: the resident blocks are filled through the
 bit-identical, and filling resident blocks through the ordinary loader silently
 changes the output.
 
+#### Temporal block-sparse attention (prototype, off by default)
+
+`H3_SPARSE_ATTN=BLOCK_FRAMES[:RADIUS]` replaces the one full-sequence SDPA call per
+DiT block with rectangular calls over temporal windows: video rows are grouped into
+blocks of `BLOCK_FRAMES` latent frames, and each block's queries score its own window
+plus `RADIUS` frames on either side, *plus every row outside the video span* so text
+and audio conditioning stay fully visible. Conditioning rows are packed once into a
+shared scratch and each block rewrites only its window segment; rows outside the video
+span keep dense keys. Falls back to dense when unset, when `BLOCK_FRAMES` exceeds the
+frame count, or under `--token-reduction`/VDN, and rejects malformed values at DiT
+creation.
+
+The wiring is exact: with the window covering every frame the layer-0 attention output
+is bit-identical to the dense call. Time saved is close to linear in dropped pairs
+(864x480, 2 s, 2 steps, M4/16 GB): 8.4% keep `-21.5%`, 19.8% `-17.9%`, 31.3% `-15.8%`,
+42.7% `-14.7%` on Euler denoise. Quality, though, breaks before that pays off -- at
+19.8% keep the subject ghosts apart, and even at 42.7% keep the frames lose ~37% of the
+dense gradient energy while saturation sits 20% high. `-14.7%` is worse than what
+`--reuse 2` buys at 20 steps without touching attention, so this stays a prototype: keep it
+as the carrier for a future *selected*-key scheme (top-k), not as a shipping knob.
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
@@ -913,7 +934,55 @@ accordingly.
 The DiT fast path evaluates each BF16 `fc1 -> SwiGLU -> fc2` block as one cached
 graph, avoiding separate graph boundaries and persistent intermediate tensors.
 Set `H3_DISABLE_FUSED_MLP=1` to retain the close-reference operation boundaries
-for numerical diagnosis.
+for numerical diagnosis. `make h3_mlp_fusion_bench &&
+./h3_mlp_fusion_bench 13 3249 7074` alternates both paths round by round in one
+process on one set of buffers: the ratio lands at 0.99-1.01 with the sign
+flipping between runs, so the fused graph costs nothing measurable and only
+saves the 405 MB persistent `fc1` activation at 7,074 rows. Absolute per-op
+times from any two runs differ by 6-12% on this class of machine, which is why
+that bench reports a paired ratio instead of comparing quoted millisecond
+figures.
+
+`make h3_attention_bench && ./h3_attention_bench 5 dsgr
+7074:189:17:405:0:6:354 3249:189:17:180:0:6:180` prices block sparsity the cheap
+way: instead of one full-sequence call, `G` smaller calls encoded into one command
+buffer. `s` splits into `sequence/G` square calls, `r` uses
+`h3_gpu_sdpa_rect_bf16` so a query block can score a different number of rows than
+it has (which is what a real pattern needs -- a square call can only express a
+block diagonal), and `g` additionally pays for the `h3_gpu_copy_bf16` gather that
+packs the selected key rows. A MODE carries two more fields
+(`SEQUENCE:TEXT:FRAMES:TOKENS_PER_FRAME:RADIUS:GROUPS:KEY_ROWS:SEGMENTS`):
+`KEY_ROWS` is the per-call keep, `SEGMENTS` how many discontinuous pieces the
+gather stitches. Per token pair all of these cost 0.9-1.0x of dense at 7,074 rows
+-- 5% keep is 30 ms against a 564-613 ms dense call. Holding the query block at
+1,179 rows and sweeping `KEY_ROWS` 480 to 1,180 (keep 6.8% to 16.7%) stays at
+0.8-0.9x per pair with no cliff, about 5.1 ms per point of keep, so a per-layer
+keep table does not have to quantize its values. Splitting each block's keys into
+1..8 segments costs nothing either (54.6 -> 55.5 ms for 6 calls of 1,179x707, and
+288 copies plus 18 SDPA calls encode in 0.8 ms of CPU time). The one thing that
+does degrade is a call whose own work shrinks: below roughly 100k token pairs per
+call the cost rises to 1.2-1.6x, so the shape to pick is few and tall query
+blocks, not many small ones. Fifty distinct shapes compile in 3.9 ms each (201 ms
+once per process) and add ~1 MB of residency each. When several MODEs share one
+`SEQUENCE` and `GROUPS` the bench reuses one buffer pool, which is what makes that
+residency figure readable -- without it per-MODE allocation ramps resident size by
+gigabytes and the growth reads as graph cache. Each sweep also prints its
+full-sequence dense median, and a `NOTE:` line when it lands more than 1.1x above
+the fastest dense for that sequence: per-pair ratios do not survive a degraded
+machine window (small calls lose more than the full-sequence one), so a sweep
+carrying that note should be discarded. The library's own windowed kernel is not
+an alternative here -- the same bench measures it at 70-78x the per-pair cost of
+dense SDPA.
+
+`H3_DIT_OP_PROFILE=1` brackets every op of a DiT block with its own commit and
+wait, so each one gets a command buffer and a measurable window; without it a
+whole block encodes into a single chain and only the block total exists. The
+report at teardown lists per-op milliseconds, the CPU-side encode, the GPU
+turnaround, and the share of the bracketed time. Each bracket costs about 18 ms
+of drain that the unbracketed path hides, so treat the absolute numbers as an
+upper bound per op and the shares as the measurement; add
+`H3_DISABLE_FUSED_GATE_ADALN=1` alongside the MLP switch to split FC1, SwiGLU,
+FC2, and each AdaLN/gate into separate labels.
 
 On supported M5 Metal 4 TensorOps hardware, the native int8 MLP engine is the
 default. It dynamically quantizes activations, uses per-output-channel weight

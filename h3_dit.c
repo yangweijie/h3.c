@@ -162,6 +162,20 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
+    int op_profile;
+    double op_profile_wall;
+    h3_gpu_stats op_profile_stats;
+    /* Block-sparse attention prototype (H3_SPARSE_ATTN=BLOCK_FRAMES[:RADIUS]):
+     * the video rows become query blocks of BLOCK_FRAMES frames, and each block
+     * scores its own frames plus RADIUS on either side, along with every row
+     * outside the video span.  Zero keeps the dense call. */
+    uint32_t sparse_block_frames;
+    uint32_t sparse_radius;
+    int sparse_reported;
+    h3_gpu_tensor *sparse_query;
+    h3_gpu_tensor *sparse_key;
+    h3_gpu_tensor *sparse_value;
+    h3_gpu_tensor *sparse_output;
     h3_lora *lora[4];
     int lora_count;
     h3_weight_store *vdn_weights;   /* linear-branch checkpoint directory */
@@ -3207,6 +3221,22 @@ static h3_dit *load_dit(const char *weight_directory,
         return NULL;
     }
     dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
+    const char *op_profile = getenv("H3_DIT_OP_PROFILE");
+    dit->op_profile = op_profile && *op_profile && strcmp(op_profile, "0");
+    {
+        const char *sparse = getenv("H3_SPARSE_ATTN");
+        if (sparse && *sparse) {
+            unsigned block = 0, radius = 0;
+            int fields = sscanf(sparse, "%u:%u", &block, &radius);
+            if (fields < 1 || !block || block > 4096) {
+                fail(error, error_size,
+                     "H3_SPARSE_ATTN wants BLOCK_FRAMES[:RADIUS] in frames");
+                goto failed;
+            }
+            dit->sparse_block_frames = block;
+            dit->sparse_radius = radius;
+        }
+    }
     /* The released final heads are F32, but their inputs are already BF16.
      * Converting these small weights once selects the Iris-derived tiled
      * linear and eliminates two full-width casts plus the scalar F32 kernel.
@@ -3976,6 +4006,224 @@ static void dump_activation(h3_dit *dit, unsigned layer, unsigned field,
     if (written) dit->dump_calls[layer][field]++;
 }
 
+/* H3_DIT_OP_PROFILE=1 gives every op of run_block its own command buffer.
+ * Without the brackets a whole block is encoded into one chain, so the driver
+ * can only ever report the block total and a single kernel's cost is invisible.
+ * The brackets serialize the GPU and add a commit+wait per op, so the wall time
+ * they measure is an upper bound per op; the split between labels is what this
+ * switch exists to show. `wait` is the GPU turnaround (host clock around
+ * waitUntilCompleted) and `encode` the CPU side of filling the buffer; the
+ * root MTLCommandBuffer timestamps are not used here because MPSGraph schedules
+ * part of an attention into child buffers they do not cover. */
+#define H3_DIT_OP_LABELS 32
+
+typedef struct {
+    const char *label;
+    double wall_seconds;
+    double encode_seconds;
+    double wait_seconds;
+    uint64_t calls;
+} dit_op_timing;
+
+static dit_op_timing dit_op_timings[H3_DIT_OP_LABELS];
+static uint32_t dit_op_timing_count;
+static double dit_op_bracketed_seconds;
+
+static dit_op_timing *dit_op_slot(const char *label) {
+    for (uint32_t index = 0; index < dit_op_timing_count; index++)
+        if (dit_op_timings[index].label == label ||
+            strcmp(dit_op_timings[index].label, label) == 0)
+            return &dit_op_timings[index];
+    if (dit_op_timing_count == H3_DIT_OP_LABELS) return NULL;
+    dit_op_timing *slot = &dit_op_timings[dit_op_timing_count++];
+    slot->label = label;
+    slot->wall_seconds = 0.0;
+    slot->encode_seconds = 0.0;
+    slot->wait_seconds = 0.0;
+    slot->calls = 0;
+    return slot;
+}
+
+static void op_profile_start(h3_dit *dit) {
+    /* Nothing to drain: the previous op's stop already committed and waited, and
+     * the chain it reopened is where this op encodes. Only the very first
+     * bracket of the run also measures what encode_forward queued before it. */
+    dit->op_profile_wall = stream_now();
+    h3_gpu_get_stats(dit->gpu, &dit->op_profile_stats);
+}
+
+static int op_profile_stop(h3_dit *dit, const char *label,
+                           char *error, size_t error_size) {
+    if (!gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                "op profile submit")) return 0;
+    double wall = stream_now();
+    h3_gpu_stats stats;
+    if (!h3_gpu_get_stats(dit->gpu, &stats)) {
+        fail(error, error_size, "op profile: no Metal stats");
+        return 0;
+    }
+    if (!gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                "op profile reopen")) return 0;
+    dit_op_timing *slot = dit_op_slot(label);
+    double elapsed = wall - dit->op_profile_wall;
+    if (slot) {
+        slot->calls++;
+        slot->wall_seconds += elapsed;
+        slot->encode_seconds += stats.command_encode_seconds -
+            dit->op_profile_stats.command_encode_seconds;
+        slot->wait_seconds += stats.command_wait_seconds -
+            dit->op_profile_stats.command_wait_seconds;
+    }
+    dit_op_bracketed_seconds += elapsed;
+    return 1;
+}
+
+static int compare_op_timing(const void *left, const void *right) {
+    double a = ((const dit_op_timing *)left)->wall_seconds;
+    double b = ((const dit_op_timing *)right)->wall_seconds;
+    return a < b ? 1 : (a > b ? -1 : 0);
+}
+
+static void op_profile_report(const h3_dit *dit) {
+    if (!dit->op_profile || dit_op_timing_count == 0) return;
+    dit_op_timing sorted[H3_DIT_OP_LABELS];
+    uint32_t count = dit_op_timing_count;
+    memcpy(sorted, dit_op_timings, count * sizeof(*sorted));
+    qsort(sorted, count, sizeof(*sorted), compare_op_timing);
+    fprintf(stderr, "h3: DiT op profile (%u labels, sequence %u rows, "
+            "%u blocks, %.3f s bracketed)\n", count, dit->sequence,
+            dit->active_block_count, dit_op_bracketed_seconds);
+    for (uint32_t index = 0; index < count; index++) {
+        const dit_op_timing *entry = &sorted[index];
+        fprintf(stderr,
+                "h3:   %-56s %6llu calls  wall %8.3f ms  encode %7.3f ms  "
+                "wait %8.3f ms  %5.1f%%\n",
+                entry->label, (unsigned long long)entry->calls,
+                entry->wall_seconds * 1e3 / (double)entry->calls,
+                entry->encode_seconds * 1e3 / (double)entry->calls,
+                entry->wait_seconds * 1e3 / (double)entry->calls,
+                dit_op_bracketed_seconds > 0.0 ?
+                    100.0 * entry->wall_seconds / dit_op_bracketed_seconds :
+                    0.0);
+    }
+}
+
+/* The rectangular SDPA call lets a query block score a different number of key
+ * rows than it has, which is the shape block sparsity needs: a square call can
+ * only express a block diagonal.  Covers the plain row-major dense call only --
+ * token reduction rewrites the row layout and VDN brings its own window. */
+static int sparse_attention_applicable(const h3_dit *dit) {
+    const uint32_t span = dit->video_rows;
+    const uint32_t frames = (uint32_t)dit->latent_t;
+    if (!dit->sparse_block_frames || dit->token_reduction_active || dit->vdn)
+        return 0;
+    if (!frames || span % frames || dit->video_target_start + span > dit->sequence)
+        return 0;
+    return dit->sparse_block_frames <= frames;
+}
+
+/* Each block's keys are its frame window plus every row outside the video span,
+ * so the conditioning stays visible to all frames.  Those conditioning rows are
+ * shared, so they are packed once at the front of one scratch and each block
+ * rewrites only the window behind them; SDPA is order-free over keys, so the
+ * split into [conditioning][window] costs nothing.  Residency is therefore one
+ * window, not one copy per block. */
+static int sparse_attention(h3_dit *dit, char *error, size_t error_size) {
+    const size_t row = (size_t)HEADS * HEAD_DIM;
+    const uint32_t start = dit->video_target_start, span = dit->video_rows;
+    const uint32_t frames = (uint32_t)dit->latent_t, sequence = dit->sequence;
+    const uint32_t tail = sequence - start - span, context = start + tail;
+    const uint32_t per_frame = span / frames;
+    const uint32_t block = dit->sparse_block_frames, radius = dit->sparse_radius;
+    const uint32_t block_rows = block * per_frame;
+    const uint32_t window_rows = (block + 2 * radius) * per_frame;
+    uint32_t query_rows = block_rows > start ? block_rows : start;
+    if (tail > query_rows) query_rows = tail;
+#define SPARSE(call) do {                                                       \
+        if (!(call)) {                                                          \
+            fail(error, error_size, "block-sparse attention: %s",               \
+                 h3_gpu_error(dit->gpu));                                       \
+            return 0;                                                           \
+        }                                                                       \
+    } while (0)
+    if (!dit->sparse_query) {
+        const size_t packed = (size_t)(context + window_rows) * row;
+        dit->sparse_query = h3_gpu_tensor_new_bf16(dit->gpu,
+                                                   (size_t)query_rows * row);
+        dit->sparse_output = h3_gpu_tensor_new_bf16(dit->gpu,
+                                                    (size_t)query_rows * row);
+        dit->sparse_key = h3_gpu_tensor_new_bf16(dit->gpu, packed);
+        dit->sparse_value = h3_gpu_tensor_new_bf16(dit->gpu, packed);
+        if (!dit->sparse_query || !dit->sparse_output || !dit->sparse_key ||
+            !dit->sparse_value) {
+            fail(error, error_size, "cannot allocate the block-sparse scratch");
+            return 0;
+        }
+    }
+    if (start) {
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_key, 0, dit->key, 0,
+                                (size_t)start * row));
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_value, 0, dit->value, 0,
+                                (size_t)start * row));
+    }
+    if (tail) {
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_key, (size_t)start * row,
+                                dit->key, (size_t)(start + span) * row,
+                                (size_t)tail * row));
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_value, (size_t)start * row,
+                                dit->value, (size_t)(start + span) * row,
+                                (size_t)tail * row));
+    }
+    const float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    for (uint32_t first = 0; first < span; first += block_rows) {
+        uint32_t rows = span - first < block_rows ? span - first : block_rows;
+        uint32_t stop_frame = (first + rows + per_frame - 1) / per_frame;
+        uint32_t window_start = first / per_frame > radius ?
+            first / per_frame - radius : 0;
+        uint32_t window_stop = stop_frame + radius > frames ?
+            frames : stop_frame + radius;
+        uint32_t window = (window_stop - window_start) * per_frame;
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_key, (size_t)context * row,
+                                dit->key,
+                                (size_t)(start + window_start * per_frame) * row,
+                                (size_t)window * row));
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_value, (size_t)context * row,
+                                dit->value,
+                                (size_t)(start + window_start * per_frame) * row,
+                                (size_t)window * row));
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_query, 0, dit->query,
+                                (size_t)(start + first) * row, (size_t)rows * row));
+        SPARSE(h3_gpu_sdpa_rect_bf16(dit->gpu, dit->sparse_output,
+                                     dit->sparse_query, dit->sparse_key,
+                                     dit->sparse_value, rows, context + window,
+                                     HEADS, HEAD_DIM, scale));
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->attention_heads,
+                                (size_t)(start + first) * row,
+                                dit->sparse_output, 0, (size_t)rows * row));
+    }
+    /* Rows outside the video span keep the whole sequence in view, so they need
+     * no packing: those buffers already start at row zero. */
+    if (start) {
+        SPARSE(h3_gpu_sdpa_rect_bf16(dit->gpu, dit->sparse_output, dit->query,
+                                     dit->key, dit->value, start, sequence,
+                                     HEADS, HEAD_DIM, scale));
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->attention_heads, 0,
+                                dit->sparse_output, 0, (size_t)start * row));
+    }
+    if (tail) {
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->sparse_query, 0, dit->query,
+                                (size_t)(start + span) * row, (size_t)tail * row));
+        SPARSE(h3_gpu_sdpa_rect_bf16(dit->gpu, dit->sparse_output,
+                                     dit->sparse_query, dit->key, dit->value,
+                                     tail, sequence, HEADS, HEAD_DIM, scale));
+        SPARSE(h3_gpu_copy_bf16(dit->gpu, dit->attention_heads,
+                                (size_t)(start + span) * row,
+                                dit->sparse_output, 0, (size_t)tail * row));
+    }
+#undef SPARSE
+    return 1;
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
                      h3_dit_block *weight,
                      int attention_adaln_ready,
@@ -3994,8 +4242,17 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         dit->reduced_rope_sin : dit->rope_sin;
     uint32_t rows = dit->token_reduction_active ?
         dit->reduced_sequence : dit->sequence;
+/* With H3_DIT_OP_PROFILE=1 each op below is bracketed by a submit, so it gets a
+ * command buffer of its own and a measurable window. The other OP users in this
+ * file (encode_forward) must keep the plain form: their calls *are* the
+ * chain's begin/continue/submit points. */
 #define OP(call, label) do {                                                    \
-    if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
+    const int profiled = dit->op_profile;                                       \
+    if (profiled) op_profile_start(dit);                                        \
+    const int called = (call);                                                  \
+    if (profiled && called &&                                                    \
+        !op_profile_stop(dit, label, error, error_size)) return 0;               \
+    if (!gpu_op(dit, called, error, error_size, label)) return 0;                \
 } while (0)
     if (!attention_adaln_ready)
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
@@ -4024,10 +4281,28 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     int int8_attention_output = dit->int8_attention_out && !vdn &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
+    int sparse_active = sparse_attention_applicable(dit);
     int head_major_attention_output = int8_attention_output &&
+        !sparse_active &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
+    if (sparse_active && !dit->sparse_reported) {
+        dit->sparse_reported = 1;
+        const uint32_t span = dit->video_rows;
+        const uint32_t frames = (uint32_t)dit->latent_t;
+        const uint32_t context = dit->sequence - span;
+        const uint32_t window =
+            (dit->sparse_block_frames + 2 * dit->sparse_radius) *
+            (span / frames);
+        fprintf(stderr,
+                "h3: block-sparse attention: %u frame blocks, radius %u;"
+                " %u frames total; video queries see %u of %u key rows"
+                " (%.1f%% of video pairs)\n",
+                dit->sparse_block_frames, dit->sparse_radius, frames,
+                context + window, dit->sequence,
+                100.0 * (double)(context + window) / (double)dit->sequence);
+    }
     if (vdn) {
         h3_vdn_state *v = dit->vdn_state;
         OP(h3_gpu_vdn_window_attention(dit->gpu, dit->attention_heads,
@@ -4040,6 +4315,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_vdn_head_gate(dit->gpu, dit->attention_heads,
             v->softmax_gate_lin, rows, HEADS, HEAD_DIM),
            "VDN softmax gate");
+    } else if (sparse_active) {
+        OP(sparse_attention(dit, error, error_size), "DiT block-sparse attention");
     } else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
@@ -5293,6 +5570,8 @@ void h3_dit_free(h3_dit *dit) {
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);
+    FREE(sparse_query); FREE(sparse_key); FREE(sparse_value);
+    FREE(sparse_output);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);
@@ -5323,6 +5602,7 @@ void h3_dit_free(h3_dit *dit) {
                 dit->stream_wait_seconds, dit->stream_pread_seconds,
                 dit->stream_dequant_seconds);
     }
+    op_profile_report(dit);
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);

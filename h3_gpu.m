@@ -38,6 +38,9 @@
 @property(nonatomic, strong) MPSGraphTensor *value;
 @property(nonatomic, strong) MPSGraphTensor *output;
 @property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+/* Key/value placeholders need their own row count once attention becomes
+ * rectangular: query rows and key rows differ. */
+@property(nonatomic, strong) NSArray<NSNumber *> *keyShape;
 @property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
 @end
 @implementation H3SDPA
@@ -1534,32 +1537,38 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
 }
 
 static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
-                                 uint32_t sequence,
+                                 uint32_t query_sequence,
+                                 uint32_t key_sequence,
                                  uint32_t heads, uint32_t head_dim, float scale,
                                  MPSDataType dataType, int causal,
                                  int headMajor, int outputHeadMajor) {
     @autoreleasepool {
         NSString *cacheKey = [NSString stringWithFormat:
-                              @"%u:%u:%u:%u:%u:%.9g:%d:%d:%d",
-                              (unsigned)dataType, batch, sequence, heads,
-                              head_dim, scale, causal, headMajor,
-                              outputHeadMajor];
+                              @"%u:%u:%u:%u:%u:%u:%.9g:%d:%d:%d",
+                              (unsigned)dataType, batch, query_sequence,
+                              key_sequence, heads, head_dim, scale, causal,
+                              headMajor, outputHeadMajor];
         H3SDPA *cached = gpu.sdpaCache[cacheKey];
         if (cached) return cached;
         MPSGraph *graph = [[MPSGraph alloc] init];
-        NSArray<NSNumber *> *rowMajorShape =
-            @[@(batch), @(sequence), @(heads), @(head_dim)];
-        NSArray<NSNumber *> *headMajorShape =
-            @[@(batch), @(heads), @(sequence), @(head_dim)];
+        NSArray<NSNumber *> *queryRowMajor =
+            @[@(batch), @(query_sequence), @(heads), @(head_dim)];
+        NSArray<NSNumber *> *keyRowMajor =
+            @[@(batch), @(key_sequence), @(heads), @(head_dim)];
+        NSArray<NSNumber *> *queryHeadMajor =
+            @[@(batch), @(heads), @(query_sequence), @(head_dim)];
+        NSArray<NSNumber *> *keyHeadMajor =
+            @[@(batch), @(heads), @(key_sequence), @(head_dim)];
         NSArray<NSNumber *> *outputShape = outputHeadMajor ?
-            headMajorShape : rowMajorShape;
-        NSArray<NSNumber *> *inputShape = headMajor ?
-            headMajorShape : rowMajorShape;
-        MPSGraphTensor *q = [graph placeholderWithShape:inputShape
+            queryHeadMajor : queryRowMajor;
+        NSArray<NSNumber *> *queryShape =
+            headMajor ? queryHeadMajor : queryRowMajor;
+        NSArray<NSNumber *> *keyShape = headMajor ? keyHeadMajor : keyRowMajor;
+        MPSGraphTensor *q = [graph placeholderWithShape:queryShape
                                                dataType:dataType name:nil];
-        MPSGraphTensor *k = [graph placeholderWithShape:inputShape
+        MPSGraphTensor *k = [graph placeholderWithShape:keyShape
                                                dataType:dataType name:nil];
-        MPSGraphTensor *v = [graph placeholderWithShape:inputShape
+        MPSGraphTensor *v = [graph placeholderWithShape:keyShape
                                                dataType:dataType name:nil];
         MPSGraphTensor *qt = headMajor ? q :
             [graph transposeTensor:q dimension:1 withDimension:2 name:nil];
@@ -1573,17 +1582,17 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
         }
         MPSGraphTensor *attention;
         if (causal) {
-            size_t mask_count = (size_t)sequence * sequence;
+            size_t mask_count = (size_t)query_sequence * key_sequence;
             float *mask_values = malloc(mask_count * sizeof(*mask_values));
             if (!mask_values) return nil;
-            for (uint32_t row = 0; row < sequence; row++)
-                for (uint32_t column = 0; column < sequence; column++)
-                    mask_values[(size_t)row * sequence + column] =
+            for (uint32_t row = 0; row < query_sequence; row++)
+                for (uint32_t column = 0; column < key_sequence; column++)
+                    mask_values[(size_t)row * key_sequence + column] =
                         column <= row ? 0.0f : -INFINITY;
             NSData *mask_data = [NSData dataWithBytesNoCopy:mask_values
                 length:mask_count * sizeof(*mask_values) freeWhenDone:YES];
             MPSGraphTensor *mask = [graph constantWithData:mask_data
-                shape:@[@1, @1, @(sequence), @(sequence)]
+                shape:@[@1, @1, @(query_sequence), @(key_sequence)]
                 dataType:MPSDataTypeFloat32];
             attention = [graph
                 scaledDotProductAttentionWithQueryTensor:qt keyTensor:kt
@@ -1600,7 +1609,8 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
         result.output = outputHeadMajor ? attention :
             [graph transposeTensor:attention dimension:1 withDimension:2
              name:nil];
-        result.inputShape = inputShape;
+        result.inputShape = queryShape;
+        result.keyShape = keyShape;
         result.outputShape = outputShape;
         gpu.sdpaCache[cacheKey] = result;
         return result;
@@ -1610,7 +1620,7 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
 static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                        const h3_gpu_tensor *value, uint32_t batch,
-                       uint32_t sequence,
+                       uint32_t query_sequence, uint32_t key_sequence,
                        uint32_t heads, uint32_t head_dim, float scale,
                        h3_gpu_dtype tensor_dtype, MPSDataType mps_dtype,
                        int causal, int outputHeadMajor) {
@@ -1618,31 +1628,37 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
     int headMajor = gpu.headMajorSDPAInputs &&
         tensor_dtype == H3_GPU_BF16 && batch == 1 && !causal;
     gpu.headMajorSDPAInputs = NO;
-    size_t count = (size_t)batch * sequence * heads * head_dim;
-    if (!batch || !sequence || !heads || !head_dim ||
+    size_t query_count =
+        (size_t)batch * query_sequence * heads * head_dim;
+    size_t key_count = (size_t)batch * key_sequence * heads * head_dim;
+    if (!batch || !query_sequence || !key_sequence || !heads || !head_dim ||
+        (causal && query_sequence != key_sequence) ||
         !h3_gpu_require_command(gpu) ||
-        !h3_gpu_require_elements(gpu, query, count, @"SDPA query") ||
-        !h3_gpu_require_elements(gpu, key, count, @"SDPA key") ||
-        !h3_gpu_require_elements(gpu, value, count, @"SDPA value") ||
-        !h3_gpu_require_elements(gpu, output, count, @"SDPA output")) return 0;
+        !h3_gpu_require_elements(gpu, query, query_count, @"SDPA query") ||
+        !h3_gpu_require_elements(gpu, key, key_count, @"SDPA key") ||
+        !h3_gpu_require_elements(gpu, value, key_count, @"SDPA value") ||
+        !h3_gpu_require_elements(gpu, output, query_count, @"SDPA output")) return 0;
     if (TENSOR(query).dtype != tensor_dtype || TENSOR(key).dtype != tensor_dtype ||
         TENSOR(value).dtype != tensor_dtype || TENSOR(output).dtype != tensor_dtype) {
         h3_gpu_set_error(gpu, @"SDPA tensor dtype mismatch");
         return 0;
     }
-    H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, sequence, heads, head_dim,
-                                      scale, mps_dtype, causal, headMajor,
-                                      outputHeadMajor);
+    H3SDPA *cache = h3_gpu_sdpa_graph(gpu, batch, query_sequence, key_sequence,
+                                      heads, head_dim, scale, mps_dtype, causal,
+                                      headMajor, outputHeadMajor);
     if (!cache) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
-        MPSGraphTensorData *(^data)(const h3_gpu_tensor *) =
-            ^MPSGraphTensorData *(const h3_gpu_tensor *tensor) {
-                return h3_gpu_graph_data(tensor, cache.inputShape,
-                                         mps_dtype, 0);
+        MPSGraphTensorData *(^data)(const h3_gpu_tensor *,
+                                    NSArray<NSNumber *> *) =
+            ^MPSGraphTensorData *(const h3_gpu_tensor *tensor,
+                                  NSArray<NSNumber *> *shape) {
+                return h3_gpu_graph_data(tensor, shape, mps_dtype, 0);
             };
         NSDictionary *feeds = @{
-            cache.query: data(query), cache.key: data(key), cache.value: data(value)
+            cache.query: data(query, cache.inputShape),
+            cache.key: data(key, cache.keyShape),
+            cache.value: data(value, cache.keyShape)
         };
         MPSGraphTensorData *outputData = h3_gpu_graph_data(
             output, cache.outputShape, mps_dtype, 0);
@@ -1666,8 +1682,9 @@ int h3_gpu_sdpa_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                     const h3_gpu_tensor *value, uint32_t sequence,
                     uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
-                       head_dim, scale, H3_GPU_F32, MPSDataTypeFloat32, 0, 0);
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, sequence,
+                       heads, head_dim, scale, H3_GPU_F32, MPSDataTypeFloat32,
+                       0, 0);
 }
 
 int h3_gpu_sdpa_causal_f32(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -1676,7 +1693,7 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                     uint32_t sequence, uint32_t heads, uint32_t head_dim,
                     float scale) {
     return h3_gpu_sdpa(opaque, output, query, key, value, batch, sequence,
-                       heads, head_dim, scale, H3_GPU_F32,
+                       sequence, heads, head_dim, scale, H3_GPU_F32,
                        MPSDataTypeFloat32, 1, 0);
 }
 
@@ -1684,9 +1701,19 @@ int h3_gpu_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
-                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
-                       0);
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, sequence,
+                       heads, head_dim, scale, H3_GPU_BF16,
+                       MPSDataTypeBFloat16, 0, 0);
+}
+
+int h3_gpu_sdpa_rect_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                          const h3_gpu_tensor *value, uint32_t query_sequence,
+                          uint32_t key_sequence, uint32_t heads,
+                          uint32_t head_dim, float scale) {
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, query_sequence,
+                       key_sequence, heads, head_dim, scale, H3_GPU_BF16,
+                       MPSDataTypeBFloat16, 0, 0);
 }
 
 int h3_gpu_sdpa_bf16_head_major_output(
@@ -1694,9 +1721,9 @@ int h3_gpu_sdpa_bf16_head_major_output(
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
-                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
-                       1);
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, sequence,
+                       heads, head_dim, scale, H3_GPU_BF16,
+                       MPSDataTypeBFloat16, 0, 1);
 }
 
 int h3_gpu_swiglu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
