@@ -28,6 +28,9 @@ AUDIO_VAE_MODEL ?= MiniMax-H3
 # Released model root for the streamed video VAE parity test. Point this at the
 # checkpoint tree, e.g. `make test VIDEO_VAE_MODEL=models/minimax-h3`.
 VIDEO_VAE_MODEL ?= MiniMax-H3
+# Checkpoint tree holding the ConvRot INT8 transformer shard, for the raw
+# int8 loader test: `make test DIT_MODEL=/path/to/MiniMax-H3-Convrot`.
+DIT_MODEL ?= MiniMax-H3
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
@@ -66,6 +69,30 @@ h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_convrot_test: tests/test_convrot_unrotate.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_int8_raw_test: tests/test_int8_raw.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_int8_test: tests/test_ane_int8.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_staging_test: tests/test_ane_staging.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_full_block_test: tests/test_ane_full_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_block_test: tests/test_ane_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_vae_test: tests/test_ane_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_vae_residency_test: tests/test_ane_vae_residency.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ane_vae_decode_test: tests/test_ane_vae_decode.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
@@ -116,6 +143,12 @@ h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 h3_metal_bench: tests/bench_metal_context.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_mlp_fusion_bench: tests/bench_mlp_fusion.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_attention_bench: tests/bench_attention.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -150,7 +183,8 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test \
-	h3_convrot_test h3_vdn_tests
+	h3_convrot_test h3_vdn_tests h3_int8_raw_test h3_ane_staging_test \
+	h3_flash_attn_tests
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -172,7 +206,14 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	fi
 	./h3_audio_gpu_tests
 	./h3_convrot_test
+	./h3_ane_staging_test
 	./h3_vdn_tests
+	./h3_flash_attn_tests
+	@if test -d $(DIT_MODEL)/FL2VA/transformer; then \
+		./h3_int8_raw_test $(DIT_MODEL)/FL2VA/transformer; \
+	else \
+		echo "skip: ConvRot INT8 transformer weights are not installed"; \
+	fi
 	@if test -f MiniMax-H3/FL2VA/audio_vae/model.safetensors && \
 	         test -f misc/fixtures/h3_real_audio_vae_37.safetensors; then \
 		./h3_real_audio_vae_test; \
@@ -265,6 +306,10 @@ tests/%.o: tests/%.c
 # terminal editor for conversion diagnostics unrelated to H3.
 linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 
+# The gate's fp32 reference runs through BLAS, whose legacy C prototype is
+# deprecated; this asks vecLib for the current one.
+tests/test_ane_vae.o: CFLAGS += -DACCELERATE_NEW_LAPACK
+
 -include $(wildcard *.d tests/*.d)
 
 clean:
@@ -277,5 +322,9 @@ clean:
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
-	h3_dit_bench h3_dit_bench_864 h3_metal_bench \
+		h3_ane_int8_test h3_ane_staging_test h3_ane_block_test \
+		h3_ane_full_block_test h3_ane_vae_test h3_ane_vae_residency_test \
+		h3_ane_vae_decode_test \
+	h3_dit_bench h3_dit_bench_864 h3_metal_bench h3_mlp_fusion_bench \
+	h3_attention_bench h3_flash_attn_tests \
 	libh3.a *.o *.d tests/*.o tests/*.d
