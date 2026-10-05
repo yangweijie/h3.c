@@ -2196,3 +2196,259 @@ head 共享形式与固定时间窗打平（13.7% 档还更差），能达标的
 4. 可选收尾：ANE 的 4 个新文件 755 位入库（要改 644 需单独确认）；`~/h3_sys`、缓存目录按红线不动。
 5. 已关闭：固定 keep 时间窗稀疏（F31）与 top-k / 逐层 keep 表（F39）；库自带 windowed kernel（F26）；
    ANE 线（用户决定）；reuse 阶梯与主因（F32~F38）；低预算运行时闸；未提交改动的主题拆分。
+
+## 新增（2026-09-26 16:00）：AdaLN 调制缓存落地并预生成 4/8/20 三档（F40 / progress 续 30）
+
+上一轮遗留的第 1 条（"缓存按 `--steps` 绑定，换步数要重新导出"）本轮做掉，并顺手把
+24.29 GiB 的 AdaLN 权重从 checkpoint 里整个拿掉。
+
+**做了什么**
+- `h3_dit_schedule.h`：`H3_ADALN_CACHE_{TIMES,BLOCK,FINAL}_FORMAT` 全部带 `s%d` 步数后缀，
+  同一 transformer 目录可并存多份缓存；`blocks.0.adaln_cache_s{steps}` 存在即选中缓存路径。
+- `h3_dit_schedule.c`：`prepare_rows` 拆成 `prepare_times`（纯 CPU，先于任何权重读）+
+  `prepare_features`；新增 `load_cached_adaln`（逐位前缀校验）与 `dump_adaln_cache`
+  （`H3ADALN2` 头，含 steps）；`H3_DIT_ADALN_CACHE_DUMP` 导出时**同时强制 visual+audio 两个
+  条件行**；新增 `!cache && !adaln_probe` 的明确报错。
+- `fastvideo_qad/scripts/export_h3_adaln_cache.py`：`--dump` 可重复、按步数命名/校验、
+  流式写不落内存；`--trim-to` 写新目录、`--verify` 只读复查。
+- 产物 `/Volumes/data/MODELS/h3c-q4-adalncache`：**12.25 GiB**（原 35.93），带三档缓存。
+
+**验证**（细节见 F40）：dump 字节数三档逐字节命中预测；`--verify` PASS；
+4/8/20 三档 A/B 的 latent **与 mp4 容器** md5 全同、`max|d|=0`；
+负向对照 `--steps 6` → exit 1 且报错可读。
+
+**重排后的待办**
+1. 本轮改动**未提交**：`h3_dit_schedule.{c,h}` + 两个新脚本 + README 新小节 +
+   `findings.md`/`progress.md`/`task_plan.md`。提交前建议再跑一次 `--verify`（只读）。
+2. 缓存与 **LoRA 互斥**（要合并进已丢弃的 AdaLN 权重，直接拒绝）——已写进 README 与头注释，
+   不打算支持；若要支持得让 LoRA 携带自己的 AdaLN 增量。
+3. **纯音频参考**（`H3_LAYOUT_REF_AUDIO` 无图）是唯一不覆盖的条件模式，被 memcmp 明确拒绝。
+   CLI/REPL 都构造不出来，只有 C API 可达；若将来加 `!ref-audio` 之类的入口，要先扩缓存行数
+   （把 audio 条件行放到 visual 之前，或按模式分键）。
+4. 想要别的步数就按 README 新小节的循环重跑一遍导出+裁剪；脚本的 `--dump` 已支持一次装多档。
+5. 旧账未动：`/tmp/reuse` `/tmp/eqcost` `/tmp/eq576` `/tmp/eq20` `/tmp/mid` `/tmp/boundary`
+   `/tmp/discrim` `/tmp/guard`、`/Volumes/data/tmp/topk`；本轮新增 `/tmp/h3ab/v2`（约 1 GB，
+   三个 dump + A/B latent + 日志，F40 复现小节引用）。
+6. 已关闭：注意力 top-k / 逐层 keep 表（F39）、固定 keep 时间窗（F31）、库自带 windowed kernel（F26）、
+   ANE 线、reuse 阶梯与主因（F32~F38）、低预算运行时闸。
+
+## 新增（2026-10-01）：Strata 对照清单落地为 h3c 待办前先核前提（F41 / progress 续 31）
+
+用户给了一份 Strata（LLM offload）与 h3c 的对照优化清单，要求"参考上面的优化"。本轮只把清单里
+三条**事实断言**核到代码（细节与行号见 F41），未改任何行为、未跑 GPU。
+
+**核对结果**：①"流式档位盘上存 BF16"只对 BF16 checkpoint 成立 —— ConvRot int8 checkpoint 的流式
+读本来就是 int8（h3_dit.c:1649）并且保留 int8 计算（`requant_stream_slot` h3_dit.c:1517）；没吃到
+的是 int8→BF16→int8 这一圈往返（反旋转 16.0 s / 33.6 s 流）。②"uncached 读=放弃保留"方向相反：
+`F_NOCACHE` 全仓只有一处且在 BF16 helper（h3_gpu.m:823），int8 流式读根本没设它 —— 保留交给 OS 且
+没记账；已有 `load_core()` 的自适应前 N 块常驻（h3_dit.c:2756-2853）。缺的那一维确认成立：
+`H3_PROFILE` 无命中/带宽按块拆分（h3_dit.c:5670-5680），并且那行不分路径都印 "BF16 SSD stream"。
+③"每调用一个 fd"成立（h3_weights.c:234-247、h3_dit.c:773-786），但请求是 ~5 MB 一块
+（`H3_STREAM_CHUNK_ROWS=1024`），不是 Strata #230 的 4 KiB ⇒ 预期倍数小得多。
+
+**重排后的待办**
+1. **先清前置杂务**：F40 那轮改动（`h3_dit_schedule.{c,h}` + 两个导出脚本 + README + 三个计划文件）
+   从 2026-09-26 挂到现在未提交，按上轮待办 1 的建议先只读跑一次 `--verify` 再入库，别和新轮混提交。
+2. **免费（零行为改动）**：修三处与代码不一致的描述 —— README 流式小节按 checkpoint 分述 BF16/int8
+   两条读法、`h3.c:918` 的报错点明被拒的是 M5 专属 row-FC2 kernel 变体（不是 int8 整体）、
+   `H3_PROFILE` 那行按实际路径印 int8/BF16。
+3. **免费 profiling**：给流式读取补"这次读本可以命中吗"的代理指标 —— 按 block 记第 1 次与后续各次的
+   pread 秒数与 GiB/s，一次渲染即可回答"页缓存保留值多少钱"，也是②的后续决策前提。
+4. **便宜原型 A**：每 worker 常驻 fd（去掉每块 open/close），`H3_STREAM_KEEP_FD` 臂 + 旧路保留，
+   量 `pread` 秒与 wall。预期小（MB 级请求），定价半小时一轮。
+5. **便宜原型 B（工程纪律）**：逐块 FNV-1a 指纹放在校验/dump 路径（不进热路径），把"cos 动了"变成
+   "第 x 块开始动" —— 补 F39 §0 整层 cos 与 F40 latent md5 都定位不到块号的短板。
+6. **等第 3 步数据再定**：un-rotate 能否不进 BF16 域（直接 int8 反旋 + 重量化）；常驻前 N 块从"按序号"
+   改"按实测成本选块"。两者都要新 kernel 或新调度，需单独批准。
+7. **不排期**：ANE 产物当专家层管理（线已按用户决定关闭）；"验证者=大模型本身"的自验证无损优先闸
+   （F35-F38 已证同族偏离度指标对崩塌反向，要用就得先拿 4-次新鲜评估崩塌档当负样本验收）；
+   `--calibrate` 5-10 min 实测搜索（最贵，且静态 80%/85% 上限的错是 panic 风险不是速度）。
+8. 已关闭不变：注意力稀疏全线（F31+F39）、库自带 windowed kernel（F26）、ANE 线、reuse 阶梯与主因、
+   低预算运行时闸。
+
+
+## 新增（2026-10-04）：评审 F40 那轮未提交改动，挑出 8 处可优化点（F42 / progress 续 32）
+
+用户要求"审核代码，看看还有什么可以优化的"。评审范围 = 工作区未提交的 F40 那轮
+（`h3_dit_schedule.{c,h}` +270/-25、两个新导出脚本、README 新小节）。本轮**不改行为、不跑 GPU**；
+凡能本机证伪的都跑了（现场 `/tmp/f42`，含一个 9.7 MB 合成 dump 与一个双分片假模型目录）。
+
+**做对的（别当问题）**：`prepare_rows` 拆成 `prepare_times`+`prepare_features` 让缓存路径能在读权重、
+碰 GPU 之前先验 sigma 前缀；该 TU 的编译告警 **11 → 1**（消掉 4 处 `-Wsometimes-uninitialized` 和 1 处
+`-Wshadow`，剩那条在 :419 早于本轮）；前缀校验顺带自然拒掉唯一不覆盖的"无图音频参考"模式。
+
+**8 处可改，按严重度**：
+1. P1 LoRA 一刀切（`h3_dit_schedule.c:688`）拒掉**所有**适配器，但计算路径对不含 AdaLN 目标的适配器
+   历来是警告跳过（`h3_lora.c:154`）。`.default`（仅 `attn.orig.*`）本可与缓存共存，`.turbo`
+   （带 `norm_out.linear`）才真冲突。README:1120 已写"refused"，属**已文档化的保守设计**；收窄的
+   真实障碍是缓存档没有 `adaln_proj` 探针 ⇒ `time_dim` 只能停在 2688，判不了 8-wide 剪枝档。要做得先
+   给缓存加宽度字段。
+2. P2 `H3_DIT_ADALN_CACHE_DUMP=`（空串）实测**强制 2 个条件行但不导出任何东西**，在缓存档还印假警告
+   —— 三处判据不一致（:679/:699 用非 NULL，:823 用 `*dump_path`）。入口读一次即修。
+3. P3 无图音频参考的报错建议 "rebuild the cache at these steps" **不可执行**（导出永远把 visual 排在
+   前，:679-682），正是本轮注释 :676-678 自己批评的那类话术。加一句前置判定即可。
+4. P4 `dump_adaln_cache` 非原子（截断文件留在 /tmp）且丢 errno；下游 Python 用长度核对兜住了，
+   所以不致命但报告不可读。`.tmp`+`rename`、消息带 `strerror`。
+5. P5 实测：`--trim-to` 缺 `--model` 抛裸 `AttributeError`（脚本 :441→:257），同文件 `--verify` 有守卫。
+6. P6 实测：**trim 静默丢掉源目录已有的 `adaln_cache_s*.safetensors`**（:265-266 整文件 skip），
+   而文档说"只丢 adaln_proj 矩阵"；对输出跑 `--verify` 仍 PASS。"给已裁剪模型追加一档"是 README
+   教的操作，这条会吃掉旧档位。
+7. P7 缓存路径**零测试**，且唯一的 AdaLN 回归测试 `tests/test_real_dit_schedule.c` 没接进 `make test`
+   /`real-parity`（count-mode 复核：Makefile 里只 1 行，即它自己的规则；`clean` 里那行是目标名）。
+   dump↔safetensors 是 **C↔Python 跨语言 codec**，按本仓库规矩要双向锚定 fixture；原料本轮已做出
+   （合成 dump 能被 Python 读回并 verify 全绿）。附带：接入时要按路径分支，缓存档 `submissions` 应为
+   0 而非 52（代码路径判定，**未实测**）。
+8. P8 小项：`cache_header`/`adaln_header` 写了没读（`h3_weight_find` 接受 NULL）；无表分支按 2688 分配
+   只写 256（依赖一条没写出来的不变量）；:277 溢出检查没算 `sizeof(float)`（原同形，够不着）。
+
+**已核过、不是问题**：三种条件模式的前缀嵌套成立；51 张的 shape 由 `load_tensor` 逐维核对兜住；
+C/Python 的 `H3ADALN2` 布局一致；缓存档 GPU 常驻与计算档同形；`st_write` 不补 8 字节对齐但官方
+`safetensors` 0.8.0 实测接受错位偏移（真档 s20 里 51/52 张量偏移非 8 倍数），h3.c 走 pread 无影响。
+
+**重排后的待办**
+1. **F41 待办 1 仍未做**：F40 那轮改动从 2026-09-26 挂到现在未入库。现在多了 F42 的 8 条评审结论，
+   建议顺序改成：先做 F42 待办 2 的低风险局部改 → 再按主题提交（提交前跑一次只读 `--verify`）。
+2. **一批做完 P2/P3/P4/P5/P6/P8**：十行内的局部改，不碰算法、无需 GPU 轮次；P5/P6 各配一条 Python
+   侧负例（缺 `--model` 干净报错；已有缓存分片被带上或被列出）。
+3. **P7 单独一轮**：双向锚定的 codec fixture + 把 `h3_real_dit_schedule_test` 接进 `make test`
+   并给缓存档分支。
+4. **P1 挂起**：只在"缓存档要用 VDN default adapter"成为需求时才做，前提是先给缓存加 AdaLN 宽度字段。
+5. 杂务新增：`/tmp/f42`（约 20 MB：合成 dump + 假模型目录 + getenv_probe，F42 复现小节引用）。
+   旧账未动：`/tmp/reuse` `/tmp/eqcost`（优先删）`/tmp/eq576` `/tmp/eq20` `/tmp/mid` `/tmp/boundary`
+   `/tmp/discrim` `/tmp/guard` `/tmp/h3ab/v2`、`/Volumes/data/tmp/topk`。
+6. 已关闭不变：注意力稀疏全线（F31+F39）、库自带 windowed kernel（F26）、ANE 线、reuse 阶梯与主因、
+   低预算运行时闸、未提交改动的主题拆分。
+
+
+## 新增（2026-10-04）：F42 的 8 条全部落地，两个新闸接进 make（F43 / progress 续 33）
+
+零 GPU 轮次。逐条改动与实测细节在 F43。
+
+**改了什么**
+- **P1** 新增可选键 `adaln_cache_meta_s{steps}`（U32[1]=AdaLN 输入宽度）。宽度已知时逐适配器判
+  `h3_lora_matches`（块侧 `transformer_blocks.0.adaln_proj.linear`、final 侧 `norm_out.linear`），
+  只拒真带 AdaLN 因子的；**宽度未知时保持原来的整批拒绝**，所以已入库的 s4/s8/s20 三档行为不变。
+  raw dump 格式与魔数没动 ⇒ 不需要重新导出；写 meta 是导出器的纯磁盘步骤，也不需要 GPU。
+  磁盘契约（magic/字段序/宽度/尺寸式/键名）从 `.c` 的文件内 enum 提到 `h3_dit_schedule.h`，成为唯一定义处。
+- **P2** env 入口读一次并折叠成 `dumping`，三处判据统一（空串不再"强制 2 行却不导出"）。
+- **P3** 缓存分支前置拒绝"无图音频参考"，理由说到位，不再建议无法满足的重建。
+- **P4** dump 改 `.tmp` + `rename`，失败清理，错误带 `strerror(errno)`。
+- **P5/P6** `--trim-to` 缺 `--model` 干净报错；trim 不再静默丢源目录已有的缓存分片（带过去并打印）。
+- **P8** 删只写不读的头参局部；`prepare_features` 按各分支真正读到的行跨度分配；溢出检查算 sizeof。
+- **P7** 两个闸：`tests/adaln_cache_probe.c` + `test_adaln_cache_codec.py`（C 常量→编译探针→比对
+  Python 侧抄的常量；sentinel 头部验字段序；C 尺寸式喂给 Python 尺寸闸；52 键名拼写）；
+  `gen_adaln_cache_fixture.py` + `test_adaln_cache_lora_gate.c`（2.1 MiB 夹具、不提交 GPU 工作，
+  靠"越过后停在 times 前缀"来证明闸放行，8 个用例）。`h3_real_dit_schedule_test` 接进 `test:` 与
+  `real-parity`，其 `submissions==52` 按路径分支为 `from_cache ? 0 : 52`。
+- README AdaLN 小节：键清单加 meta 行，LoRA 那句改成"按目标判定 + 宽度未知则全拒"。
+
+**验证**
+- `make test` **exit 0**；codec 绿、闸 8/8 绿；15 条 skip（模型/夹具未装）。
+- codec 的外部锚：C 的 `dump_bytes_41/17/9` 与三档**真实已安装**缓存的载荷字节逐行吻合。
+- Mutation：codec 5 条、LoRA 闸 4 条，全部 red 且归因到被监视的那条判定；每控制单独删
+  object+binary 重建，批后 sha256 确认源码回原样。
+- 导出器 P5/P6/P1 用 `/tmp/f42` 合成夹具实测过（含 `--verify` 从 52 键变 53 键仍 PASS）。
+
+**重排后的待办**
+1. **端到端复跑被一个事实挡住**：三棵模型树下都没有 `FL2VA/text_encoder`
+   （`find /Volumes/data/MODELS -maxdepth 3 -type d -name text_encoder` 为空），F40 复现小节里那条
+   `./h3 -d /Volumes/data/MODELS/h3c-q4-adalncache ...` 今天照抄直接报缺组件 ⇒ 拿不到用户真实调用方式
+   之前，**本轮不声称端到端复跑过**，F40 小节要就地标注"命令不完整"。要验的是"缓存档 4 步 latent
+   md5 仍等于 `6e9c2d87`"。
+2. 本机 15 条 skip 里包含刚接进去的 `h3_real_dit_schedule_test` ⇒ 它的 `from_cache ? 0 : 52` 分支
+   **未实测**，只有在装了模型与 block0 夹具的机器上才会第一次跑到。
+3. 想真正用上 P1 的收窄，需要对 s4/s8/s20 各跑一次 `install`（纯磁盘，无需 GPU）把 meta 写进去；
+   已入库缓存现在仍是"全拒"。
+4. 提交：F40 + F42/F43 两轮改动现在都在工作区未入库（`h3_dit_schedule.{c,h}`、README、Makefile、
+   4 个 tests/新文件、2 个导出脚本、三个计划文件）。按主题拆：ANE/矩形 SDPA 那批早已单独提交，
+   本轮至少分「AdaLN 缓存功能」「缓存的闸与文档」两笔。
+5. 杂务：新增 `tmp_adaln_cache_fixture`（2.1 MiB，测试自产）与 `/tmp/f42`（F43 复现小节引用）。
+   旧账：`/tmp/reuse` `/tmp/eqcost`（优先删）`/tmp/eq576` `/tmp/eq20` `/tmp/mid` `/tmp/boundary`
+   `/tmp/discrim` `/tmp/guard`、`/Volumes/data/tmp/topk`。**F40 的 `/tmp/h3ab/v2` 已被清掉**，
+   其复现小节引用的三个 dump 与 A/B latent 都不在了。
+6. 已关闭不变：注意力稀疏全线（F31+F39）、库自带 windowed kernel（F26）、ANE 线、reuse 阶梯与主因、
+   低预算运行时闸。
+
+
+## 新增（2026-10-04 下午）：整仓评审出一张优化路径表，按证据分两级（F44 / progress 续 34）
+
+用户要求"审核全部代码，看是否有优化路径"。本轮**只评审、不改代码、不跑 GPU**。
+四个子系统并行派代理评审（DiT+流式权重 / Metal 层+着色器 / VAE+编码器+ffmpeg / 引擎胶水+内存规划），
+brief 里带上了判死红线（ANE、F31+F39 稀疏注意力、F32~F38 reuse、F26），回来后我逐行复核。
+证据分级与全部条目在 F44。
+
+**我读源码复核成立的 4 条（可直接排期）**
+1. `h3_video_vae.c:934/952-959/1327` —— 流式路径每块每 tile 两次全量 blit，而 `vae->hidden`
+   本来就是 `scale_add` 原地累加器（`:653`/`:663`），state 张量与 hidden 同尺寸 ⇒ 两条 blit 全可删，
+   纯搬运不改算术。**两个代理各自独立命中同一处。** 同一模式在 `:1234/:1262`、`:1279/:1287`、
+   `:1319` 又出现三次。
+2. `h3.c:2051-2057` / `:376-388` / `:781-792` —— 同一个"`H3_CLIPPROJ_DIR` 未设"在三条路径上得到
+   三个相反答案（运行路径默认启用 ClipProj 并**把本机绝对路径写死进库**；缓存 key 记成 none；
+   `h3_load_dir` 判"必须加载 text_encoder 否则 fatal"）。**这正是 F43 §6 端到端复跑被卡的根因**，
+   不是"用户少给了个参数"。
+3. `h3.c:1375-1377` 用 `56`（那是 DiT 的 `HEADS`）当 latent 通道数，真实是 `VIDEO_CHANNELS=24`
+   （`h3_dit.c:28`，`h3_dit.c:4960` 就按它算）；`h3_dit.c:2771-2774` 按 `16` 预留 ⇒ **少留 1/3**，
+   误差方向正是把内存守卫放松（`h3_memory_plan.c:43-46` 自认的 panic 侧）。
+   代理说的"高估 8 倍"是它的推算，标未实测。
+4. `h3_text_encoder.c:623-625` + 常量 `:14-15` —— 把 `151936×5120` BF16 ≈ **1.45 GiB** 整块词表
+   embedding 传上 GPU，只 gather `tokens` 行，且 `:639-646` 随后用视觉 span 覆写 pad 行。
+
+**代理报告、我未复核收益的 14 条**记在 F44 §2：cross-chunk 的 1 GiB 全有或全无阈值、requant 末尾
+多余 submit（但改法动命令缓冲纪律，不是"删 5 行"）、label 字符串选量化器导致落到标量对照 kernel、
+`h3_head_rms_norm_bf16` 一线程一 head、NAX 收尾半线写、视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、
+终端每帧 fork、M4 每步 6 次 malloc、butterfly/4bit 三遍展-pack-unrotate、memory_plan 的 int8 建议
+被立刻清零 + 4 处文档与实际相反、显式覆盖后不重规划、`free_after_stream` 用未夹的 `rec`、
+ANE 判死线仍在构建（删除需单独批准）。
+
+**重排后的待办**
+1. **先修 F44 §1.2**（ClipProj 三处判据 + 库内机器路径）：它既是 bug，也是"F43 待办 1 的端到端
+   md5 复跑补不上"的根因。修完这条，`./h3 -d /Volumes/data/MODELS/h3c-q4-adalncache` 那类
+   只有 transformer + 软链的树才能按 README 的说法跑起来。
+2. 再修 F44 §1.3（两个常量）与 §1.1（删纯搬运 blit）、§1.4（别上载整块词表）。这四条都不需要
+   GPU 轮次就能推进，且都有现成闸口（`h3_semantic_vae_test --streaming-parity`、
+   `h3_text_tests`/`h3_real_multimodal_text_test`）。
+3. Metal 侧三条（F44 §2 的 3/4/5）**先在 M5 上取 GPU 时间**再动，本机 M4 没有 TensorOps，
+   测不出来的东西不要写成结论。
+4. "免费描述修正"这批又攒了 4 处（`main.c:82-85`、`h3.h:157-162`、
+   `h3_memory_plan.c:22-25` 与 `.h:21-28`），和 F41 待办 2 的三处合并成一轮做。
+5. 上一轮遗留未动：F40+F42/F43 两轮改动仍**未入库**；`s4/s8/s20` 的 meta 键还没写（纯磁盘）。
+6. 杂务：`/tmp/f42` 与 `tmp_adaln_cache_fixture`（2.1 MiB，测试自产，已进 .gitignore）。
+   `/tmp/h3ab/v2` 已不存在。旧账 `/tmp/reuse` `/tmp/eqcost`（优先删）等仍在。
+7. 已关闭不变：注意力稀疏全线（F31+F39）、F26、ANE 线、reuse 阶梯与主因、低预算运行时闸。
+
+
+## 新增（2026-10-04）：F44 待办 1 做完 —— ClipProj 选择折成一个规则，查出静默缓存投毒（F45 / progress 续 35）
+
+**改了什么**（`h3.c` + `h3_text_encoder.h` + README + Makefile + 新测试）
+- 单一规则、单一读取点：`h3_clipproj_classify`（纯函数，可表测）→ `h3_clipproj_resolve`
+  （全仓唯一 `getenv` 处）→ `h3_clipproj_disk_identity`（缓存 key 用同一条规则）。
+  装载路径、生成路径、key 路径此前各自手推，得到三个不同答案。
+- **语义定为"ClipProj 是 opt-in"**：DIR 与 PROJ 必须都给；只给一个明确报错；未设 ⇒ 必须加载
+  `FL2VA/text_encoder`。依据三条独立文档证据（`comfyui_nodes/__init__.py:19`、
+  `h3_text_encoder.h:75-76`、`h3.c:781-784` 本来就是这条），且所有真实调用方都给全了两个变量
+  ⇒ 没有现用法被改变。库里不再保留任何默认路径（`grep -c .lmstudio h3.c` = 0）。
+- 查出的真危害：未设时生成路径**用 ClipProj 编码、却按 `clipmodel=none`(=50 层) 记缓存 key**，
+  于是下一个未设的进程会把 ClipProj 条件当 50 层的结果读回去。此前不可见，只因为无 text_encoder
+  的树在 `h3_load_dir` 先 fatal。
+
+**验证**：新闸 `tests/test_clipproj_selection.c` 10/10（已进 `make test`）；mutation 控制 4 条
+全红且归因正确（其中一条被预检挡下后换写法重跑）；`make test` exit 0；真机两证（裁剪树 +
+两个变量 ⇒ 装载通过并停在 F40 的 6 步负向对照；只给 DIR ⇒ 新报错）。README 新增
+「Text encoder choice」小节（此前 0 处提及），并修掉 `h3_text_encoder.h` 那句教回退的注释。
+
+**F43 §6 的堵点解除**：F43 待办 1（缓存档 4 步 latent md5 仍等于 `6e9c2d87`）现在具备条件。
+
+**重排后的待办**
+1. **补 F43 待办 1**：按 F45 §6 的两个变量把 4 步渲染跑完，对 `6e9c2d87`；顺带把 F40 复现小节
+   补上"必须先设 H3_CLIPPROJ_DIR/PROJ"这一句（那小节此前抄下来是跑不通的）。
+2. F44 待办 2 剩余三条：内存估算常量（`h3.c:1375` 用 56 当通道、`h3_dit.c:2772` 用 16 而真实 24）、
+   video VAE 每块两次全量 blit（`h3_video_vae.c:952-959`）、整块词表 1.45 GiB 上载
+   （`h3_text_encoder.c:623-625`）。
+3. F44 §2 的 Metal 三条（label 选量化器 / head rmsnorm / NAX 收尾）**先在 M5 上取 GPU 时间**再动。
+4. 攒一批"免费描述修正"：`main.c:82-85` 与 `h3.h:157-162`（`--pipeline` 声称 madvise/重读盘，
+   实际 `h3.c:2313-2320` 明写不 madvise）、`h3_memory_plan.c:22-25` 与 `.h:21-28`（说 int8 可叠加，
+   实际 `h3.c:1402` 立刻清零）、F41 待办 2 的三处。
+5. 小账：`h3_conditioning_cache_dump` 的死参数 `conditioning_key`（现 `h3.c:494`，HEAD 就报，
+   未顺手改）；F44 §1.2 的描述"库内机器路径"实际是**两条**且与脚本用的 int8-convrot 目录不一致。
+6. 未入库账不变：F40 + F42/F43 + 本轮 F45 都在工作区；`s4/s8/s20` 的 meta 键仍未写（纯磁盘）。
+7. 已关闭不变：注意力稀疏全线、F26、ANE 线、reuse 阶梯与主因、低预算运行时闸。

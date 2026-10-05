@@ -131,6 +131,15 @@ h3_real_dit_block_test: tests/test_real_dit_block.o $(LIB_OBJ)
 h3_real_dit_schedule_test: tests/test_real_dit_schedule.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_adaln_cache_lora_gate_test: tests/test_adaln_cache_lora_gate.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# Includes h3.c to reach the file-static encoder-selection rule, so the
+# translation unit is compiled once; the engine symbols that test never calls are
+# left to dynamic lookup.
+h3_clipproj_selection_test: tests/test_clipproj_selection.c h3.c
+	$(CC) $(CFLAGS) -Wno-unused-parameter -I. $< -o $@ -undefined dynamic_lookup
+
 h3_real_dit_test: tests/test_real_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -184,7 +193,8 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test \
 	h3_convrot_test h3_vdn_tests h3_int8_raw_test h3_ane_staging_test \
-	h3_flash_attn_tests
+	h3_flash_attn_tests h3_real_dit_schedule_test \
+	h3_adaln_cache_lora_gate_test h3_clipproj_selection_test
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -209,6 +219,17 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	./h3_ane_staging_test
 	./h3_vdn_tests
 	./h3_flash_attn_tests
+	@python3 tests/test_adaln_cache_codec.py
+	@python3 tests/gen_adaln_cache_fixture.py tmp_adaln_cache_fixture
+	./h3_adaln_cache_lora_gate_test tmp_adaln_cache_fixture
+	./h3_clipproj_selection_test
+	@if test -f misc/fixtures/h3_real_dit_block0_bf16.safetensors && \
+	         test -d $(DIT_MODEL)/FL2VA/transformer; then \
+		./h3_real_dit_schedule_test $(DIT_MODEL) \
+			misc/fixtures/h3_real_dit_block0_bf16.safetensors; \
+	else \
+		echo "skip: real DiT block-0 fixture or transformer weights are not installed"; \
+	fi
 	@if test -d $(DIT_MODEL)/FL2VA/transformer; then \
 		./h3_int8_raw_test $(DIT_MODEL)/FL2VA/transformer; \
 	else \
@@ -286,9 +307,11 @@ parity: h3_metal_tests h3_bf16_tests h3_text_tests
 	./h3_bf16_tests misc/fixtures/h3_dit_bf16.safetensors
 	./h3_text_tests misc/fixtures/h3_text_bf16.safetensors
 
-real-parity: h3_real_prompt_test h3_real_dit_block_test
+real-parity: h3_real_prompt_test h3_real_dit_block_test h3_real_dit_schedule_test
 	./h3_real_prompt_test MiniMax-H3 misc/fixtures/h3_real_prompt_bf16.safetensors
 	./h3_real_dit_block_test MiniMax-H3 misc/fixtures/h3_real_dit_block0_bf16.safetensors
+	./h3_real_dit_schedule_test MiniMax-H3 \
+		misc/fixtures/h3_real_dit_block0_bf16.safetensors
 
 clipproj-golden: h3_clipproj_test
 	bash clipproj_golden.sh
@@ -321,6 +344,7 @@ clean:
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
+		h3_adaln_cache_lora_gate_test h3_clipproj_selection_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 		h3_ane_int8_test h3_ane_staging_test h3_ane_block_test \
 		h3_ane_full_block_test h3_ane_vae_test h3_ane_vae_residency_test \

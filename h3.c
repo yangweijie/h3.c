@@ -367,29 +367,81 @@ struct h3_cache_header {
     uint8_t conditioned;
 };
 
+/* --- ClipProj text-encoder selection: one rule, three readers -----------------
+ *
+ * The ClipProj encoder is opt-in. `H3_CLIPPROJ_DIR` must name a Qwen3-VL-4B
+ * directory *and* `H3_CLIPPROJ_PROJ` the projection; that pairing is what makes a
+ * checkpoint tree without `FL2VA/text_encoder` usable at all, which is how the
+ * ComfyUI nodes and the benchmark scripts drive the engine. Anything else -- unset,
+ * empty, `0` or `off` -- selects the 50-layer encoder and makes
+ * `FL2VA/text_encoder` required.
+ *
+ * The load path (`h3_load_dir`), the generate path (`h3_generate`) and the
+ * conditioning cache key (`h3_conditioning_disk_key`) all read this. They used to
+ * disagree: with the variable unset the generate path fell back to a
+ * machine-specific ClipProj directory, so the conditioning it produced came from
+ * ClipProj while the disk key recorded `clipmodel=none`, which means "50-layer" to
+ * every reader. The key is derived from the encoder choice, so that mismatch let
+ * one encoder's conditioning be handed back as the other's. The library carries no
+ * default paths for either directory. */
+typedef enum {
+    H3_CLIPPROJ_50_LAYER = 0,
+    H3_CLIPPROJ_CLIPPROJ = 1,
+    /* DIR set without PROJ: refuse rather than reach for a built-in projection. */
+    H3_CLIPPROJ_INCOMPLETE = 2
+} h3_clipproj_mode;
+
+static h3_clipproj_mode h3_clipproj_classify(const char *configured_directory,
+                                             const char *configured_projection,
+                                             const char **directory_out,
+                                             const char **projection_out) {
+    if (!configured_directory || !*configured_directory ||
+        strcmp(configured_directory, "0") == 0 ||
+        strcmp(configured_directory, "off") == 0)
+        return H3_CLIPPROJ_50_LAYER;
+    if (!configured_projection || !*configured_projection)
+        return H3_CLIPPROJ_INCOMPLETE;
+    if (directory_out) *directory_out = configured_directory;
+    if (projection_out) *projection_out = configured_projection;
+    return H3_CLIPPROJ_CLIPPROJ;
+}
+
+static h3_clipproj_mode h3_clipproj_resolve(const char **directory,
+                                            const char **projection) {
+    return h3_clipproj_classify(getenv("H3_CLIPPROJ_DIR"),
+                                getenv("H3_CLIPPROJ_PROJ"),
+                                directory, projection);
+}
+
+/* The encoder identity a conditioning cache key records: the ClipProj pair when
+ * one is fully configured, otherwise "none"/"none" -- which is the 50-layer
+ * encoder, and also what a half-configured request falls back to. */
+static void h3_clipproj_disk_identity(const char **directory,
+                                      const char **projection) {
+    const char *configured_directory = NULL;
+    const char *configured_projection = NULL;
+    if (h3_clipproj_resolve(&configured_directory,
+                            &configured_projection) == H3_CLIPPROJ_CLIPPROJ) {
+        *directory = configured_directory;
+        *projection = configured_projection;
+        return;
+    }
+    *directory = "none";
+    *projection = "none";
+}
+
 static int h3_conditioning_disk_key(h3_ctx *ctx, const char *conditioning_key,
                                      char **disk_key) {
     (void)ctx;
-    /* conditioning_key covers prompt + render + media refs but NOT the
-     * encoder choice (clipproj vs 50-layer) which is env-driven and must be
-     * locked across processes for a persistent cache. */
-    int use_clipproj = 0;
-    const char *cp_dir = getenv("H3_CLIPPROJ_DIR");
-    const char *clip_proj = NULL;
+    /* conditioning_key covers prompt + render + media refs but NOT the encoder
+     * choice, which is env-driven and must be locked across processes for a
+     * persistent cache. A half-configured ClipProj request keys as the 50-layer
+     * encoder: the generate path is what reports it, and keying it the same as
+     * the fallback keeps a misconfigured run from storing entries that a
+     * correctly configured run would then read back as its own. */
     const char *cp_model = NULL;
-    if (cp_dir && *cp_dir && strcmp(cp_dir, "0") != 0 &&
-        strcmp(cp_dir, "off") != 0) {
-        use_clipproj = 1;
-        clip_proj = getenv("H3_CLIPPROJ_PROJ");
-    } else {
-        clip_proj = "none";
-    }
-    if (use_clipproj) {
-        cp_model = cp_dir;
-        if (!clip_proj) clip_proj = "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3";
-    } else {
-        cp_model = "none";
-    }
+    const char *clip_proj = NULL;
+    h3_clipproj_disk_identity(&cp_model, &clip_proj);
     h3_key key = {0};
     h3_key_file(&key, "clipmodel", cp_model);
     h3_key_file(&key, "clipproj", clip_proj);
@@ -772,19 +824,16 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         h3_free(ctx);
         return NULL;
     }
-    /* When the ClipProj text encoder is active (H3_CLIPPROJ_DIR set and not
-     * "0"/"off"), FL2VA/text_encoder is never loaded at runtime: the 4B+ClipProj
-     * path replaces the 50-layer encoder. A missing/partial text_encoder
-     * directory is therefore tolerated. It stays required for the
-     * H3_CLIPPROJ_DIR=0/off fallback to the 50-layer encoder. */
+    /* A missing or partial FL2VA/text_encoder is tolerated exactly when some
+     * ClipProj mode was requested -- see h3_clipproj_resolve for the rule. The
+     * half-configured case is tolerated here so the real complaint comes from
+     * the generate path, which can name both variables. */
     {
-        const char *cp_dir = getenv("H3_CLIPPROJ_DIR");
-        int clipproj_active = cp_dir && *cp_dir &&
-                              strcmp(cp_dir, "0") != 0 &&
-                              strcmp(cp_dir, "off") != 0;
+        int clipproj_requested =
+            h3_clipproj_resolve(NULL, NULL) != H3_CLIPPROJ_50_LAYER;
         if (!h3_inventory(ctx, "FL2VA/text_encoder",
                           &ctx->model.text_encoder)) {
-            if (!clipproj_active) {
+            if (!clipproj_requested) {
                 snprintf(h3_global_error, sizeof(h3_global_error), "%s",
                          ctx->error);
                 h3_free(ctx);
@@ -2048,17 +2097,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        const char *cp_dir = getenv("H3_CLIPPROJ_DIR");
-        if (!cp_dir || !*cp_dir)
-            /* Default to the 4B + ClipProj text encoder so the 62 GiB encoder
-               is never loaded. Set H3_CLIPPROJ_DIR=0 (or =off) to fall back to
-               the 50-layer encoder at FL2VA/text_encoder. */
-            cp_dir = "/Volumes/data/.lmstudio/models/Qwen3-VL-4B-Instruct";
-        int use_clipproj = strcmp(cp_dir, "0") != 0 && strcmp(cp_dir, "off") != 0;
-        if (use_clipproj) {
-            const char *cp_proj = getenv("H3_CLIPPROJ_PROJ");
-            if (!cp_proj)
-                cp_proj = "/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3";
+        const char *cp_dir = NULL;
+        const char *cp_proj = NULL;
+        h3_clipproj_mode clipproj = h3_clipproj_resolve(&cp_dir, &cp_proj);
+        if (clipproj == H3_CLIPPROJ_INCOMPLETE) {
+            h3_set_error(ctx, "H3_CLIPPROJ_DIR is set but H3_CLIPPROJ_PROJ is not; "
+                              "the ClipProj encoder needs both, or unset "
+                              "H3_CLIPPROJ_DIR to use the 50-layer encoder at "
+                              "FL2VA/text_encoder");
+            goto cleanup;
+        }
+        if (clipproj == H3_CLIPPROJ_CLIPPROJ) {
             h3_progress_emit(&progress, "text encoder (clipproj)", 0, 50);
             if (!h3_text_encode_clipproj_bf16(
                     cp_dir, cp_proj, "h3_shaders.metal", ids, token_count,

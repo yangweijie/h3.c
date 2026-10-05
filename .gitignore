@@ -31,3 +31,4 @@ libh3.a
 __pycache__/
 candidate.npz
 tmp_lora_test/
+tmp_adaln_cache_fixture/

@@ -72,8 +72,12 @@ void h3_text_embedding_free(h3_text_embedding *embedding);
  *
  * This is the in-engine equivalent of clipproj_harness.py: it removes the need
  * to read the ~62 GiB 50-layer encoder, replacing it with a ~5.5 GiB 4B model
- * plus a tiny projection. Enable by pointing H3_CLIPPROJ_DIR at a BF16
- * Qwen3-VL-4B-Instruct directory (H3_CLIPPROJ_PROJ overrides the projection dir). */
+ * plus a tiny projection. Enable it by setting BOTH H3_CLIPPROJ_DIR (a Qwen3-VL-4B
+ * directory) and H3_CLIPPROJ_PROJ (the projection directory); with either one
+ * missing the engine uses the 50-layer encoder at FL2VA/text_encoder, and setting
+ * one without the other is refused rather than guessed at. The engine holds no
+ * default paths: see h3_clipproj_resolve in h3.c, which is the single rule the
+ * load, generate and conditioning-cache-key paths share. */
 int h3_text_encode_clipproj_bf16(
                         const char *qwen4b_directory,
                         const char *projection_directory,

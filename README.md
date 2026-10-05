@@ -1049,6 +1049,109 @@ the 128 GB M5 Max, clean end-to-end image+audio and embedded-video+audio renders
 completed in 74.58 and 76.99 seconds respectively, each with about a 40.1 GB
 peak physical footprint and zero swaps.
 
+### AdaLN modulation cache (checkpoint-provided)
+
+Each DiT block's AdaLN modulation is a pure function of the sigma schedule, and
+`h3_dit_schedule_precompute` materializes all of it before denoising begins,
+projecting one block at a time and releasing each 496 MiB matrix as soon as it
+has been applied. The 51 `adaln_proj.linear` matrices are therefore read exactly
+once per run and never touched again -- yet on the released architecture they are
+the single largest tensor group in the checkpoint, 24.29 GiB of its 61.73 GiB.
+A checkpoint can ship the *modulation* instead and drop them outright.
+
+The engine adopts such a checkpoint with no flag at all: when
+`blocks.0.adaln_cache_s<steps>` is present, the cache path is selected. A cache is
+keyed by `--steps`, so several coexist in one directory and switching step counts
+changes nothing but the flag:
+
+```
+adaln_cache_s8.safetensors
+  adaln_cache_times_s8        F32  [17]          schedule key
+  blocks.N.adaln_cache_s8     BF16 [17, 96768]
+  final_layer.adaln_cache_s8  BF16 [17, 10752]
+  adaln_cache_meta_s8         U32  [1]           AdaLN input width (optional)
+```
+
+`adaln_cache_times_s<steps>` pins the sigma schedule the cache was built from,
+and the loader requires the rows this run actually indexes to match it bit for
+bit, so a cache built for a different step count fails loudly instead of quietly
+applying the wrong modulation at every step.
+
+One cache covers all three conditioning modes, because the condition rows are
+appended *after* the step rows in a fixed order (visual, then audio) and the
+modes therefore nest: text-to-video uses `2*steps - 1` rows, a first or last
+frame `2*steps`, a reference image `2*steps + 1`. The exporter materializes both
+condition rows -- `H3_DIT_ADALN_CACHE_DUMP` forces them on -- so the shorter modes
+match as a prefix, for the cost of two unused rows (~20 MiB). A standalone audio
+reference is the one mode no cache covers, since its single condition row would
+land where the visual row sits; the loader rejects it rather than misapplying the
+row, and it is reachable only through the C API.
+
+Build caches by exporting from a checkpoint that still has the weights -- the
+export run is an ordinary run, so it doubles as the full-weight baseline:
+
+```sh
+for steps in 4 8 20; do
+  H3_DIT_ADALN_CACHE_DUMP=/tmp/adaln_s$steps.raw ./h3 -d <full checkpoint> \
+    --ssd-streaming ... --steps $steps
+done
+python fastvideo_qad/scripts/export_h3_adaln_cache.py \
+  --dump /tmp/adaln_s4.raw --dump /tmp/adaln_s8.raw --dump /tmp/adaln_s20.raw \
+  --model <full checkpoint>/FL2VA/transformer \
+  --trim-to <new dir>/FL2VA/transformer
+```
+
+`--trim-to` writes a *new* directory and drops only the `adaln_proj` matrices, so
+the source is never modified; `--verify` re-checks an existing one instead of
+writing. A row costs 9.25 MiB, so the three caches come to 83.2, 157.2 and
+379.2 MiB.
+
+Measured on a 4-bit grouped checkpoint (`export_h3_q4_native.py`, 35.93 GiB),
+same prompt, 256x256, 22 frames, seed 42:
+
+| steps | rows | cache | full weights | cached | latent md5 | mp4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 | 9 | 83.2 MiB | 151 s | 119 s | `6e9c2d87` | identical |
+| 8 | 17 | 157.2 MiB | 250 s | 219 s | `a7f85c8b` | identical |
+| 20 | 41 | 379.2 MiB | 556 s | 501 s | `dc8c5d41` | identical |
+
+Both the latent and the mp4 container are byte-identical in all three, so the
+whole pipeline including VAE decode is unaffected; the saving is simply the
+24.29 GiB of AdaLN weights the run no longer reads. The cached checkpoint is
+12.25 GiB. An adapter that targets AdaLN cannot be used with a cached checkpoint
+-- it merges into exactly the weights the cache replaced -- so `norm_out.linear`
+and `blocks.N.adaln_proj.linear` factors are refused by name, while an adapter
+with no AdaLN factor (the VDN `.default` set, for instance) loads unchanged.
+Which adapters qualify is decided by the `adaln_cache_meta_s<steps>` width key
+the exporter writes when it can read the width from the checkpoint; caches
+exported before that key carry no width, and a cache with no declared width
+refuses every adapter. Block thinning (`--layers`) stays exact, because the gate
+scores it ranks come from the modulation itself, which the cache reproduces bit
+for bit.
+
+### Text encoder choice (`H3_CLIPPROJ_DIR` / `H3_CLIPPROJ_PROJ`)
+
+The engine can encode prompts two ways: the released 50-layer Qwen3-VL encoder at
+`FL2VA/text_encoder` (~62 GiB), or a 4B encoder plus the ClipProj MLP (~5.5 GiB + a
+small projection). The ClipProj path is opt-in and needs **both** variables:
+
+```sh
+export H3_CLIPPROJ_DIR=/path/to/Qwen3-VL-4B-Instruct        # the 4B encoder tree
+export H3_CLIPPROJ_PROJ=/path/to/ClipProj-MiniMax-H3        # the projection weights
+./h3 -d /path/to/model --ssd-streaming ...
+```
+
+With both set, `FL2VA/text_encoder` is never read and a model tree without it -- like
+a trimmed checkpoint directory -- loads normally. Otherwise the 50-layer encoder is
+required, and a tree missing it fails at load. Setting one variable without the other
+is an error naming both, because the engine keeps no default paths for either.
+
+This matters for the conditioning cache: its key records which encoder produced an
+entry, so a run that encoded with ClipProj while the key said "none" could hand one
+encoder's conditioning back as the other's. All three readers of this setting (load,
+generate, cache key) share one rule -- `h3_clipproj_resolve` in `h3.c` -- and
+`make test` pins the table (`tests/test_clipproj_selection.c`).
+
 ### Profiling and diagnostic paths
 
 `--profile` reports each Metal-backed phase separately: wall time, CPU-side

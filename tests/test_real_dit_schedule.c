@@ -43,6 +43,14 @@ int main(int argc, char **argv) {
     if (!gpu) die(error);
     h3_sigma_schedule sigmas;
     if (!h3_schedule_build(20, &sigmas)) die("cannot build 20-step schedule");
+    /* Which path this checkpoint takes decides what residency even means: the
+     * projecting path runs 52 submissions, a cached one loads 51 tensors
+     * straight into buffers and submits nothing. */
+    char cache_key[H3_ADALN_CACHE_NAME_MAX];
+    snprintf(cache_key, sizeof(cache_key), H3_ADALN_CACHE_BLOCK_FORMAT, 0u, 20);
+    int from_cache = h3_weight_find(weights, cache_key, NULL) != NULL;
+    fprintf(stderr, "AdaLN schedule source: %s\n",
+            from_cache ? "checkpoint-provided cache" : "projection from weights");
     h3_dit_schedule *schedule = h3_dit_schedule_precompute(
         weights, gpu, &sigmas, 1, 0, NULL, 0, progress, NULL, error,
         sizeof(error));
@@ -116,7 +124,7 @@ int main(int argc, char **argv) {
            h3_dit_schedule_time_rows(schedule),
            (double)stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0),
            stats.gpu_seconds, (unsigned long long)stats.submissions);
-    if (stats.submissions != 52)
+    if (stats.submissions != (from_cache ? 0ull : 52ull))
         die("AdaLN setup did not preserve one-projection-at-a-time residency");
 
     free(want);
