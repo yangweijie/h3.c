@@ -2599,6 +2599,8 @@ VAE 编码器下采样），而 DiT 序列用的是 `h3_video_latent_t()`（`((f
 修前的 3 / 9 排成同代码序列）。`make test` exit 0：新测试 14 条断言全绿、全仓 50 行 `  ok  `
 + 11 行 `ok…`、15 skip、0 FAIL、0 `warning:`。
 
-**状态**：本步已入库两笔 —— `64599eb`（F50+F51 代码 + `tests/test_memory_plan_inverse.c` +
-Makefile）、`d944a35`（F51 记录与 F48 §2/F48 §3 就地更正）。工作区干净，**仍未 push**
-（`main...origin/main [ahead 5]`）。
+**状态**：本步入库三笔 —— `64599eb`（F50+F51 代码 + `tests/test_memory_plan_inverse.c` +
+Makefile）、`d944a35`（F51 记录与 F48 §2/F48 §3 就地更正）、`5e279a3`（把上一版状态行里
+"h3_host.c/h 待提交"这个过期前提改掉 —— 那两个文件在 `0301614` 就入库了）。
+工作区干净，**全部未 push**（`ahead` 数字会随每笔入库变化，故不写进记录，以
+`git status -sb` 现查为准）。
