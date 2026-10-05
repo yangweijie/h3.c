@@ -5306,3 +5306,77 @@ python3 fastvideo_qad/scripts/add_h3_adaln_cache_meta.py \
   --source-model /Volumes/data/MODELS/h3c-q4-native/FL2VA/transformer \
   --backup-dir /Volumes/data/tmp/h3scr/f53/backup --dry-run                   # 先看字节账
 ```
+
+---
+
+# F54（2026-10-06）：给会改用户模型文件的工具补测试，测试反过来逼出一处"半途而废"的写序
+
+F53 自己在保留意见里记了"这个工具还没有测试"。本轮补上（`tests/test_adaln_cache_meta_tool.py`，
+20 条断言，已进 `make test`），而测试期间确实逼出了一个真缺陷 —— 不是写法问题，是**顺序**问题。
+
+## 1. 测试钉住的五条承诺
+
+1. **宽度来自 checkpoint，不是来自工具**：夹具的 source 声明 **1344** —— 既不是引擎真实的 2688，
+   也不是 `gen_adaln_cache_fixture.py` 自己的 `TIME_DIM`。所以任何写死其中一个值的实现都会在
+   第一条断言上变红，而不是"恰好对上"而蒙混过去。
+2. **载荷一个字节都不动**：逐个既有张量比 dtype/shape/offsets 全等 + 载荷区 SHA-256 全等 +
+   文件增长 = 头部增量 + 4。
+3. **原文件先落备份目录**再 rename。
+4. **可重入**：第二次运行退出 0、报 `already carries`、文件字节不变（三条独立断言，见 §3）。
+5. **宁可拒也不猜、也不半做**：三种拒各配一条"该改的份没被动过" ——
+   source 无 `adaln_proj`、分片名不带步数、头部带 `__metadata__`。
+
+## 2. 测试逼出的真改动：所有校验必须在动盘之前做完
+
+入库那一版（`git show 5075499`）是"逐份 `rewrite()`"，而**两道拒都在循环体内**：步数名校验在
+`for shard in shards:` 里面，`__metadata__` 校验在 `rewrite()` 里面。于是带 `__metadata__` 的那份
+排在后面时，前面的份已经被人模型文件级地重写过了 —— 目录会变成"一部分有宽度键、一部分仍拒一切
+适配器"的半做状态。本轮我先只把步数名那道提到前面，**这就是修了一半而不自知**；把它逼出来的是新
+加的用例 `a *later* shard carries __metadata__`（s8 带、s1 不带）。**这句不是推测，是量出来的**：
+把测试对着入库那一版跑（`git show 5075499` 的文件就地换入、跑完换回并比 sha256），红恰好 2 条，
+都是那对"先被写的那份应没被动过"的伴随断言 —— 步数名那条与 `__metadata__` 那条各一；而"是否拒绝"
+本身在两版下都绿，因为旧版确实拒了，只是**拒之前已经改完前一份**。这正是半做状态的可观测形状。
+最终形态是把"读 + 所有会拒的判断"收进
+`prepare()`、把"写 + 复核"收进 `apply()`，main 先跑完全部 `prepare()` 再进 `apply()`。
+真机侧也复验了改动无害：重跑工具对三份已装分片全报 `already carries`，
+s4 的 md5 仍是 `b2ce74529d1f63a1f0e482d62586fb09`、mtime 仍是 05:07。
+
+## 3. 合并断言把红的因写错了，于是拆开
+
+可重入原来是一条 `rc == 0 and "already carries" in stdout`。变异 M3（去掉 `return None` 短路）
+把它打红，但红的**标签**说"第二次运行应报 already present"，而实际 stdout 里那句照打不误，
+真正坏的是退出码（工具自己报 `short read at 352`）。也就是说这条断言的标签会把读者指向
+错误的那一半 —— 已拆成三条（退出码 / 那句在不在 / 字节不变），拆完 M3 的红就自报了原因。
+
+## 4. 变异对照（四条，每条都跑完整测试并把工具还原后比 sha256）
+
+前置检查照例：待替换文本在基线出现 1 次、变异文本出现 0 次。
+
+| 变异 | 红数 | 红落在哪 |
+|---|---|---|
+| M1 写死 `2688` | 2 | 宽度那条 + 工具自己的读回闸 |
+| M2 meta 张量的 offsets 写成 `[0,4]` | 3 | offsets 全等、"从旧载荷末尾开始"、读回值 |
+| M3 去掉 `already carries` 短路 | 1 | "第二次运行退出 0"（附工具的 `short read`） |
+| M4 去掉步数名预检 | 2 | 那条拒（rc 变 0）+ "先写的那份没被动过" |
+
+**一条覆盖边界要写清**：M2 下"载荷区哈希相同"这条**仍绿** —— 因为实现始终把 4 字节追加在末尾，
+M2 只让**头部声明**与字节脱钩，没真的移走任何字节。所以"载荷不动"这件事是被 offsets/读回那
+两条守住的，不是被哈希那条守住的；哈希那条守的是另一种破坏（真抄错数据）。
+
+## 5. 复验与保留
+
+- `python3 tests/test_adaln_cache_meta_tool.py`：EXIT=0，20 条 `  ok  `、0 条 FAIL。
+- `make test`：EXIT=0，83 行 `  ok  `（比上轮 +20，正是新测试）、15 行 `ok:`/`PASS` 收尾、
+  15 skip、0 FAIL；该次构建 0 条 `warning:`。
+- **没测的**：这个测试不启动 C 加载器，所以"补键后的文件真能被引擎读到"仍只有 F53 那轮
+  真文件 A/B（note 行与点名 2688 的拒绝行）作证据。两边互补，别把这条测试当成已验过 C 侧。
+
+## 6. 复现
+
+```bash
+python3 tests/test_adaln_cache_meta_tool.py                       # EXIT=0，20 条 ok
+python3 fastvideo_qad/scripts/add_h3_adaln_cache_meta.py \
+  --cache-dir /Volumes/data/MODELS/h3c-q4-adalncache/FL2VA/transformer \
+  --source-model /Volumes/data/MODELS/h3c-q4-native/FL2VA/transformer \
+  --backup-dir /Volumes/data/tmp/h3scr/f53/backup --dry-run       # 三份全报 already carries
+```
