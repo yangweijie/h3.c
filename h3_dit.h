@@ -105,6 +105,25 @@ size_t h3_dit_latent_elements(int latent_t, int latent_h, int latent_w,
  * h3_dit_activation_bytes in h3_dit.c for the configuration it assumes. */
 size_t h3_dit_activation_bytes(size_t sequence);
 
+/* Row count the memory plan has to size against before a layout exists. Mirrors
+ * what h3_layout_build() emits: the video grid plus one frame grid per first/last
+ * keyframe condition, two audio rows per audio latent frame, and
+ * `reference_count` additional target-sized presentations (references are sized
+ * down from the target canvas, so counting them at full size bounds them).
+ * `text_rows_upper_bound` is an upper bound on the prompt's token count --
+ * callers pass the prompt length, since BPE never yields more tokens than
+ * characters and tokenizing is not available this early. h3_generate() checks
+ * this against the real layout and complains when it under-shoots. */
+size_t h3_dit_sequence_estimate(int width, int height, int frames,
+                               size_t text_rows_upper_bound,
+                               size_t condition_count, size_t reference_count);
+
+/* Latent + activation bytes a memory plan should reserve for the same run, from
+ * the same arguments as h3_dit_sequence_estimate(). */
+uint64_t h3_dit_plan_bytes(int width, int height, int frames,
+                           size_t text_rows_upper_bound, size_t condition_count,
+                           size_t reference_count);
+
 /* One raw data-ward velocity evaluation. Input/output video layout is
  * [24,T,H,W], audio is [32,2,T], all F32 on the host boundary. */
 int h3_dit_forward(h3_dit *dit, int step,

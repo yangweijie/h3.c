@@ -754,20 +754,20 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                    (double)total_weight / gib);
             if (state->params.memory_plan_auto) {
                 h3_memory_plan plan;
-                /* Same sizing h3_generate feeds the planner: the joint latent the
-                 * run allocates, not a hand-copied channel count. */
+                /* The same sizing h3_generate feeds the planner. The prompt is
+                 * per-command here rather than part of the session parameters,
+                 * so the text rows are left out of this preview; they are the
+                 * smallest term, and h3_generate checks its own estimate against
+                 * the layout it actually builds. */
                 int canvas_w = state->params.render_width
                     ? state->params.render_width : state->params.width;
                 int canvas_h = state->params.render_height
                     ? state->params.render_height : state->params.height;
-                h3_temporal_shape shape = h3_temporal(state->params.frames);
-                int latent_w = 0, latent_h = 0;
-                h3_latent_canvas(canvas_w, canvas_h, &latent_w, &latent_h);
-                uint64_t activation =
-                    (uint64_t)h3_dit_latent_elements(shape.video_t, latent_h,
-                                                     latent_w,
-                                                     shape.audio_t) *
-                        sizeof(float) + gib;
+                uint64_t activation = gib + h3_dit_plan_bytes(
+                    canvas_w, canvas_h, state->params.frames, 0,
+                    (size_t)((state->params.first_frame != NULL) +
+                             (state->params.last_frame != NULL)),
+                    state->params.reference_count);
                 const uint64_t dit_blocks = m->fl2va_transformer.bytes +
                     (m->ref2va_transformer.bytes
                          ? m->ref2va_transformer.bytes : 0);
@@ -775,8 +775,35 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                     2 * (dit_blocks / H3_DEFAULT_DIT_LAYERS) +
                     m->video_vae.bytes / H3_VIDEO_VAE_LAYERS;
                 if (h3_memory_plan_auto(dev, total_weight, streamed_resident,
-                                        activation, &plan) == 0)
+                                        activation, &plan) == 0) {
                     printf("Auto plan: %s\n", plan.reason);
+                    /* The inverse question, from the same ceiling the plan used:
+                     * how long a clip fits once the streamed weights are paid
+                     * for. Text rows are left out here (the prompt is per
+                     * command), so this is the optimistic end. */
+                    uint64_t ceiling = h3_memory_plan_budget_bytes(dev);
+                    uint64_t room = ceiling > streamed_resident
+                        ? ceiling - streamed_resident : 0;
+                    int longest = h3_memory_plan_frames_within(
+                        room, canvas_w, canvas_h, 0,
+                        (size_t)((state->params.first_frame != NULL) +
+                                 (state->params.last_frame != NULL)),
+                        state->params.reference_count);
+                    if (!longest)
+                        printf("Longest clip at %dx%d: none -- a 22-frame chunk "
+                               "does not fit the %llu GiB left after %llu GiB of "
+                               "streamed weights\n",
+                               canvas_w, canvas_h,
+                               (unsigned long long)(room / gib),
+                               (unsigned long long)(streamed_resident / gib));
+                    else
+                        printf("Longest clip at %dx%d: %d frames%s "
+                               "(%llu of a %llu GiB ceiling)\n",
+                               canvas_w, canvas_h, longest,
+                               longest == H3_PLAN_FRAMES_CEILING ? "+" : "",
+                               (unsigned long long)(room / gib),
+                               (unsigned long long)(ceiling / gib));
+                }
             } else {
                 printf("Auto memory plan: off (manual knobs)\n");
             }

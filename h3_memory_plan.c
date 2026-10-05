@@ -1,5 +1,7 @@
 #include "h3_memory_plan.h"
 
+#include "h3_dit.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -7,6 +9,46 @@
 /* Physical RAM kept for the OS / window server so a greedy long clip cannot
  * starve the system into a panic. */
 #define H3_OS_RESERVE_GIB 4ull
+
+uint64_t h3_memory_plan_budget_bytes(const h3_device_info *device) {
+    if (!device || device->recommended_working_set == 0) return 0;
+    /* Cap the budget by Metal's recommendation *and* by physical RAM minus an
+     * OS reserve: on a unified-memory Mac the GPU's wired allocations cannot be
+     * swapped, so trusting Metal's optimistic recommendation alone lets a long
+     * clip overrun physical RAM and panic the system. */
+    uint64_t target = (device->recommended_working_set * 80ull) / 100ull;
+    const uint64_t physical = device->physical_memory;
+    const uint64_t reserve = H3_OS_RESERVE_GIB * H3_GIB;
+    if (physical > reserve) {
+        const uint64_t phys_target = ((physical - reserve) * 85ull) / 100ull;
+        if (phys_target < target) target = phys_target;
+    }
+    return target;
+}
+
+int h3_memory_plan_frames_within(uint64_t available_bytes, int width, int height,
+                                 size_t text_rows_upper_bound,
+                                 size_t condition_count,
+                                 size_t reference_count) {
+    /* Aligned clip lengths are 22 + 17k: h3_align_frame_count() leaves those
+     * fixed, and the video VAE is trained on whole 22-frame chunks. Searching
+     * that ladder rather than raw frame counts means the answer is a length the
+     * caller can actually request. */
+    size_t low = 0;
+    size_t high = (size_t)((H3_PLAN_FRAMES_CEILING - 22) / 17);
+    if (h3_dit_plan_bytes(width, height, 22, text_rows_upper_bound,
+                          condition_count, reference_count) > available_bytes)
+        return 0;
+    while (low < high) {
+        size_t middle = low + (high - low + 1) / 2;
+        uint64_t needed = h3_dit_plan_bytes(
+            width, height, (int)(22 + 17 * middle), text_rows_upper_bound,
+            condition_count, reference_count);
+        if (needed <= available_bytes) low = middle;
+        else high = middle - 1;
+    }
+    return (int)(22 + 17 * low);
+}
 
 /*
  * Decide an automatic memory plan from the device's recommended working set and
@@ -40,17 +82,9 @@ int h3_memory_plan_auto(const h3_device_info *device,
     }
 
     const uint64_t rec = device->recommended_working_set;
-    /* Cap the budget by Metal's recommendation *and* by physical RAM minus an
-     * OS reserve: on a unified-memory Mac the GPU's wired allocations cannot
-     * be swapped, so trusting Metal's optimistic recommendation alone lets a
-     * long clip overrun physical RAM and panic the system. */
-    uint64_t target = (rec * 80ull) / 100ull; /* 80% headroom cap */
-    const uint64_t physical = device->physical_memory;
-    const uint64_t reserve = H3_OS_RESERVE_GIB * H3_GIB;
-    if (physical > reserve) {
-        const uint64_t phys_target = ((physical - reserve) * 85ull) / 100ull;
-        if (phys_target < target) target = phys_target;
-    }
+    /* One definition of the ceiling, shared with the inverse query in
+     * h3_memory_plan_frames_within() so the two cannot drift apart. */
+    const uint64_t target = h3_memory_plan_budget_bytes(device);
     const uint64_t steady = total_weight_bytes + activation_bytes;
     const uint64_t steady_streamed =
         streamed_resident_bytes + activation_bytes;

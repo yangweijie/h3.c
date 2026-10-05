@@ -1415,6 +1415,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                                params->width;
     int render_height = params->render_height ? params->render_height :
                                                  params->height;
+    /* Rows the run will need, estimated before the layout exists, plus the two
+     * buffers that scale with it: the joint latent and the DiT's run-long
+     * activation arena. h3_generate() checks the estimate against the real
+     * layout below; the prompt's byte length bounds its token count because BPE
+     * never emits more tokens than bytes. */
+    size_t condition_count = (size_t)((params->first_frame != NULL) +
+                                       (params->last_frame != NULL));
+    size_t planned_rows = h3_dit_sequence_estimate(
+        render_width, render_height, params->frames, strlen(prompt),
+        condition_count, params->reference_count);
+    uint64_t planned_activation = h3_dit_plan_bytes(
+        render_width, render_height, params->frames, strlen(prompt),
+        condition_count, params->reference_count);
     /* Apply the automatic memory-tier planner to an effective copy of the
      * parameters, so small-RAM Macs pick a viable strategy from the device's
      * recommended working set. An explicit ssd_streaming/int8 choice or
@@ -1429,21 +1442,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             ctx->model.audio_vae.bytes;
         if (ctx->model.ref2va_transformer.bytes)
             total_weight += ctx->model.ref2va_transformer.bytes;
-        /* The joint video+audio latent the run allocates, sized the way the run
-         * sizes it (4:1 temporal, /16 spatial, VIDEO_CHANNELS and
-         * AUDIO_CHANNELS*AUDIO_STREAMS channels). The previous expression put
-         * `56` -- the DiT head count -- in the channel slot and skipped the
-         * temporal compression, which over-stated this by roughly 56/24*4. */
-        h3_temporal_shape planned = h3_temporal(eff.frames);
-        int planned_latent_w = 0;
-        int planned_latent_h = 0;
-        h3_latent_canvas(render_width, render_height,
-                         &planned_latent_w, &planned_latent_h);
-        uint64_t activation =
-            (uint64_t)h3_dit_latent_elements(planned.video_t, planned_latent_h,
-                                             planned_latent_w,
-                                             planned.audio_t) * sizeof(float) +
-            1024ull * 1024 * 1024;
+        /* Latent + DiT activations, both estimated the way the run sizes them:
+         * 4:1 temporal, /16 spatial, VIDEO_CHANNELS and
+         * AUDIO_CHANNELS*AUDIO_STREAMS channels. The expression before this put
+         * `56` -- the DiT head count -- in the channel slot, skipped the temporal
+         * compression, and ignored the activation arena entirely. */
+        uint64_t activation = planned_activation + 1024ull * 1024 * 1024;
         /* Streaming-aware resident footprint: under ssd_streaming the DiT holds
          * only ~2 blocks resident (of H3_DIT_BLOCKS) and the video VAE decoder
          * only ~1 block (of its LAYERS); text/image/audio encoders are freed
@@ -2191,6 +2195,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
+    /* The plan above sized memory from an estimate taken before the layout and
+     * the tokenizer existed. Under-estimating is the direction that lets a run
+     * overrun RAM, so it is reported; H3_PROFILE prints the pair either way, so
+     * the estimate gets calibrated rather than merely trusted. */
+    if (layout.seq_len > planned_rows)
+        fprintf(stderr,
+                "h3: warning: the memory plan sized %zu token rows but this run "
+                "needs %zu; the tier choice above may be too optimistic\n",
+                planned_rows, layout.seq_len);
+    else if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: [mem] planned %zu token rows, layout %zu\n",
+                planned_rows, layout.seq_len);
     h3_sigma_schedule sigmas;
     if (params->refine_sigma > 0.0f) {
         if (!h3_refine_schedule_build(params->refine_sigma, params->steps,

@@ -2785,6 +2785,44 @@ size_t h3_dit_activation_bytes(size_t sequence) {
     return sequence * sizeof(uint16_t) * ((size_t)3 * HIDDEN + (size_t)6 * INNER);
 }
 
+/* See h3_dit.h. The frame grid is (latent_h/2) x (latent_w/2) rows per latent
+ * frame, one per video frame plus one per first/last keyframe condition; audio
+ * contributes two rows per audio latent frame; each reference presentation is
+ * bounded at the full target size. */
+size_t h3_dit_sequence_estimate(int width, int height, int frames,
+                               size_t text_rows_upper_bound,
+                               size_t condition_count, size_t reference_count) {
+    h3_temporal_shape temporal = h3_temporal(frames);
+    int latent_w = 0;
+    int latent_h = 0;
+    h3_latent_canvas(width, height, &latent_w, &latent_h);
+    size_t frame_rows = ((size_t)latent_h / 2) * ((size_t)latent_w / 2);
+    size_t video_rows = frame_rows * (size_t)temporal.video_t;
+    size_t audio_rows = 2 * (size_t)temporal.audio_t;
+    return text_rows_upper_bound + video_rows +
+        frame_rows * condition_count + audio_rows +
+        reference_count * (video_rows + audio_rows);
+}
+
+/* The two host-side buffers a plan has to reserve for: the joint video+audio
+ * latent h3_generate mallocs, and the DiT activation arena for that row count.
+ * Both callers (the generate-time planner and the REPL preview) go through this
+ * so neither can drop a term the other counts. */
+uint64_t h3_dit_plan_bytes(int width, int height, int frames,
+                           size_t text_rows_upper_bound, size_t condition_count,
+                           size_t reference_count) {
+    h3_temporal_shape temporal = h3_temporal(frames);
+    int latent_w = 0;
+    int latent_h = 0;
+    h3_latent_canvas(width, height, &latent_w, &latent_h);
+    size_t rows = h3_dit_sequence_estimate(width, height, frames,
+                                          text_rows_upper_bound, condition_count,
+                                          reference_count);
+    return (uint64_t)h3_dit_latent_elements(temporal.video_t, latent_h, latent_w,
+                                            temporal.audio_t) * sizeof(float) +
+        h3_dit_activation_bytes(rows);
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     /* Partial residency only means something under SSD streaming: the fully
@@ -2800,7 +2838,8 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         uint64_t avail = h3_host_available_memory();
         /* Reserve headroom for everything the slots cannot evict: ~1 GiB base,
          * the joint latent buffer h3_generate mallocs next, and the DiT's own
-         * activation arena -- at 256x256/44 frames that arena is ~0.1 GiB, and
+         * activation arena -- measured through h3_dit_activation_bytes(), a
+         * 44-frame request aligns to 56 and that arena is then 0.141 GiB, so
          * the per-block cost below is what actually overshot the machine. */
         uint64_t activation_reserve = (uint64_t)1 * 1024 * 1024 * 1024;
         /* Exactly what h3_generate mallocs, from the same helpers it uses: this

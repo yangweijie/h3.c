@@ -55,6 +55,31 @@ int h3_memory_plan_auto(const h3_device_info *device,
                         uint64_t activation_bytes,
                         h3_memory_plan *out);
 
+/* The byte ceiling h3_memory_plan_auto() compares against: Metal's recommended
+ * working set and physical RAM minus the OS reserve, each discounted by the
+ * static margin documented above. Exposed so a caller asking the inverse
+ * question does not re-derive -- and drift from -- that rule. */
+uint64_t h3_memory_plan_budget_bytes(const h3_device_info *device);
+
+/* The inverse question: the longest clip whose estimated per-run memory still
+ * fits `available_bytes` at this canvas, or 0 when even a single 22-frame
+ * trained chunk does. The answer is always a length h3_align_frame_count()
+ * accepts (22 + 17k), so callers can request it directly instead of round-tripping
+ * through the plan. Inputs match h3_dit_sequence_estimate()'s: the prompt's byte
+ * length bounds its token count, and `reference_count` counts ordered references.
+ * This is an estimate, not a promise: it covers only the two buffers that grow
+ * with the clip (the joint latent and the DiT activation arena), so it does not
+ * bound the video VAE's per-tile states, the audio path, or the page-cache
+ * state -- and h3_generate() checks its own row estimate against the layout it
+ * actually builds. The search is bounded, so a result equal to
+ * H3_PLAN_FRAMES_CEILING means "at least this much" and must not be read as a
+ * limit. The ceiling is itself a ladder value (22 + 17k), or the equality could
+ * never happen. */
+#define H3_PLAN_FRAMES_CEILING 4051      /* 22 + 17 * 237 */
+int h3_memory_plan_frames_within(uint64_t available_bytes, int width, int height,
+                                size_t text_rows_upper_bound,
+                                size_t condition_count, size_t reference_count);
+
 /* Reserve budget for a streaming cache: recommended_working_set * 7/8,
  * minus the steady-state model + activation footprint. Mirrors ds4's
  * ds4_streaming_manual_cache_safe_bytes. Returns a GiB-aligned byte count
