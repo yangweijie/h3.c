@@ -93,6 +93,18 @@ int h3_dit_reset_run(h3_dit *dit,
 size_t h3_dit_video_elements(const h3_dit *dit);
 size_t h3_dit_audio_elements(const h3_dit *dit);
 
+/* The same two element counts for a run that has not opened a DiT yet, which is
+ * when the memory planner needs them. `latent_t`/`latent_h`/`latent_w` come from
+ * h3_temporal() and h3_latent_canvas(); audio_t from h3_temporal(). Kept here so
+ * the channel counts stay defined in exactly one translation unit. */
+size_t h3_dit_latent_elements(int latent_t, int latent_h, int latent_w,
+                              int audio_t);
+
+/* Bytes of the DiT's run-long activation arena for a given token-row count, so a
+ * caller planning memory before the DiT exists can include it. See
+ * h3_dit_activation_bytes in h3_dit.c for the configuration it assumes. */
+size_t h3_dit_activation_bytes(size_t sequence);
+
 /* One raw data-ward velocity evaluation. Input/output video layout is
  * [24,T,H,W], audio is [32,2,T], all F32 on the host boundary. */
 int h3_dit_forward(h3_dit *dit, int step,

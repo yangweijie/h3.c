@@ -1407,6 +1407,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "prompt must not be empty");
         return NULL;
     }
+    /* The canvas the run actually renders into. Resolved here, before the memory
+     * plan, because the plan has to size the same latent buffer the run will
+     * allocate -- and the old estimate sized it from `params->width` instead,
+     * ignoring an explicit render override. */
+    int render_width = params->render_width ? params->render_width :
+                                               params->width;
+    int render_height = params->render_height ? params->render_height :
+                                                 params->height;
     /* Apply the automatic memory-tier planner to an effective copy of the
      * parameters, so small-RAM Macs pick a viable strategy from the device's
      * recommended working set. An explicit ssd_streaming/int8 choice or
@@ -1421,9 +1429,21 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             ctx->model.audio_vae.bytes;
         if (ctx->model.ref2va_transformer.bytes)
             total_weight += ctx->model.ref2va_transformer.bytes;
-        uint64_t activation = (uint64_t)eff.width * eff.height *
-                                  eff.frames / 16 / 16 * 56 * 4 +
-                              1024ull * 1024 * 1024;
+        /* The joint video+audio latent the run allocates, sized the way the run
+         * sizes it (4:1 temporal, /16 spatial, VIDEO_CHANNELS and
+         * AUDIO_CHANNELS*AUDIO_STREAMS channels). The previous expression put
+         * `56` -- the DiT head count -- in the channel slot and skipped the
+         * temporal compression, which over-stated this by roughly 56/24*4. */
+        h3_temporal_shape planned = h3_temporal(eff.frames);
+        int planned_latent_w = 0;
+        int planned_latent_h = 0;
+        h3_latent_canvas(render_width, render_height,
+                         &planned_latent_w, &planned_latent_h);
+        uint64_t activation =
+            (uint64_t)h3_dit_latent_elements(planned.video_t, planned_latent_h,
+                                             planned_latent_w,
+                                             planned.audio_t) * sizeof(float) +
+            1024ull * 1024 * 1024;
         /* Streaming-aware resident footprint: under ssd_streaming the DiT holds
          * only ~2 blocks resident (of H3_DIT_BLOCKS) and the video VAE decoder
          * only ~1 block (of its LAYERS); text/image/audio encoders are freed
@@ -1486,10 +1506,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             eff.denoise_reuse = 1;
         }
     }
-    int render_width = params->render_width ? params->render_width :
-                                               params->width;
-    int render_height = params->render_height ? params->render_height :
-                                                 params->height;
     if (h3_align_frame_count(params->frames) < 22) {
         h3_set_error(ctx,
             "generation requires at least one trained 22-frame decoder chunk");

@@ -1,4 +1,5 @@
 #include "h3_cli.h"
+#include "h3_dit.h" /* h3_dit_latent_elements */
 #include "h3_memory_plan.h"
 #include "h3_video_vae.h" /* H3_VIDEO_VAE_LAYERS */
 
@@ -753,9 +754,20 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                    (double)total_weight / gib);
             if (state->params.memory_plan_auto) {
                 h3_memory_plan plan;
-                uint64_t activation = (uint64_t)state->params.width *
-                    state->params.height * state->params.frames / 16 / 16 *
-                    56 * 4 + gib;
+                /* Same sizing h3_generate feeds the planner: the joint latent the
+                 * run allocates, not a hand-copied channel count. */
+                int canvas_w = state->params.render_width
+                    ? state->params.render_width : state->params.width;
+                int canvas_h = state->params.render_height
+                    ? state->params.render_height : state->params.height;
+                h3_temporal_shape shape = h3_temporal(state->params.frames);
+                int latent_w = 0, latent_h = 0;
+                h3_latent_canvas(canvas_w, canvas_h, &latent_w, &latent_h);
+                uint64_t activation =
+                    (uint64_t)h3_dit_latent_elements(shape.video_t, latent_h,
+                                                     latent_w,
+                                                     shape.audio_t) *
+                        sizeof(float) + gib;
                 const uint64_t dit_blocks = m->fl2va_transformer.bytes +
                     (m->ref2va_transformer.bytes
                          ? m->ref2va_transformer.bytes : 0);

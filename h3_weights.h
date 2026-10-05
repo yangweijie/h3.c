@@ -37,6 +37,15 @@ h3_gpu_tensor *h3_weight_load_i8(const h3_weight_store *store, h3_gpu *gpu,
                                  const char *name, int ndim, const uint64_t *shape,
                                  char *error, size_t error_size);
 
+/* Gather the named BF16 [rows, columns] table's selected rows into the first
+ * `index_count * columns` elements of `destination`, in the order given. Reads
+ * only those rows off disk, so a huge embedding table costs one row set instead
+ * of the whole tensor. */
+int h3_weight_gather_bf16_rows(const h3_weight_store *store, const char *name,
+                               const uint32_t *indices, size_t index_count,
+                               h3_gpu_tensor *destination,
+                               char *error, size_t error_size);
+
 /* Raw comfy-quants int8_tensorwise projection: the I8 codes and the F32
  * per-output-row scales exactly as stored, for consumers that quantise inside
  * their own kernel (the Neural Engine graphs).  The caller frees both buffers.

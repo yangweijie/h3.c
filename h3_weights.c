@@ -1004,3 +1004,59 @@ h3_gpu_tensor *h3_weight_load_i8(const h3_weight_store *store, h3_gpu *gpu,
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_I8,
                        error, error_size);
 }
+
+/* Gather selected rows of a BF16 [rows, columns] table into the front of
+ * `destination`, in the order given. Vocabulary embeddings are the reason this
+ * exists: the released table is 151936 * 5120 * 2 = 1.45 GiB while a prompt
+ * looks up a few hundred rows, so uploading the whole tensor to gather from it
+ * costs 1.45 GiB of GPU storage and disk bandwidth for the size of one row set.
+ * Duplicate indices are simply read twice, which is cheaper than any bookkeeping
+ * that would work out the same bytes. */
+int h3_weight_gather_bf16_rows(const h3_weight_store *store, const char *name,
+                               const uint32_t *indices, size_t index_count,
+                               h3_gpu_tensor *destination,
+                               char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return 0;
+    }
+    uint64_t expected = tensor->shape[0] * tensor->shape[1] * sizeof(uint16_t);
+    if (tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
+        !tensor->shape[0] || !tensor->shape[1] ||
+        tensor->data_end - tensor->data_begin != expected) {
+        fail(error, error_size,
+             "weight %s is not a BF16 [rows, columns] table", name);
+        return 0;
+    }
+    for (size_t index = 0; index < index_count; index++) {
+        if (indices[index] >= tensor->shape[0]) {
+            fail(error, error_size,
+                 "%s index %u is outside [0, %llu)", name, indices[index],
+                 (unsigned long long)tensor->shape[0]);
+            return 0;
+        }
+    }
+    size_t columns = (size_t)tensor->shape[1];
+    size_t row_bytes = columns * sizeof(uint16_t);
+    uint16_t *values = malloc(index_count * row_bytes);
+    if (!values) {
+        fail(error, error_size, "out of memory gathering %s rows", name);
+        return 0;
+    }
+    int ok = 1;
+    for (size_t index = 0; ok && index < index_count; index++)
+        ok = pread_bytes(header->path,
+                         tensor->file_offset +
+                             (uint64_t)indices[index] * row_bytes,
+                         values + index * columns, row_bytes);
+    if (ok && !h3_gpu_tensor_write_bf16_range(destination, 0, values,
+                                              index_count * columns)) {
+        fail(error, error_size,
+             "gathered %s rows do not fit the destination tensor", name);
+        ok = 0;
+    }
+    free(values);
+    return ok;
+}

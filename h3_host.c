@@ -782,7 +782,7 @@ uint64_t h3_host_footprint(void) {
 #endif
 }
 
-static uint64_t h3_host_physical_memory(void) {
+uint64_t h3_host_physical_memory(void) {
     static uint64_t cached = 0;
     if (cached) return cached;
 #if defined(__APPLE__)

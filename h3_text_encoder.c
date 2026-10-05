@@ -567,7 +567,6 @@ static int text_encode_bf16_impl(
         }
     }
 
-    h3_gpu_tensor *ids = h3_gpu_tensor_from_u32(gpu, token_ids, token_count);
     h3_gpu_tensor *rope_cos = h3_gpu_tensor_from_f32(
         gpu, cosines, token_count * TEXT_ROPE_HALF);
     h3_gpu_tensor *rope_sin = h3_gpu_tensor_from_f32(
@@ -605,14 +604,14 @@ static int text_encode_bf16_impl(
         free(values);
     }
     h3_gpu_tensor *activations[] = {
-        ids, rope_cos, rope_sin, hidden, norm, query, key, value,
+        rope_cos, rope_sin, hidden, norm, query, key, value,
         attention_heads, attention_output, gate, up, mlp_output,
         deepstack[0], deepstack[1], deepstack[2]
     };
     int ok = 1;
     for (size_t index = 0; index < sizeof(activations) / sizeof(*activations);
          index++) {
-        if (!activations[index] && (index < 13 || span_count)) ok = 0;
+        if (!activations[index] && (index < 12 || span_count)) ok = 0;
     }
     if (!ok) {
         fail(error, error_size, "cannot allocate Qwen activations: %s",
@@ -620,20 +619,14 @@ static int text_encode_bf16_impl(
         goto cleanup;
     }
 
-    h3_gpu_tensor *embedding_weight = load_2d(
-        &load, "model.language_model.embed_tokens.weight", TEXT_VOCAB,
-        TEXT_HIDDEN);
-    if (!embedding_weight) goto cleanup;
-    if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
-                       "command stream begin", -1) ||
-        !gpu_operation(gpu, h3_gpu_embedding_bf16(
-                                 gpu, hidden, embedding_weight, ids, tokens,
-                                 TEXT_VOCAB, TEXT_HIDDEN),
-                       error, error_size, "embedding lookup", -1) ||
-        !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
-                       "embedding stream submit", -1)) {
+    /* Gather just this prompt's vocabulary rows straight off disk. The table is
+     * TEXT_VOCAB * TEXT_HIDDEN BF16 -- 1.45 GiB -- and a prompt looks up a few
+     * hundred of its rows, so loading it whole to gather from it cost a 1.45 GiB
+     * GPU allocation plus that much disk bandwidth per run. */
+    if (!h3_weight_gather_bf16_rows(
+            load.store, "model.language_model.embed_tokens.weight", token_ids,
+            token_count, hidden, error, error_size))
         goto cleanup;
-    }
     retire_deferred(&load);
     for (size_t index = 0; index < span_count; index++) {
         const h3_text_vision_span *span = &spans[index];
@@ -759,7 +752,6 @@ finished:
     return ok;
 
 early_cleanup:
-    h3_gpu_tensor_free(ids);
     h3_gpu_tensor_free(rope_cos);
     h3_gpu_tensor_free(rope_sin);
     h3_gpu_tensor_free(hidden);
@@ -1091,7 +1083,6 @@ int h3_text_encode_clipproj_bf16(const char *qwen4b_directory,
         }
 
     int rc = 0;
-    h3_gpu_tensor *ids = h3_gpu_tensor_from_u32(gpu, token_ids, token_count);
     h3_gpu_tensor *rope_cos = h3_gpu_tensor_from_f32(gpu, cosines,
                                                      token_count * CP_ROPE_HALF);
     h3_gpu_tensor *rope_sin = h3_gpu_tensor_from_f32(gpu, sines,
@@ -1106,25 +1097,20 @@ int h3_text_encode_clipproj_bf16(const char *qwen4b_directory,
     h3_gpu_tensor *gate = h3_gpu_tensor_new_bf16(gpu, inter_count);
     h3_gpu_tensor *up = h3_gpu_tensor_new_bf16(gpu, inter_count);
     h3_gpu_tensor *mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
-    h3_gpu_tensor *activations[] = {ids, rope_cos, rope_sin, hidden, norm,
+    h3_gpu_tensor *activations[] = {rope_cos, rope_sin, hidden, norm,
         query, key, value, attention_heads, attention_output, gate, up,
         mlp_output};
     for (size_t i = 0; i < sizeof(activations)/sizeof(*activations); i++)
         if (!activations[i]) { fail(error, error_size, "ClipProj alloc failed");
                                goto cp_cleanup; }
 
-    h3_gpu_tensor *embed = cp_load_2d(gpu, store,
-        "model.language_model.embed_tokens.weight", CP_VOCAB, H,
-        error, error_size);
-    if (!embed) goto cp_cleanup;
-    if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
-                       "stream begin", -1) ||
-        !gpu_operation(gpu, h3_gpu_embedding_bf16(gpu, hidden, embed, ids,
-                         tokens, (int)CP_VOCAB, (int)H), error, error_size,
-                       "embedding lookup", -1) ||
-        !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
-                       "embedding submit", -1)) goto cp_cleanup;
-    h3_gpu_tensor_free(embed);
+    /* Same reason as the 50-layer path: gather the prompt's rows instead of
+     * uploading CP_VOCAB * H (151936 * 2560 BF16 = 778 MiB for the 4B model) to
+     * look a few hundred of them up. */
+    if (!h3_weight_gather_bf16_rows(
+            store, "model.language_model.embed_tokens.weight", token_ids,
+            token_count, hidden, error, error_size))
+        goto cp_cleanup;
 
     /* Optional dump of the post-embedding hidden (pre-layer) for fidelity
        debugging (compares against harness hidden_states[0]). */

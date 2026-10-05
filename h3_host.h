@@ -180,6 +180,12 @@ int h3_host_memory_guard(const char *phase, char *error, size_t error_size);
  * hold. Returns 0 if unavailable. */
 uint64_t h3_host_footprint(void);
 
+/* Total physical RAM in bytes (0 if the platform query fails). Paired with
+ * h3_host_footprint() by callers that have to bound a residency decision by RAM
+ * rather than by the volatile "available" figure -- see h3_memory_plan.c's note
+ * that GPU wired memory cannot be swapped. */
+uint64_t h3_host_physical_memory(void);
+
 /* Estimate how many DiT blocks can be kept resident given the available memory
  * headroom. per_block_cost is the resident cost of one block (bytes).
  * Returns a value in [0, active_blocks - 2] (at least 2 blocks must stay in the

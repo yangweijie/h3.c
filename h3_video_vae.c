@@ -621,8 +621,11 @@ static int allocate_activations(vae_context *vae, char *error,
     return 1;
 }
 
-static int run_block(vae_context *vae, int index, char *error,
-                     size_t error_size) {
+/* One transformer block over the `hidden` tile. The streaming path hands this the
+ * tile's own state tensor instead of a shared scratch buffer, which is what
+ * removes a full copy in and a full copy out per block per tile. */
+static int run_block(vae_context *vae, h3_gpu_tensor *hidden, int index,
+                     char *error, size_t error_size) {
     vae_block *weight = &vae->blocks[index];
     uint32_t rows = vae->sequence;
     const int ane = ane_ready(vae, index);
@@ -638,7 +641,7 @@ static int run_block(vae_context *vae, int index, char *error,
     } else if (!gpu_op(vae, h3_gpu_linear_f32(vae->gpu, output, input, matrix,  \
             bias, rows, inner, outer), error, error_size, label)) return 0;     \
 } while (0)
-    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm1,
+    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, hidden, weight->norm1,
         rows, HIDDEN, 1e-5f), "video VAE attention norm");
     GEMM(ANE_QKV, vae->qkv, vae->norm, weight->qkv_w, weight->qkv_b,
          "video VAE QKV", HIDDEN, INNER * 3);
@@ -650,9 +653,9 @@ static int run_block(vae_context *vae, int index, char *error,
        "video VAE attention");
     GEMM(ANE_OUT, vae->branch, vae->heads, weight->out_w, weight->out_b,
          "video VAE attention output", INNER, HIDDEN);
-    OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
+    OP(h3_gpu_scale_add_f32(vae->gpu, hidden, hidden, vae->branch,
         weight->scale1, rows, HIDDEN), "video VAE attention residual");
-    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm2,
+    OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, hidden, weight->norm2,
         rows, HIDDEN, 1e-5f), "video VAE MLP norm");
     GEMM(ANE_W1, vae->ff1, vae->norm, weight->w1, weight->w1_b,
          "video VAE MLP input", HIDDEN, FFN * 2);
@@ -660,7 +663,7 @@ static int run_block(vae_context *vae, int index, char *error,
        "video VAE SwiGLU");
     GEMM(ANE_W2, vae->branch, vae->activated, weight->w2, weight->w2_b,
          "video VAE MLP output", FFN, HIDDEN);
-    OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
+    OP(h3_gpu_scale_add_f32(vae->gpu, hidden, hidden, vae->branch,
         weight->scale2, rows, HIDDEN), "video VAE MLP residual");
 #undef GEMM
 #undef OP
@@ -710,7 +713,7 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
     for (int index = 0; index < LAYERS; index++) {
         if (!load_block(vae, index, error, error_size)) return 0;
         OP(h3_gpu_begin(vae->gpu), "begin video VAE transformer block");
-        if (!run_block(vae, index, error, error_size)) return 0;
+        if (!run_block(vae, vae->hidden, index, error, error_size)) return 0;
         OP(h3_gpu_submit(vae->gpu), "submit video VAE transformer block");
         free_block(&vae->blocks[index]);
         if (progress) progress(index + 1, LAYERS, progress_opaque);
@@ -797,7 +800,7 @@ static int run_resident_tile(vae_context *vae, char *error,
         (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
        "pack tiled video VAE suffix");
     for (int index = 0; index < LAYERS; index++)
-        if (!run_block(vae, index, error, error_size)) {
+        if (!run_block(vae, vae->hidden, index, error, error_size)) {
             h3_gpu_tensor_free(zero);
             return 0;
         }
@@ -904,7 +907,7 @@ static int run_stream_tile(vae_context *vae, char *error,
                     vae->sequence);
         }
         OP(h3_gpu_begin(vae->gpu), "begin streamed video VAE transformer block");
-        if (!run_block(vae, index, error, error_size)) {
+        if (!run_block(vae, vae->hidden, index, error, error_size)) {
             h3_gpu_tensor_free(zero);
             return 0;
         }
@@ -931,7 +934,6 @@ static int run_stream_tile(vae_context *vae, char *error,
 static int run_stream_chunk(vae_context *vae, int state_count,
                             h3_gpu_tensor **states, char *error,
                             size_t error_size) {
-    size_t state_elements = (size_t)vae->sequence * HIDDEN;
     for (int index = 0; index < LAYERS; index++) {
         if (!load_block(vae, index, error, error_size)) return 0;
         if (index == 0 && getenv("H3_PROFILE")) {
@@ -949,14 +951,11 @@ static int run_stream_chunk(vae_context *vae, int state_count,
                     "begin streamed video VAE transformer block"))
             return 0;
         for (int state = 0; state < state_count; state++) {
-            if (!gpu_op(vae, h3_gpu_copy_f32(vae->gpu, vae->hidden, 0,
-                        states[state], 0, state_elements), error, error_size,
-                        "restore streamed video VAE tile state"))
-                return 0;
-            if (!run_block(vae, index, error, error_size)) return 0;
-            if (!gpu_op(vae, h3_gpu_copy_f32(vae->gpu, states[state], 0,
-                        vae->hidden, 0, state_elements), error, error_size,
-                        "save streamed video VAE tile state"))
+            /* The tile's state *is* the block's input and output: run_block
+             * only ever reads it and adds into it in place, and a state is
+             * allocated with the same state_elements the shared scratch holds.
+             * Copying it in and out was two full tile transits per block. */
+            if (!run_block(vae, states[state], index, error, error_size))
                 return 0;
         }
         if (!gpu_op(vae, h3_gpu_submit(vae->gpu), error, error_size,

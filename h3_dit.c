@@ -2748,6 +2748,43 @@ static void adopt_slot_weights(h3_dit_block *block, h3_dit_block *slot,
     }
 }
 
+/* GPU bytes one resident stream slot holds once its block is loaded: a
+ * projection is int8 plus one f32 scale per output row where its int8 path is on
+ * (the BF16 original is released after requantizing) and stays BF16 otherwise.
+ * Derived from the same constants `allocate_stream_slot()` uses. The budget used
+ * to assume a flat 0.5 GiB justified by "int8 weights dominate", which only holds
+ * with int8 enabled; the default streaming path keeps BF16 slots, which measured
+ * 0.72 GiB per block on an M4, so 1.44x as many blocks were pinned as the machine
+ * could pay for and a 256x256/44-frame run was killed mid-denoise. */
+static uint64_t stream_slot_bytes(const h3_dit *dit) {
+    uint64_t qkv = (uint64_t)INNER * 3 * HIDDEN;
+    uint64_t out = (uint64_t)HIDDEN * INNER;
+    uint64_t fc1 = (uint64_t)FFN * 2 * HIDDEN;
+    uint64_t fc2 = (uint64_t)HIDDEN * FFN;
+    uint64_t bytes =
+        (dit->int8_qkv ? qkv + (uint64_t)INNER * 3 * sizeof(float)
+                       : qkv * sizeof(uint16_t)) +
+        (dit->int8_attention_out
+             ? out + (uint64_t)HIDDEN * sizeof(float)
+             : out * sizeof(uint16_t)) +
+        (dit->int8_mlp ? fc1 + (uint64_t)FFN * 2 * sizeof(float)
+                       : fc1 * sizeof(uint16_t)) +
+        (dit->int8_mlp ? fc2 + (uint64_t)HIDDEN * sizeof(float)
+                       : fc2 * sizeof(uint16_t));
+    if (dit->vdn) bytes += out * sizeof(uint16_t);
+    return bytes;
+}
+
+/* Activation bytes the DiT holds for the whole run, per token row: the live set
+ * `allocate_activations()` creates under its default configuration (MLP fused,
+ * attention heads and the MLP modulation aliased into the qkv buffer) --
+ * hidden + mod_attention + attention_output across HIDDEN, qkv across INNER*3 and
+ * query/key/value each across INNER, all BF16. Turning either optimization off
+ * adds more; see H3_DISABLE_FUSED_MLP and H3_DISABLE_DIT_ACTIVATION_ALIAS. */
+size_t h3_dit_activation_bytes(size_t sequence) {
+    return sequence * sizeof(uint16_t) * ((size_t)3 * HIDDEN + (size_t)6 * INNER);
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
     /* Partial residency only means something under SSD streaming: the fully
@@ -2761,35 +2798,46 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
      * un-rotate. */
     if (dit->ssd_streaming && resident_budget == 0) {
         uint64_t avail = h3_host_available_memory();
-        /* Reserve headroom for activations: ~1 GiB base + the joint latent
-         * buffer (video + audio, float32) allocated just after this call in
-         * h3_generate. The latent dominates for long clips, so size it. */
+        /* Reserve headroom for everything the slots cannot evict: ~1 GiB base,
+         * the joint latent buffer h3_generate mallocs next, and the DiT's own
+         * activation arena -- at 256x256/44 frames that arena is ~0.1 GiB, and
+         * the per-block cost below is what actually overshot the machine. */
         uint64_t activation_reserve = (uint64_t)1 * 1024 * 1024 * 1024;
-        int lt = dit->latent_t, lh = dit->latent_h, lw = dit->latent_w;
-        int at = dit->audio_t;
-        if (lt > 0 && lh > 0 && lw > 0) {
-            /* Video latent: [C=16, T, H, W] float32; audio latent: [32,2,T] f32. */
-            uint64_t video_latent =
-                (uint64_t)16 * (size_t)lt * (size_t)lh * (size_t)lw * 4;
-            uint64_t audio_latent =
-                (uint64_t)32 * 2 * (size_t)(at > 0 ? at : 0) * 4;
-            activation_reserve += video_latent + audio_latent;
-        }
+        /* Exactly what h3_generate mallocs, from the same helpers it uses: this
+         * used to spell the channel counts out a second time here and got the
+         * video one wrong (16 instead of VIDEO_CHANNELS = 24), which under-sized
+         * the reserve and pinned more blocks than the run could afford. */
+        activation_reserve +=
+            (uint64_t)(h3_dit_video_elements(dit) +
+                       h3_dit_audio_elements(dit)) * sizeof(float) +
+            h3_dit_activation_bytes(dit->sequence);
         uint64_t usable = avail > activation_reserve ? avail - activation_reserve : 0;
-        /* Per-block resident cost: int8 weights dominate (~0.39 GiB on the
-         * reference M5 bf16 source, but the convrot/linear blocks vary). Use a
-     * conservative 0.5 GiB so we do not overshoot on smaller GPUs. */
-        uint64_t per_block = (uint64_t)(0.5 * 1024 * 1024 * 1024);
+        /* `available` is free+inactive+purgeable page cache, so it moves with what
+         * the machine has been doing -- the same shape and binary measured 2.6 and
+         * 5.6 GiB on two runs -- whereas GPU-wired memory cannot be swapped at all.
+         * Bound the decision by physical RAM too, the way the runtime guard does. */
+        uint64_t headroom = (uint64_t)H3_MEM_HEADROOM_DEFAULT_MB * 1024 * 1024;
+        uint64_t physical = h3_host_physical_memory();
+        uint64_t footprint = h3_host_footprint();
+        if (physical > footprint + headroom) {
+            uint64_t ram_bound = physical - (footprint + headroom);
+            if (!usable || ram_bound < usable) usable = ram_bound;
+        }
+        uint64_t per_block = stream_slot_bytes(dit);
         unsigned auto_resident = h3_dit_resident_budget(
             usable, per_block, dit->active_block_count);
         if (auto_resident > 0) {
             resident_budget = auto_resident;
             fprintf(stderr,
                     "h3: adaptive DiT partial residency: %u of %u blocks "
-                    "resident (available %.1f GiB, activation reserve %.1f GiB, "
+                    "resident (available %.1f GiB, footprint %.1f/%.1f GiB, "
+                    "budget %.1f GiB, activation reserve %.1f GiB, "
                     "per-block %.2f GiB)\n",
                     auto_resident, dit->active_block_count,
                     (double)avail / (1024.0 * 1024.0 * 1024.0),
+                    (double)footprint / (1024.0 * 1024.0 * 1024.0),
+                    (double)physical / (1024.0 * 1024.0 * 1024.0),
+                    (double)usable / (1024.0 * 1024.0 * 1024.0),
                     (double)activation_reserve / (1024.0 * 1024.0 * 1024.0),
                     (double)per_block / (1024.0 * 1024.0 * 1024.0));
         }
@@ -4964,6 +5012,21 @@ size_t h3_dit_video_elements(const h3_dit *dit) {
 size_t h3_dit_audio_elements(const h3_dit *dit) {
     return dit ? (size_t)AUDIO_CHANNELS * AUDIO_STREAMS *
         (size_t)dit->audio_t : 0;
+}
+
+/* Video plus audio latent elements for a run that has not opened a DiT yet. The
+ * channel counts live here so the planner cannot drift from what the forward
+ * actually allocates: `h3_dit_video_elements()` and `h3_dit_audio_elements()`
+ * above are the same products with the same constants. */
+size_t h3_dit_latent_elements(int latent_t, int latent_h, int latent_w,
+                              int audio_t) {
+    if (latent_t < 0) latent_t = 0;
+    if (latent_h < 0) latent_h = 0;
+    if (latent_w < 0) latent_w = 0;
+    if (audio_t < 0) audio_t = 0;
+    return (size_t)VIDEO_CHANNELS * (size_t)latent_t * (size_t)latent_h *
+               (size_t)latent_w +
+           (size_t)AUDIO_CHANNELS * AUDIO_STREAMS * (size_t)audio_t;
 }
 
 int h3_dit_reset_run(h3_dit *dit,
