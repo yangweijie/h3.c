@@ -79,9 +79,4 @@ uint64_t h3_memory_plan_budget_bytes(const h3_device_info *device);
 int h3_memory_plan_frames_within(uint64_t available_bytes, int width, int height,
                                 size_t text_rows_upper_bound,
                                 size_t condition_count, size_t reference_count);
-
-/* Reserve budget for a streaming cache: recommended_working_set * 7/8,
- * minus the steady-state model + activation footprint. Mirrors ds4's
- * ds4_streaming_manual_cache_safe_bytes. Returns a GiB-aligned byte count
- * (at least 1 GiB when positive). */
 #endif /* H3_MEMORY_PLAN_H */

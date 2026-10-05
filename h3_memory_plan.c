@@ -65,8 +65,9 @@ int h3_memory_plan_frames_within(uint64_t available_bytes, int width, int height
  *     1 block, and the encoders are freed per call. int8 is suggested *in
  *     addition* to streaming (the two are orthogonal, per ds4's decoupled
  *     expert-cache design), not forced off.
- *   - On extreme budgets (< ~4 GiB headroom after streaming) also drop
- *     dit_layers toward H3_MIN_DIT_LAYERS.
+ *   - On extreme budgets (< ~4 GiB headroom after streaming, measured against
+ *     the ceiling from h3_memory_plan_budget_bytes(), not Metal's raw
+ *     recommendation) also drop dit_layers toward H3_MIN_DIT_LAYERS.
  */
 int h3_memory_plan_auto(const h3_device_info *device,
                         uint64_t total_weight_bytes,
@@ -81,7 +82,6 @@ int h3_memory_plan_auto(const h3_device_info *device,
         return 0;
     }
 
-    const uint64_t rec = device->recommended_working_set;
     /* One definition of the ceiling, shared with the inverse query in
      * h3_memory_plan_frames_within() so the two cannot drift apart. */
     const uint64_t target = h3_memory_plan_budget_bytes(device);
@@ -110,9 +110,12 @@ int h3_memory_plan_auto(const h3_device_info *device,
     out->video_vae_streaming = 1;
 
     /* Extreme budget after streaming: also trim DiT depth toward the validated
-     * minimum. */
+     * minimum. Measured against the same clamped ceiling the tier choice above
+     * used, not against Metal's raw recommendation -- on a 16 GiB Mac the
+     * recommendation is routinely ~20 GiB, so comparing to it hid the tight case
+     * on exactly the machines where trimming depth matters. */
     const uint64_t free_after_stream =
-        rec > steady_streamed ? rec - steady_streamed : 0;
+        target > steady_streamed ? target - steady_streamed : 0;
     if (free_after_stream < 4ull * H3_GIB) {
         out->dit_layers = H3_MIN_DIT_LAYERS;
         snprintf(out->reason, sizeof(out->reason),
