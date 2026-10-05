@@ -2599,6 +2599,6 @@ VAE 编码器下采样），而 DiT 序列用的是 `h3_video_latent_t()`（`((f
 修前的 3 / 9 排成同代码序列）。`make test` exit 0：新测试 14 条断言全绿、全仓 50 行 `  ok  `
 + 11 行 `ok…`、15 skip、0 FAIL、0 `warning:`。
 
-**状态**：本步代码 6 个文件 + 1 个新测试未提交（`h3.c h3_cli.c h3_dit.c h3_dit.h
-h3_memory_plan.c h3_memory_plan.h Makefile tests/test_memory_plan_inverse.c`）；
-上一轮已提交 `0301614`/`dbe42d2`/`a88c17d`，**仍未 push**。
+**状态**：本步已入库两笔 —— `64599eb`（F50+F51 代码 + `tests/test_memory_plan_inverse.c` +
+Makefile）、`d944a35`（F51 记录与 F48 §2/F48 §3 就地更正）。工作区干净，**仍未 push**
+（`main...origin/main [ahead 5]`）。

@@ -2640,11 +2640,16 @@ DiT 的 `h3_video_latent_t()`（`((f-5)/17)*5+2`），rows 差算成 356（实�
 （`printf '…\nquit\n' | ./h3 -d <cached>` 挂住无输出），要看真打印得在交互终端手打 `!memory-plan`。
 
 **重排后的待办**
-1. 提交本步（`h3.c h3_cli.c h3_dit.c h3_dit.h h3_memory_plan.c h3_memory_plan.h h3_host.c
-   h3_host.h Makefile` + 新测试 + 三份记录），**不 push**。
+1. ~~提交本步~~ 已做（2026-10-05）：`64599eb` = F50+F51 代码
+   （`h3.c h3_cli.c h3_dit.c h3_dit.h h3_memory_plan.c h3_memory_plan.h Makefile` +
+   新测试 `tests/test_memory_plan_inverse.c`）；`d944a35` = 三份记录。
+   上一版这条把 `h3_host.c h3_host.h` 也列进来是**过期前提**（那两个文件在 `0301614` 就入库了，
+   本步 `git diff` 对它们无差异）。工作区干净，**未 push**（`main...origin/main [ahead 5]`）。
 2. `h3_memory_plan.c:80-82` 用未夹 `rec` 算 `free_after_stream`（F44 §2 #13，一行）。
 3. meta 键装到 `s4/s8/s20`（纯磁盘活，让 F43 的 P1 收窄真正生效）。
 4. i2v/reference 估计路径的校准：需要一个可跑的参考图锚（现在是上界 + warning 兜底）。
 5. F44 §2 未做的：视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、终端每帧 fork、4+3 处文档相反。
    Metal 三条要 M5 GPU 数据（本机 M4 无 TensorOps）。
-6. 逐位锚不变：latent `6e9c2d8786cea097ddf9bdd45e5593bd` / mp4 `ac0d0940434ad216d8131f7469154b70`。
+6. CLI 的 `Longest clip at WxH` 那行仍未在真机 REPL 眼验（管道喂不动 linenoise）；
+   下次在交互终端手打 `!memory-plan` 看一眼即可结掉。
+7. 逐位锚不变：latent `6e9c2d8786cea097ddf9bdd45e5593bd` / mp4 `ac0d0940434ad216d8131f7469154b70`。
