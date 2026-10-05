@@ -2654,3 +2654,36 @@ DiT 的 `h3_video_latent_t()`（`((f-5)/17)*5+2`），rows 差算成 356（实�
 6. CLI 的 `Longest clip at WxH` 那行仍未在真机 REPL 眼验（管道喂不动 linenoise）；
    下次在交互终端手打 `!memory-plan` 看一眼即可结掉。
 7. 逐位锚不变：latent `6e9c2d8786cea097ddf9bdd45e5593bd` / mp4 `ac0d0940434ad216d8131f7469154b70`。
+
+
+## 新增（2026-10-05）：档位判据改回"规划真正执行的上限"，档位决策第一次有覆盖（F52 / progress 续 42）
+
+做 F44 §2 #13。`h3_memory_plan_auto()` 原先两档用的数不一致：能不能全常驻比的是夹后上限
+（`h3_memory_plan_budget_bytes()`），"流式后余量 < 4 GiB 就削 DiT 深度"比的却是**未夹的 Metal
+建议值**。这台 16 GB M4 上建议 20 GiB、上限 10.2 GiB ⇒ 削深度那条在最需要它的机器上永不触发。
+改成共用 `target`；顺手删掉 `h3_memory_plan.h` 末尾那段**没有对应实现**的 "rec × 7/8" 注释
+（教的是与本仓相反的算法）。
+
+**新测试 `tests/test_memory_plan_tiers.c`（13 条）补的是零覆盖**：`grep tests/ h3_memory_plan_auto`
+此前无命中。最关键一条是**用例自证前提** `room_by_rec ≥ 4 GiB && room_by_target < 4 GiB` ——
+没有它，"削深度"的绿可能只是两条规则同答的假绿。另有一条 wiring：rationale 打印的 GiB 数必须
+等于 `h3_memory_plan_budget_bytes()`，防止"打印一个数、按另一个数决策"。
+
+**变异对照**（改回 `recommended_working_set`）：exit=1 且**恰好 1 条**变红，红落点正是那条
+trim 断言；还原后 sha256 与基线一致。
+
+**验收**：`make test` EXIT=0（63 行 `  ok  `、比上轮 +13；11 行 `ok…`；15 skip；0 FAIL）。
+逐位锚本轮复跑不变（latent `6e9c2d87…` / mp4 `ac0d0940…`）—— 注意 `--ssd-streaming` 路径按
+`h3.c:1436-1437` 的门根本不进规划器，所以这条只是保险，真正的证据是上面那条变异对照。
+
+**重排后的待办**
+1. ~~提交本步~~ 已做（2026-10-05）：`e3c6ce9` = `h3_memory_plan.c h3_memory_plan.h Makefile` +
+   新测试；记录另计一笔（不写它的哈希，否则状态行永远比自己旧）。**未 push**。
+2. meta 键装到 `s4/s8/s20`（纯磁盘活，让 F43 的 P1 收窄真正生效）。
+3. i2v/reference 估计路径的校准：需要一个可跑的参考图锚（现在是上界 + warning 兜底）。
+4. CLI 的 `Longest clip at WxH` 那行仍未在真机 REPL 眼验（管道喂不动 linenoise）；
+   在交互终端手打 `!memory-plan` 即可结掉。
+5. F44 §2 未做的：视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、终端每帧 fork、4+3 处文档相反。
+   Metal 三条要 M5 GPU 数据（本机 M4 无 TensorOps）。
+6. 观察项（未改，F52 §4）：`h3.c:1465-1467` 用 `bytes * 0 +` 表达"每次调用后释放"。
+7. 逐位锚：latent `6e9c2d8786cea097ddf9bdd45e5593bd` / mp4 `ac0d0940434ad216d8131f7469154b70`。

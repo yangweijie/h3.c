@@ -5152,3 +5152,81 @@ grep -n "h3_memory_plan_budget_bytes\|h3_memory_plan_frames_within\|H3_PLAN_FRAM
   h3_memory_plan.c h3_memory_plan.h h3_cli.c
 grep -n "更正（2026-10-05" findings.md   # F48 §2 的更正块
 ```
+
+---
+
+# F52（2026-10-05）：档位判据从"Metal 建议值"改回"规划真正执行的那条上限"
+
+F44 §2 #13 挂着的一条一行级缺陷，本轮结掉，并给它补上第一个覆盖档位决策的测试。
+
+## 1. 缺陷本体
+
+`h3_memory_plan_auto()` 里两处判据用的**不是同一个数**：
+- 第一档（能不能全常驻）比的是 `h3_memory_plan_budget_bytes()` —— 建议工作集 ×80% 与
+  `(物理内存 − 4 GiB) ×85%` 取小；
+- 第二档（流式之后还剩多少余量 ⇒ 要不要把 DiT 深度降到 `H3_MIN_DIT_LAYERS`）比的是
+  **未夹的 `rec`**（Metal 原始建议值）。
+
+后果有方向性：小内存机器上 `rec` 通常远大于夹后上限（这台 16 GB M4 实测 `rec=20 GiB`、
+上限 `10.2 GiB`），于是"余量 < 4 GiB 就削深度"这条**在最需要削的机器上永远不触发** ——
+`rec − 6.5 GiB = 13.5 GiB` 看着很宽裕，而上限那边只剩 `3.7 GiB`。
+
+改成 `target`（同 F51 抽出来的那条规则）后，两档共用一个数，注释里写清了为什么不能用 `rec`。
+顺带删掉 `h3_memory_plan.h:83-86` 那段**没有对应函数**的尾注释（"recommended_working_set * 7/8"）：
+`grep` 全仓，这个名字只在头部注释里作为 ds4 出处出现，没有实现 —— 它教的是和本仓实际规则
+相反的算法（既不是 7/8，也没夹物理内存），按"文档教过期配方等同于缺陷"处理。
+
+## 2. 新测试 `tests/test_memory_plan_tiers.c`（此前档位决策**零覆盖**）
+
+`grep -rn h3_memory_plan_auto tests/` 之前无命中 —— 也就是说这两档的取数规则一直没被测过，
+所以缺陷能长期活着。测试 13 条断言，其中最关键的一条是**用例自证前提**：
+
+> `room_by_rec >= 4 GiB && room_by_target < 4 GiB`
+
+即"这个用例真的横跨阈值"。没有这条，"削深度"的断言可能只是两条规则给出同一答案时的假绿。
+其余覆盖：流式档的开关组合、余量宽（4.7 GiB）时保持满深度、能全常驻时不碰任何旋钮、
+`rec == 0` 时留默认，以及**rationale 里打印的 GiB 数必须等于 `h3_memory_plan_budget_bytes()`**
+（wiring 类断言：防止以后改成"打印一个数、按另一个数决策"）。
+
+## 3. 变异对照：证明这条断言确实在测这条规则
+
+按单文件变异流程（先 `grep` 前置：待替换文本基线出现 1 次、变异文本基线出现 0 次；
+每次重建前 `rm` 掉 `.o` 与测试二进制；变异/测量/还原在同一次调用里；还原后比 sha256）：
+
+| 手臂 | 结果 |
+|---|---|
+| 变异：把 `target` 换回 `device->recommended_working_set` | exit=1，**恰好 1 条变红**："tight against the enforced ceiling trims DiT depth" |
+| 基线（还原后 sha256 一致） | exit=0，0 条红 |
+
+红只落在那一条上，正是它该有的形状 —— 其余 12 条在两个手臂下都同色，说明它们不是这条规则的
+覆盖来源。另一侧（`rec=2 GiB` 小于物理夹后上限）在变异下仍绿，因为两条规则在那个方向给出的
+余量都低于阈值，测试里没有把它当成"证明"。
+
+## 4. 顺带记下、本轮没动的一处
+
+`h3.c:1465-1467` 用 `bytes * 0 + ...` 表达"这个分量每次调用后释放"。能编译、语义正确（结果恒 0），
+但写法比直接不加大项更绕，且 `-Wextra` 不会提醒它。留作观察项，不单开一步。
+
+## 5. 验收
+
+- `./h3_memory_plan_tiers_test`：EXIT=0，**13 条断言全绿**（含那条自证前提）。
+- 变异对照：exit=1 且**恰好 1 条**变红，基线还原后 sha256 一致（见 §3 表）。
+- `make test`：EXIT=0，63 行 `  ok  `（比上一轮 +13，即新测试全量进闸门）+ 11 行 `ok…` 收尾、
+  15 skip、0 FAIL。该次日志里没有 `warning:` 行 —— 这**不等于**全仓无告警：本轮只重编了改动
+  涉及的文件，`h3.c:494` 那条 `unused parameter 'conditioning_key'` 是 HEAD 就有的、没被这次
+  构建触及，仍按"原有告警"记账。另外单独 `make h3` 重编过 `h3_cli.c`，给出 2 条整型→浮点转换，
+  本步没让它变多；"原有"这次是查出来的而不是沿用记忆：`git show 0301614:h3_cli.c` 单独
+  `-fsyntax-only` 编出来的还是 `:752`/`:754` 同两处、同行号。
+- 逐位锚：`--ssd-streaming` 走的路径其实**不经过**规划器（`h3.c:1436-1437` 的门是
+  `memory_plan_auto && ssd_streaming == 0 && use_int8_row_fc2 == 0`），但按"改内存决策类代码就
+  回锚"的规矩仍复跑一次 256²/22f/steps4/seed42 ⇒ EXIT=0，latent
+  `6e9c2d8786cea097ddf9bdd45e5593bd`、mp4 `ac0d0940434ad216d8131f7469154b70` **两串逐字符不变**
+  （常驻仍 6/50 块）。这条是保险，不是证据来源 —— 证据是上面那条变异对照。
+
+## 6. 复现
+
+```bash
+make h3_memory_plan_tiers_test && ./h3_memory_plan_tiers_test   # EXIT=0，13 条 ok
+grep -n "free_after_stream" h3_memory_plan.c
+grep -Fn "7/8" h3_memory_plan.h    # 计数应为 0（那段注释已删）
+```
