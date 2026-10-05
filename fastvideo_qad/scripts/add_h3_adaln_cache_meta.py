@@ -27,59 +27,61 @@ from export_h3_adaln_cache import (  # noqa: E402  (same helpers, same repo)
     cache_steps_of, is_cache_file, meta_key, st_header, weight_time_dim)
 
 
-def rewrite(shard: pathlib.Path, key: str, width: int, backup: pathlib.Path,
-            dry: bool) -> None:
-    size = shard.stat().st_size
+def prepare(shard: pathlib.Path, key: str):
+    """Read and validate one shard, returning what `apply()` needs or None when
+    it already carries the key. Everything that can refuse happens here, before
+    any file in the directory has been written."""
     header, base = st_header(shard)
+    if header.get("__metadata__") is not None:
+        raise SystemExit(f"{shard.name}: __metadata__ key present; this tool "
+                         "does not reorder headers around it")
     if key in header:
         existing = struct.unpack(
             "<I", _read(shard, base + header[key]["data_offsets"][0], 4))[0]
         print(f"{shard.name}: already carries {key} = {existing}; left alone")
-        return
-    payload = size - base
-    if header.get("__metadata__") is not None:
-        raise SystemExit(f"{shard.name}: __metadata__ key present; this tool "
-                         "does not reorder headers around it")
-
-    entry = {"dtype": "U32", "shape": [1],
-             "data_offsets": [payload, payload + 4]}
-    header[key] = entry
+        return None
+    payload = shard.stat().st_size - base
+    header[key] = {"dtype": "U32", "shape": [1],
+                   "data_offsets": [payload, payload + 4]}
     text = json.dumps(header, separators=(",", ":"),
                       ensure_ascii=False).encode("utf-8")
-    pad = (-len(text)) % 8
-    text += b" " * pad
-
+    text += b" " * ((-len(text)) % 8)
     print(f"{shard.name}: header {base - 8} -> {len(text)} B, "
-          f"data {payload} B (+4), width {width}")
-    if dry:
-        return
+          f"data {payload} B (+4)")
+    return {"header_len": base - 8, "data_start": base, "payload": payload,
+            "text": text}
+
+
+def apply(shard: pathlib.Path, plan: dict, key: str, width: int,
+          backup: pathlib.Path) -> None:
+    payload = plan["payload"]
 
     backup.mkdir(parents=True, exist_ok=True)
     original = backup / shard.name
     if not original.exists():
         shutil.copy2(shard, original)
-    before = _digest(original, 8 + (base - 8), payload)
+    before = _digest(original, 8 + plan["header_len"], payload)
 
     tmp = shard.with_name(shard.name + ".tmp")
     with open(original, "rb") as src, open(tmp, "wb") as dst:
-        dst.write(struct.pack("<Q", len(text)))
-        dst.write(text)
-        src.seek(base)
+        dst.write(struct.pack("<Q", len(plan["text"])))
+        dst.write(plan["text"])
+        src.seek(plan["data_start"])
         shutil.copyfileobj(src, dst, length=1 << 22)
         dst.write(struct.pack("<I", width))
         dst.flush()
         os.fsync(dst.fileno())
     tmp.replace(shard)
 
-    after = _digest(shard, 8 + len(text), payload)
+    after = _digest(shard, 8 + len(plan["text"]), payload)
     if before != after:
         raise SystemExit(f"{shard.name}: PAYLOAD CHANGED -- original kept at "
                          f"{original}, the shard was replaced; do not use it")
-    check = st_header(shard)
-    got = struct.unpack("<I", _read(shard, check[1] +
-                    check[0][key]["data_offsets"][0], 4))[0]
+    header, base = st_header(shard)
+    got = struct.unpack("<I", _read(shard, base +
+                    header[key]["data_offsets"][0], 4))[0]
     print(f"{shard.name}: payload digest {before[:12]}.. unchanged, "
-          f"{key} reads back {got}")
+          f"{key} = {got} written")
     if got != width:
         raise SystemExit(f"{shard.name}: {key} reads back {got}, expected {width}")
 
@@ -126,11 +128,22 @@ def main() -> int:
                     if is_cache_file(p))
     if not shards:
         raise SystemExit(f"no adaln_cache_s*.safetensors under {args.cache_dir}")
+    # Read and validate every shard before writing any: aborting halfway would
+    # leave a directory where some shards carry a width and others still refuse
+    # every adapter.
+    pending = []
     for shard in shards:
         steps = cache_steps_of(shard)
         if steps is None:
             raise SystemExit(f"{shard.name}: name carries no step count")
-        rewrite(shard, meta_key(steps), width, args.backup_dir, args.dry_run)
+        plan = prepare(shard, meta_key(steps))
+        if plan:
+            pending.append((shard, meta_key(steps), plan))
+    if args.dry_run:
+        print(f"dry run: {len(pending)} shard(s) would be rewritten")
+        return 0
+    for shard, key, plan in pending:
+        apply(shard, plan, key, width, args.backup_dir)
     return 0
 
 

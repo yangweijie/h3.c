@@ -227,6 +227,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	./h3_vdn_tests
 	./h3_flash_attn_tests
 	@python3 tests/test_adaln_cache_codec.py
+	@python3 tests/test_adaln_cache_meta_tool.py
 	@python3 tests/gen_adaln_cache_fixture.py tmp_adaln_cache_fixture
 	./h3_adaln_cache_lora_gate_test tmp_adaln_cache_fixture
 	./h3_clipproj_selection_test
