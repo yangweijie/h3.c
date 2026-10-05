@@ -2753,3 +2753,34 @@ trim 断言；还原后 sha256 与基线一致。
    Metal 三条要 M5 GPU 数据（本机 M4 无 TensorOps）。
 5. 观察项（未改，F52 §4）：`h3.c:1465-1467` 用 `bytes * 0 +` 表达"每次调用后释放"。
 6. 清理待判：`/Volumes/data/tmp/h3scr/f53/backup/`（619 MB 原始分片）与各轮 e2e 产物。
+
+
+## 新增（2026-10-06）：i2v/reference 估计路径改走 host 侧对账（F55 / progress 续 45）
+
+F50 那句"keyframe 与 reference 未实测"的前提先查实：两套 checkpoint 都只有 FL2VA
+（无 video_encoder、无 REF2VA），端到端在这台机器上**起不来**。但行数的权威 `h3_layout_build()`
+在 host 侧，于是让估计与 layout 同形状对打（`tests/test_sequence_estimate_layout.c`，58 条断言）。
+
+- **关键帧路径精确相等**：48 例里 36 例（全部无参考项的形状）估计与 layout 一行不差 ⇒ F50 那条
+  "首尾关键帧未实测"结掉。
+- **reference 项实测富余 1.75×～1.95×**：256²/22f 每参考估 522 行、layout 真发 64 行；
+  方向安全但把长片段档位往保守推。**口径本轮未收紧**（收紧会改档位行为，要单独论证）。
+- **一个疑似缺陷查清不是**：奇 latent 画幅（768×432）layout 会拒，但 `h3.c:900`/`:915` 已把
+  输出与内部渲染画幅都限成 32 的倍数 ⇒ 不可达。第一版测试草稿踩中它红了 24 条，换 768×448 后全绿。
+- 变异对照：M1 去掉关键帧项 ⇒ 28 红；M2 把 `temporal.video_t` 换成编码器的
+  `h3_video_encoder_latent_t()`（F51 同款陷阱）⇒ 40 红。还原后 `h3_dit.c` 与 HEAD 无差异。
+- 验收：新测试 EXIT=0（58 条 ok）；`make test` EXIT=0（141 行 `  ok  `、比上轮 +58；16 行
+  `ok:`/`PASS`；15 skip；0 FAIL；0 `warning:`）。本轮被执行侧代码零改动 ⇒ 逐位锚无需重跑。
+
+**重排后的待办**
+1. ~~提交本步~~ 已做（2026-10-06）：`85785cb` = 新测试 + Makefile；记录另计一笔（不记它自己的哈希）。
+   不 push。
+2. reference 收费口径要不要收紧：给 `h3_dit_sequence_estimate()` 传参考的真实几何（或至少一个
+   "最大参考帧网格行数"），把 1.75×～1.95× 的保守换成有界近似；这会改档位行为，要先出数字再动。
+3. 若哪天有带 video_encoder / REF2VA 的机器：跑一次真 i2v 与一次 Ref2VA，把 F55 §4 的
+   "端到端未跑"消掉。
+4. CLI 的 `Longest clip at WxH` 那行仍未在真机 REPL 眼验（管道喂不动 linenoise）。
+5. F44 §2 未做的：视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、终端每帧 fork、4+3 处文档相反。
+   Metal 三条要 M5 GPU 数据（本机 M4 无 TensorOps）。
+6. 观察项（未改，F52 §4）：`h3.c:1465-1467` 用 `bytes * 0 +` 表达"每次调用后释放"。
+7. 清理待判：`/Volumes/data/tmp/h3scr/f53/backup/`（619 MB 原始分片）与各轮 e2e 产物。

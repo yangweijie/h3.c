@@ -2717,3 +2717,38 @@ M3 去掉短路 ⇒ 1 红；M4 去掉步数预检 ⇒ 2 红。同时记了一条
 **状态**：代码笔 `91d5c5c` = `fastvideo_qad/scripts/add_h3_adaln_cache_meta.py`（重构）+ 新测试
 `tests/test_adaln_cache_meta_tool.py` + `Makefile`（接线）；记录（含这一行）另计一笔、不记它自己的
 哈希。未 push。
+
+## 续 45（2026-10-06）：i2v/reference 的估计校准改走 host 侧对账（F55）
+
+待办 2 的前提先查实：`h3c-q4-native` 与 `h3c-official` 都只有 `FL2VA/{transformer,video_vae,
+audio_vae,tokenizer}` —— 没有 video_encoder、没有 REF2VA，所以 i2v/Ref2VA 端到端在这台机器上
+**根本起不来**，F50 那句"没有可跑的锚"是真的。但决定这两条路径内存的东西全在 host 侧：
+`h3_layout_build()` 就是行数的权威。于是把估计和 layout 摆在同一批形状上对打，一行 GPU 都不碰
+（`tests/test_sequence_estimate_layout.c`，58 条断言，进 `make test`）。
+
+**测到什么**：48 例（4 画幅 × 3 片段长度 × {无参考,1 参考} × {0,1,2 关键帧}）里 **36 例估计与
+layout 一行不差** —— 那正好是全部不带参考项的形状，也就是说首尾关键帧这条路不是"方向安全但未验证"，
+是准确。剩下 12 例全在参考项上：256²/22f 每个参考估 522 行、layout 真发 64 行，整体富余 77%（22f）
+到 95%（127f）。原因是收费口径 —— 估计按"整个片段的 video+audio 行"收一个参考，而
+`h3_host.c:400-460` 一个图像参考只发一份 frame grid。**方向安全，本轮没收紧**：收紧会改档位行为，
+得先出数字再动，已列进待办 2。
+
+**一次先怀疑自己前提、比先怀疑被测代码便宜的例子**：第一版草稿塞了 768×432，红 24 条，报的都是
+`invalid latent canvas or out of memory`。查下去：`h3_frame_grid()` 要偶数边长，而 `h3.c:900` 已把
+输出画幅、`:915` 已把内部 render 画幅都限成 32 的倍数 ⇒ 奇 latent 不可达，引擎没这个坑，是我的用例
+到了引擎到不了的地方。换 768×448 / 448×768 后全绿。（顺带记下那句错误信息的"or out of memory"
+是误导性兜底。）
+
+**变异对照**：M1 去掉关键帧那一项 ⇒ 28 红；M2 把估计里的 `temporal.video_t` 换成编码器的
+`h3_video_encoder_latent_t()` —— 正是 F51 刚踩过、并在记录里立了规矩的那个"名字近的 helper"陷阱 ——
+⇒ 40 红。批流程照例（前置检查、`rm` 掉 .o 与二进制强制重编、变异与还原同一次调用、跑完比 sha256），
+最后 `git diff --stat` 只剩 Makefile，证明估计式一字未改地回了基线。
+
+**记账**：本轮被执行侧代码零改动 ⇒ 上一轮的逐位锚不需要重跑；这不是"沿用上次结果"，而是改动面
+为零时数值面必然为零，并且由 sha256/diff 两面同时确认。
+
+**验收**：新测试 EXIT=0（58 条 `  ok  `）；`make test` EXIT=0（141 行 `  ok  `、比上轮 +58；
+16 行 `ok:`/`PASS`；15 skip；0 FAIL；0 条 `warning:`）。
+
+**状态**：代码笔 `85785cb` = `tests/test_sequence_estimate_layout.c` + `Makefile` 接线；
+记录（含这一行）另计一笔、不记它自己的哈希。被引擎执行的代码本步零改动。未 push。

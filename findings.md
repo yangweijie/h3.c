@@ -5380,3 +5380,70 @@ python3 fastvideo_qad/scripts/add_h3_adaln_cache_meta.py \
   --source-model /Volumes/data/MODELS/h3c-q4-native/FL2VA/transformer \
   --backup-dir /Volumes/data/tmp/h3scr/f53/backup --dry-run       # 三份全报 already carries
 ```
+
+---
+
+# F55（2026-10-06）：i2v / reference 的估计路径改走 host 侧对账，F50 那句"未实测"结掉一半
+
+F50 留了一句"首尾关键帧与 reference 的估计路径未实测（本机没有可跑的 i2v 锚）"。
+本轮确认那半句的前提是真的：`h3c-q4-native` 与 `h3c-official` 都只有
+`FL2VA/{transformer,video_vae,audio_vae,tokenizer}`，**没有 video_encoder、没有 REF2VA**，
+i2v/Ref2VA 端到端在这台机器上起不来。但决定这两条路径内存的东西全在 host 侧 ——
+`h3_layout_build()` 就是行数的权威。于是把两边同形状对打，不看 GPU。
+
+## 1. 测出来的三件事
+
+新测试 `tests/test_sequence_estimate_layout.c`（58 条断言，进 `make test`）：4 个画幅 ×
+3 个片段长度 × {无参考, 1 参考} × {0,1,2 关键帧条件}，每例都断言
+`h3_dit_sequence_estimate() >= layout.seq_len`（低于才是危险方向）。
+
+1. **关键帧路径精确相等**：48 例里 36 例（= 全部不带参考项的形状）估计与 layout **一行不差**。
+   也就是说 F50 那句"首尾关键帧未实测"到此结掉：它不是"方向安全但未验证"，是**准确**。
+2. **reference 项实测富余 1.75×～1.95×**：256²/22f 每个参考估 522 行、layout 真发 **64** 行；
+   总富余从 77%（22f）涨到 95%（127f）。原因在收费口径：估计按"整个片段的 video+audio 行"收一个参考，
+   而 `h3_host.c:400-460` 对一个图像参考只发一份 frame grid，视频参考是 frame grid + 它自己的
+   audio 行。**方向安全**（只会偏保守），代价是长片段上把内存档位往保守推。
+   收紧它需要按参考真实几何收费，而现在的 API 只拿 `reference_count` —— 要么加参数，
+   要么按 `frame_rows + 2*audio_t` 这类上界收。本轮只做校准，**没动口径**（见 §4）。
+3. **一个我以为的缺陷查清了不是**：`h3_frame_grid()` 要求 latent 边长为偶数，
+   所以 768×432 这种画幅 layout 直接拒（`invalid latent canvas or out of memory`，措辞里那句
+   "or out of memory" 是误导性兜底）。但 `h3.c:900` 已经把输出画幅、`:915` 已经把内部
+   render 画幅都限定成 32 的倍数 ⇒ **奇 latent 不可达**，引擎没这个坑。
+   我第一版测试草稿正是因为塞了 768×432 而红 24 条，换成 768×448 / 448×768 后全绿 ——
+   红的时候先怀疑自己的前提，比先怀疑被测代码便宜。
+
+## 2. 变异对照：它能不能抓到"低估"
+
+| 变异（改 `h3_dit.c` 的估计式） | 红数 |
+|---|---|
+| M1 去掉 `frame_rows * condition_count`（关键帧那一项） | 28 |
+| M2 把估计里的 `temporal.video_t` 换成 `h3_video_encoder_latent_t()` | 40 |
+
+M2 就是 F51 刚踩过的那个"两个名字近的 latent helper"陷阱，如今这条测试会当场抓住它。
+批流程照例：前置检查 LHS 唯一 / RHS 基线不存在、`rm` 掉 `.o` 与测试二进制强制重编、
+变异与还原同一次调用、跑完对 `h3_dit.c` 比 sha256（`git diff --stat` 最后只剩 Makefile，
+证明估计式一字未改地回到基线）。
+
+## 3. 验收
+
+- `./h3_sequence_estimate_layout_test`：EXIT=0，58 条 `  ok  `。
+- `make test`：EXIT=0，141 行 `  ok  `（比上轮 +58，正是新测试）、16 行 `ok:`/`PASS`、
+  15 skip、0 FAIL、0 条 `warning:`。
+- 本轮**没有**改任何被引擎执行的代码（`h3_dit.c` 变异批还原后与 HEAD 无差异），
+  所以上一轮的逐位锚不需要重跑；这是"改动面为零 ⇒ 数值面为零"的记账，不是又一次沿用。
+
+## 4. 保留
+
+- 端到端 i2v / Ref2VA **仍未跑过**（缺组件），本测试对的是行数学；真到了那台有编码器的机器上，
+  `h3_generate()` 与 layout 的对账 warning 仍是最后兜底。
+- reference 的收费口径**没收紧**：收紧会改变档位行为，属于要单独论证的一步。
+- sweep 里参考几何用的是"与目标同画幅"（最坏情况）与更小画幅，**没测**参考比目标大的形状 ——
+  那需要先确认 `h3_reference_image_canvas()` 的下采样-only 性质（`h3_host.h:101-106`）。
+
+## 5. 复现
+
+```bash
+make h3_sequence_estimate_layout_test && ./h3_sequence_estimate_layout_test   # 58 条 ok
+grep -n "h3_video_encoder_latent_t\|video_rows = frame_rows" h3_dit.c | head
+sed -n '400,462p' h3_host.c        # 参考项真实发了多少行
+```
