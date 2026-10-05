@@ -2537,3 +2537,68 @@ EXIT=0 写出 mp4"；22f 的 latent `6e9c2d87…` 与 mp4 `ac0d0940…` 两串�
 **入库更正**：本条原先写"六轮改动未入库"是过期前提 —— `d51d414`（10-05 14:30）已收走
 F40/F42/F43/F45 与新测试/脚本/README/Makefile；本轮补两笔 `0301614`（F47+F49 代码）与
 `dbe42d2`（F46~F49 记录）。工作区干净，未 push。
+
+## 续 40（2026-10-05）：内存规划补上可信的 sequence 估计，并让它自证（F50）
+
+做 F49 待办 1。`h3_dit.c` 新增 `h3_dit_sequence_estimate()`（按 `h3_layout_build()` 的真实构成：
+每帧 `(latent_h/2)(latent_w/2)` 行 × `latent_t`、首尾关键条件各一份 frame_rows、音频 `2*audio_t`、
+每个 reference 按满画幅一整个序列计入）与 `h3_dit_plan_bytes()`（latent + activation 合在一处，
+**两个调用点共用**），`h3.c` 用 `strlen(prompt)` 当 token 行上界，REPL 预览没有 prompt 就传 0
+并注明差这一项。
+
+**给了它一个自证**：`h3_generate` 在 layout 建好后与 `planned_rows` 对账 —— 低估就打印 warning
+（只有这个方向会让档位过于乐观），`H3_PROFILE=1` 时两种情况都打印数字。实测 256²/22f
+得 `planned 552, layout 528` ⇒ 高估 4.5%，安全方向；两串逐位锚不变；`make test` exit 0，无新告警。
+
+**过程中一次自我纠正**：我第一版把 CLI 侧改成只算 activation，**静默丢了 latent 项**——正是我这轮
+要避免的那类漂移。改成 `h3_dit_plan_bytes()` 由结构上保证两边同式，不是靠人记住。
+
+**明确未验证**：首尾关键帧与 reference 的估计路径（本机没有 i2v 锚可跑）。reference 是**上界**
+（一张图实际只加一份 frame_rows，我按整个序列算，方向安全、代价是可能偏保守一丁点）；
+真低估了会由那条 warning 抓出来，这是留的兜底，不是"应该没问题"。
+
+**状态**：4 个代码文件已改未提交（`h3.c h3_cli.c h3_dit.c h3_dit.h`）；上一轮已提交
+`0301614`/`dbe42d2`/`a88c17d`，仍未 push。
+
+## 续 41（2026-10-05）：反查"最长能出多少帧"落地，测试抓到一个够不着的上限（F51）
+
+做 F50 待办 2，照 splash `contextTokensWithin` 的**接口形状**（不抄它的数）补上反向那一半。
+
+**关键设计是"共用而不是重抄"**：把 `h3_memory_plan_auto()` 内部的预算折扣规则抽成公开的
+`h3_memory_plan_budget_bytes()`，正向判档位和反向查最长片段都走它 —— 否则两条式子迟早漂。
+`h3_memory_plan_frames_within()` 在 **`22 + 17k`** 梯子上二分 `h3_dit_plan_bytes()`（F50 刚建的
+那个共用式），所以返回的长度一定是 `h3_align_frame_count()` 认得的、调用方真能请求的长度；
+22 帧一个训练块都塞不下就返回 0。CLI `!memory-plan` 多打一行
+`Longest clip at WxH: N frames (+)`。
+
+**新测试抓到的是我写的真缺陷，不是用例毛病**：上限第一版 `4065` 不在梯子上
+（`align(4065) = 4068`，梯子要 `f ≡ 5 mod 17`），于是二分最大只能答 4051，
+`longest == H3_PLAN_FRAMES_CEILING` 恒假 ⇒ "撞到上限"的 `+` 号一次都不会出现，用户只能把
+4051 误读成硬顶。断言 `align(CEILING) == CEILING` 直接失败把它抓到，改成 4051 后全绿。
+这条断言的价值在于它检查"外部世界能否表示这个返回值"，而不是函数自洽 —— 后者永远发现不了。
+
+**数字都改成实测**（256²/文本上界 64）：8 GiB ⇒ 3252 帧（正向复核 7.9707 GiB 放得下，
+梯子下一级 3269 是 8.0122 GiB 放不下）；768×432 ⇒ 753 / 下一级 770 放不下。测试的每个用例
+就是"问一次 → 正向复核放得下 → 复核下一级放不下"，所以这张表是断言本身，不是另算。
+
+**顺带把 F48 §2 的手算就地更正了**：那处用了 `h3_video_encoder_latent_t()`（`(f+3)/4`，
+VAE 编码器下采样），而 DiT 序列用的是 `h3_video_latent_t()`（`((f-5)/17)*5+2`）。名字太像，
+抓错一个就全盘错：rows 差算成 356（实测 **752**），44 帧对齐长度记成 58（实测 **56**）。
+更正后每块 `(2.955 − 0.083)/4 = 0.718 GiB`，与独立算出的 0.719 对上到 0.001 —— 结论没变，
+但两条独立路径现在真能闭合。`h3_dit.c` 里"~0.1 GiB"那句注释同步改成实测 0.141 GiB。
+**规矩定下来：真函数能答的问题不要手算。**
+
+**明确未眼验**：CLI 那一行只在纯 C 层由同一组函数覆盖。想用管道喂 REPL 亲眼看一次打印没成功
+（`printf '…\nquit\n' | ./h3 -d <cached>` 不响应 stdin 输入，挂住无输出，已停）。
+要看真打印得在交互终端手打 `!memory-plan`。
+
+**逐位锚本轮复跑过**（不是沿用上一轮）：同一命令 256²/22f/steps4/seed42 + int8-convrot 4B
+⇒ EXIT=0，latent `6e9c2d8786cea097ddf9bdd45e5593bd`、mp4 `ac0d0940434ad216d8131f7469154b70`
+两串逐字符不变，自证行仍是 `h3: [mem] planned 552 token rows, layout 528`。
+这次常驻给了 **6/50** 块（F48 §3 那条"抽奖"在修后的二进制上只有一个观测值，已记清不能与
+修前的 3 / 9 排成同代码序列）。`make test` exit 0：新测试 14 条断言全绿、全仓 50 行 `  ok  `
++ 11 行 `ok…`、15 skip、0 FAIL、0 `warning:`。
+
+**状态**：本步代码 6 个文件 + 1 个新测试未提交（`h3.c h3_cli.c h3_dit.c h3_dit.h
+h3_memory_plan.c h3_memory_plan.h Makefile tests/test_memory_plan_inverse.c`）；
+上一轮已提交 `0301614`/`dbe42d2`/`a88c17d`，**仍未 push**。

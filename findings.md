@@ -4895,20 +4895,29 @@ md5 -q /tmp/s4.bin   # 6e9c2d8786cea097ddf9bdd45e5593bd
 ## 2. 两点求斜率 ⇒ 每块常驻的真实成本是 0.72 GiB，代码按 0.50 GiB 算
 
 - 峰值差 `10.995 − 8.040 = 2.955 GiB`，常驻块差 `13 − 9 = 4` 块 ⇒ **0.739 GiB/块**。
-- 其中激活的贡献要扣掉：两形状的 rows 差 ≈ 784−428 = 356 行，按 `allocate_activations()`
-  默认活集合（MLP 融合开、别名开）118,272 B/行 ≈ **0.040 GiB** ⇒ 每块
-  `(2.955 − 0.040)/4 = 0.729 GiB`。
+- **更正（2026-10-05，F51 复算）**：下面这条原来用 `latent_t = (f+3)/4` 手算，那是
+  `h3_video_encoder_latent_t()`（`h3_host.c:35-37`，编码器下采样）的式子，不是 DiT 序列的
+  `h3_video_latent_t()`（`:30-33`，`((f-5)/17)*5+2`）。改成直接调真函数测：
+  256²、文本 6 行、无附加条件下
+  `--frames 22` → 对齐 **22**、估计 **528 行**（6 文本 + 448 视频 + 74 音频）、激活 0.0582 GiB；
+  `--frames 44` → 对齐 **56**（梯子同余于 5 mod 17：5/22/39/56…，我先前记成的"58"也不对）、
+  **1280 行**、激活 0.1410 GiB。
+  于是 rows 差 = `1280 − 528 = 752` 行，按 `allocate_activations()` 默认活集合
+  （MLP 融合开、别名开）118,272 B/行 ≈ **0.083 GiB** ⇒ 每块
+  `(2.955 − 0.083)/4 = 0.718 GiB`。
 - 独立核对（不靠拟合）：`allocate_stream_slot()` 的 BF16 权重是
   `INNER*3*HIDDEN + HIDDEN*INNER + FFN*2*HIDDEN + HIDDEN*FFN` 个元素
-  = 385,874,432 元素 × 2 B = **736 MiB = 0.719 GiB/块** —— 与拟合值一致。
+  = 385,874,432 元素 × 2 B = **736 MiB = 0.719 GiB/块** —— 与拟合值 **0.718** 相符。
+  （更正前那版算出的 0.729 也落在同一量级，结论没变，但两条独立路径现在能对上到 0.001 GiB。）
 - 而 `h3_dit.c:2779` 用的是字面量 `per_block = 0.5 * 1024^3`，其注释的理由是
   "int8 权重占主导，约 0.39 GiB，取保守的 0.5 GiB"。
   **这个前提只在 `--int8` 开着时成立**；`--ssd-streaming` 不带 `--int8`（M4 上的默认路径）
   槽位是 BF16 ⇒ 0.719 GiB ⇒ **低估 1.44×**，于是多钉约 44% 的块。
   44f 那次 13 块 ≈ 9.3 GiB 槽位，加上 11 GiB 峰值，16 GiB 机器直接在去噪中被杀。
 
-⇒ **F47 待办 1 里"activation 是长片段主导项"这个假设不成立**：activation 在 44f 上只有
-0.09 GiB 量级（118,272 × 784 ≈ 93 MB），而每块成本误差一项就是 13 × 0.22 ≈ 2.9 GiB。
+⇒ **F47 待办 1 里"activation 是长片段主导项"这个假设不成立**：activation 在 44f（对齐 56 帧）
+实测 0.141 GiB（118,272 × 1280 ≈ 151 MB），而每块成本误差一项就是 13 × 0.22 ≈ 2.9 GiB。
+长片段确实把它顶大了（0.058 → 0.141 GiB），但那是 2.4×，而致命的是 13 块 × 0.22 GiB 的累积。
 
 ## 3. 第二个实测事实：`h3_host_available_memory()` 同形状两次给出 2.6 / 5.6 GiB
 
@@ -4916,6 +4925,11 @@ md5 -q /tmp/s4.bin   # 6e9c2d8786cea097ddf9bdd45e5593bd
 同画幅同帧数同二进制，常驻块数差 3 倍，说明这个"可用内存"读数被页缓存/压力状态左右，
 而常驻决策**只**靠它 ⇒ 常驻策略成了抽奖。这不是新问题（F41 待办 3 就缺这一维的记账），
 但现在有了具体数字：**同形状 3↔9 块、对应 available 2.6↔5.6 GiB**。
+
+> F51 复跑同一形状（256²/22f/steps4/seed42，两串逐位锚不变，F49 修后的二进制）钉了 **6** 块。
+> 注意这**不能**与上面 3 / 9 排成一条同代码的序列 —— 那两次是 F49 之前的二进制
+> （`per_block` 还是 0.5 GiB、也没有物理内存那道夹）。所以能说的只是：修后仍然只有一个
+> 观测值 6，而抽奖的源头（`available` 自身不稳定）没有被 F49 动过 —— 加的是上夹，不是去抖。
 
 ## 4. 修正后的做法（下一步该做的）
 
@@ -5004,4 +5018,137 @@ H3_CLIPPROJ_PROJ=/Volumes/data/.lmstudio/models/ClipProj-MiniMax-H3 \
 grep "partial residency" /tmp/...   # 4 of 50 ... per-block 0.72 GiB
 # 逐位锚（22f）
 md5 -q <latent> <mp4>   # 6e9c2d8786cea097ddf9bdd45e5593bd / ac0d0940434ad216d8131f7469154b70
+```
+---
+
+# F50（2026-10-05）：给内存规划补上可信的 sequence 估计，并让它自证
+
+F49 §3 留的那条：`h3.c`/`h3_cli.c` 的 activation 项缺 DiT 自己的激活 arena，原因是规划点跑在
+layout 与 tokenize 之前，拿不到真实行数。这轮补上，并且**不给没有自证的估计**。
+
+## 1. 新增的三个口子（`h3_dit.c`，声明在 `h3_dit.h`）
+
+- `h3_dit_sequence_estimate(width, height, frames, text_rows_upper_bound, condition_count,
+  reference_count)` —— 按 `h3_layout_build()` 的真实构成写：`(latent_h/2)*(latent_w/2)` 行/帧 ×
+  `latent_t` 帧，一帧首尾关键条件再加一份 frame_rows，音频每 latent 帧 2 行（`h3_audio_grid`
+  就是 `audio_t*2`），每个 reference 按**满画幅一份序列**计入。
+- `h3_dit_activation_bytes(rows)` —— F49 加的 118,272 B/行。
+- `h3_dit_plan_bytes(...)` = latent + activation，**两个调用点共用它**，这样" generate 侧算了
+  latent、REPL 预览漏掉 latent"这种事没法再发生（我第一版就在 CLI 侧漏了 latent 项，被这条结构
+  逼回来）。
+
+文本行数：`h3.c` 有 prompt，用 `strlen(prompt)` 当上界（BPE 不会产生比字节数更多的 token）；
+REPL 的 `!memory-plan` 预览没有 prompt（prompt 是每命令参数，不在 session params 里），
+那里传 0 并在注释里写明它少这一项、权威检查在 `h3_generate`。
+
+## 2. 自证：估完必须和真实 layout 对账
+
+`h3_generate` 在 `h3_layout_build()` 成功后比对：
+- **低估**（`layout.seq_len > planned_rows`）⇒ 打印 warning，因为这是唯一会让档位过于乐观的方向；
+- 否则只在 `H3_PROFILE=1` 下打印 `h3: [mem] planned N token rows, layout M`，让估计平时可校准。
+
+实测（256²/22f/t2v/steps4，int8-convrot 4B + 缓存档）：`planned 552 token rows, layout 528`
+⇒ **高估 4.5%，安全方向**；同一次运行 latent `6e9c2d8786cea097ddf9bdd45e5593bd`、
+mp4 `ac0d0940434ad216d8131f7469154b70` 两串逐字符不变（估的是内存，不动数值）。
+`make test` exit 0（48 行绿、15 skip、无 FAIL），无新告警（剩下的 3 条 `h3_cli.c:752/754`、
+`h3.c:494` 都是 HEAD 就有的）。
+
+## 3. 边界与已知不精确（不要当成已验证）
+
+- reference 项是**上界**：一张参考图实际只加 `frame_rows`，我按满画幅一整个序列算 ⇒ 多估数倍。
+  方向安全，代价是档位可能偏保守一丁点；量化上界是每参考 ~458 行 × 118 KB ≈ 54 MB 的激活。
+- **首尾关键帧 / reference 的估计路径未实测**（本机没有可跑的 i2v 锚，跑一次要图 + 另一组基线）。
+  若它低估，运行时会打印上面那条 warning —— 这是有意留的兜底而不是"应该没问题"。
+- 溢出检查：行数量级到 768²/360f 约 5.2 万行 × 118 KB ≈ 6.1 GB，`size_t` 无溢出；
+  参考数与条件数都是小整数。
+
+## 4. 复现
+
+```bash
+H3_PROFILE=1 ./h3 -d <cached> --ssd-streaming -p "..." --width 256 --height 256 \
+  --frames 22 --steps 4 --seed 42 -o /tmp/x.mp4 2>&1 | grep "\[mem\]"
+# h3: [mem] planned 552 token rows, layout 528
+grep -n "h3_dit_sequence_estimate\|h3_dit_plan_bytes" h3.c h3_cli.c h3_dit.c h3_dit.h
+```
+
+---
+
+# F51（2026-10-05）：把"这个画幅最长能出多少帧"接成反查，并让正/反规划共用同一条预算式
+
+splash 的 `MemoryPlan.hpp` 旁边有个反向查询 `contextTokensWithin`（给定预算问最长上下文），
+它的价值不在算法而在**共用规则**：正向判定和反向查询如果各抄一遍预算折扣，迟早漂。
+本轮照这个形状补 h3 这边缺的另一半。
+
+## 1. 改了什么
+
+- `h3_memory_plan_budget_bytes(device)`（`h3_memory_plan.c:13`，新公开）：把
+  `h3_memory_plan_auto()` 内部那条 `min(建议工作集×80%, (物理内存−4 GiB)×85%)` 抽出来，
+  正向档位判定与反向最长查询都走它。`h3_memory_plan_auto()` 里因此不再用的 `physical`
+  局部一并删掉（留着就是 `-Wunused-variable`）。
+- `h3_memory_plan_frames_within()`（`h3_memory_plan.c:29`）：在 **`22 + 17k`** 这个梯子上二分
+  `h3_dit_plan_bytes()`，搜索区间 `(H3_PLAN_FRAMES_CEILING − 22)/17`。连"22 帧一个训练块都
+  放不下"这种情形都返回 0，而不是返回一个请求了也会被对齐改写的数。
+- `H3_PLAN_FRAMES_CEILING 4051`（`h3_memory_plan.h:78`，= `22 + 17×237` = `5 + 17×238`）：
+  命中它表示"至少这么多"，注释写明它只覆盖 latent + activation 的增长，**是估计不是承诺**。
+- CLI `!memory-plan`（`h3_cli.c:780-805`）：在同一条 ceiling 上先扣掉流式常驻权重，再打印
+  `Longest clip at WxH: N frames (+) (room of a C GiB ceiling)`；放不下 22 帧时改打印缺多少。
+
+## 2. 新测试当场抓到一个"够不着的上限"——这是真缺陷，不是 harness 毛病
+
+我第一版把上限写成 **4065**。`h3_align_frame_count()`（`h3_host.c:22-28`）要求
+`f ≡ 5 (mod 17)`，而 `align(4065) = 4068` —— 4065 根本不在梯子上。后果是二分的最大可达答案是
+4051，于是 `longest == H3_PLAN_FRAMES_CEILING` 这个"撞没撞到上限"的等式**永远为假**，
+`+` 号一次都不会出现，而用户会把 4051 读成硬上限。
+
+`tests/test_memory_plan_inverse.c:85` 的成员断言（`align(CEILING) == CEILING`）把它抓住，
+失败信息就是返回的 4051。改成 4051 后全绿。**这条断言之所以有意义，是因为它检查的是
+"外部世界能不能表示这个值"，而不是函数自洽。**
+
+## 3. 实测数字（全部走真函数，不再手算）
+
+256²/文本上界 64 行/无条件无参考：
+
+| 反查预算 | 答案 | 正向 `h3_dit_plan_bytes()` |
+|---|---|---|
+| 8 GiB @ 256×256 | **3252** 帧 | 7.9707 GiB（放得下） |
+| — 梯子下一级 | 3269 帧 | **8.0122 GiB（放不下）** |
+| 8 GiB @ 768×432 | **753** 帧 | 7.9389 GiB（放得下） |
+| — 梯子下一级 | 770 帧 | **8.1175 GiB（放不下）** |
+| 64 GiB @ 256×256 | **4051 帧**（撞上限，打 `+`） | — |
+
+测试的每个用例都是"问一次 → 用正向函数复核答案真的放得下 → 复核梯子下一级放不下"，
+所以这张表不是另算一套，而是断言本身。另外三条边界也钉住了：差一字节放不下 22 帧、
+恰好一份 22 帧返回 22、`plan(39)+1` 字节仍返回 39。单调性四向（预算/画幅/关键帧条件/参考图）
+各一条。
+
+## 4. 已知不精确（写进了头文件注释，别当已验证）
+
+- 只计入 **latent + activation** 两项增长。延续 F50 的口径，参考图按满画幅整个序列算（上界），
+  页缓存状态它无从知道；`h3_generate()` 仍然会拿自己估的行数和真正 build 出来的 layout 对账。
+- CLI 那行刻意把文本行留成 0（prompt 是逐命令给的，不在会话参数里），所以预览是**乐观端**。
+- 4051 只是让二分收敛的搜索边界，不代表任何机器跑得动这么长的片段。
+- **本机 REPL 里那一行长什么样，还没眼验**：试着用 `printf '…\nquit\n' | ./h3 -d <cached>`
+  喂 linenoise，进程不响应管道输入（挂住、无输出），我把它停了。这一行的正确性目前只在
+  纯 C 层（同一组函数）由上面的测试覆盖。想真看一眼需要在交互终端里手打 `!memory-plan`。
+
+## 5. 顺带的就地更正：F48 §2 的手算用错了 latent 式子
+
+见 F48 §2 的更正块。原因是 `h3_host.c` 有两个同名近似的 helper：
+`h3_video_encoder_latent_t()`（`:35-37`，`(f+3)/4`，VAE 编码器下采样）和 DiT 序列真正用的
+`h3_video_latent_t()`（`:30-33`，`((f-5)/17)*5+2`）。手算抓错了那一个， rows 差算成 356
+行（实际 **752** 行），顺带把 44 帧对齐后的长度记成 58（实际 **56**）。
+改成实测后：22f = 528 行 / 0.0582 GiB，56f = 1280 行 / 0.1410 GiB，每块
+`(2.955 − 0.083)/4 = 0.718 GiB`，与独立算出的 0.719 GiB 对上到 0.001。
+`h3_dit.c:2839-2842` 那句"~0.1 GiB"的注释一并改成实测 0.141 GiB。
+
+**教训**：这类"两个名字像的 helper"正是手算最容易踩的坑；凡是能被真函数回答的问题就别手算，
+本轮的做法（把数字搬进 probe / 测试）以后固定下来。
+
+## 6. 复现
+
+```bash
+make h3_memory_plan_inverse_test && ./h3_memory_plan_inverse_test   # EXIT=0，14 条 ok、0 FAIL
+grep -n "h3_memory_plan_budget_bytes\|h3_memory_plan_frames_within\|H3_PLAN_FRAMES_CEILING" \
+  h3_memory_plan.c h3_memory_plan.h h3_cli.c
+grep -n "更正（2026-10-05" findings.md   # F48 §2 的更正块
 ```

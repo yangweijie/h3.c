@@ -2592,3 +2592,59 @@ ANE 判死线仍在构建（删除需单独批准）。
    `d51d414`（10-05 14:30）已经收走 F40/F42/F43/F45 与新测试/脚本/README/Makefile；
    本轮另起两笔：`0301614`（F47+F49 代码）、`dbe42d2`（F46~F49 记录）。工作区已干净、**未 push**。
    上面 2362/2414/2453/2491/2533/2565 各行里的"未入库"是当时的状态，保留不改。
+
+
+## 新增（2026-10-05）：内存规划的 sequence 估计落地并带自证（F50 / progress 续 40）
+
+`h3_dit_sequence_estimate()` + `h3_dit_plan_bytes()`（latent+activation 合式，两个调用点共用）；
+`h3.c` 用 `strlen(prompt)` 当 token 行上界，REPL 预览无 prompt 传 0 并注明。
+自证：layout 建好后与估计对账，**低估打印 warning**，`H3_PROFILE=1` 打印双方数字。
+实测 256²/22f ⇒ `planned 552 / layout 528`（高估 4.5%，安全方向），两串逐位锚不变，
+`make test` exit 0。关键帧与 reference 的估计路径**未实测**（reference 是上界），低估由 warning 兜。
+
+**重排后的待办**
+1. 提交本步（4 个代码文件 + 记录），仍不 push。
+2. "给定字节能撑多少帧"的反查现在有可信输入了：`h3_memory_plan` 加一个
+   `h3_memory_plan_rows_within(...)` 形状的反查（照 splash `contextTokensWithin` 的接口，不抄它的数）。
+3. `h3_memory_plan.c:80-82` 用未夹 `rec` 算 `free_after_stream`（F44 §2 #13，一行）。
+4. i2v/reference 的估计校准：需要一个可跑的参考图锚；跑通后把 F50 §3 那条"未实测"消掉。
+5. F44 §2 未做项：视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、终端每帧 fork、4+3 处文档纠偏；
+   Metal 三条等 M5 数据。
+6. `s4/s8/s20` 的 meta 键仍未写（纯磁盘，让 F43 的 P1 收窄生效）。
+
+
+## 新增（2026-10-05）：反查"这个画幅最长多少帧"落地，测试抓到一个够不着的上限（F51 / progress 续 41）
+
+`h3_memory_plan_budget_bytes()` 抽出来给正/反两条查询共用（否则预算折扣规则会漂）；
+`h3_memory_plan_frames_within()` 在 **`22 + 17k`** 梯子上二分 `h3_dit_plan_bytes()`，
+答案一定是 `h3_align_frame_count()` 认得的长度；`H3_PLAN_FRAMES_CEILING = 4051`；
+CLI `!memory-plan` 多打一行 `Longest clip at WxH: N frames (+)`。
+
+**新测试 `tests/test_memory_plan_inverse.c` 当场抓到真缺陷**：上限第一版写成 4065，
+而 `align(4065) = 4068` ⇒ 4065 不在梯子上 ⇒ "撞到上限"的等式永远为假、`+` 号永不出现。
+断言 `align(H3_PLAN_FRAMES_CEILING) == H3_PLAN_FRAMES_CEILING` 抓住它，改成 4051 后全绿。
+实测对账（256²/文本上界 64）：8 GiB ⇒ **3252** 帧（7.9707 GiB），梯子下一级 3269 放不下
+（8.0122 GiB）；768×432 ⇒ **753**（7.9389）/ 下一级 770 放不下（8.1175）。
+
+**顺带就地更正 F48 §2 的手算**：那处用了 `h3_video_encoder_latent_t()`（`(f+3)/4`）而不是
+DiT 的 `h3_video_latent_t()`（`((f-5)/17)*5+2`），rows 差算成 356（实为 **752**），
+并把 44 帧对齐长度记成 58（实为 **56**）。改实测后每块 `(2.955−0.083)/4 = 0.718 GiB`，
+与独立算出的 0.719 对上到 0.001。`h3_dit.c` 那句 "~0.1 GiB" 注释同步改成实测 0.141 GiB。
+**今后凡真函数能答的问题不要手算。**
+
+**验收**：`make test` exit 0（新测试 14 条断言全绿、0 FAIL；全仓 50 行 `  ok  ` + 11 行 `ok…`
+收尾（含 `ok: 1829 checks`）、15 skip、0 FAIL、该次构建 0 条 `warning:`）；
+两串逐位锚 `6e9c2d87…`/`ac0d0940…` 不变；`h3_cli.c` 只剩 2 条原有告警。
+
+**未眼验**：CLI 那一行只在纯 C 层由测试覆盖。管道喂 linenoise REPL 不响应
+（`printf '…\nquit\n' | ./h3 -d <cached>` 挂住无输出），要看真打印得在交互终端手打 `!memory-plan`。
+
+**重排后的待办**
+1. 提交本步（`h3.c h3_cli.c h3_dit.c h3_dit.h h3_memory_plan.c h3_memory_plan.h h3_host.c
+   h3_host.h Makefile` + 新测试 + 三份记录），**不 push**。
+2. `h3_memory_plan.c:80-82` 用未夹 `rec` 算 `free_after_stream`（F44 §2 #13，一行）。
+3. meta 键装到 `s4/s8/s20`（纯磁盘活，让 F43 的 P1 收窄真正生效）。
+4. i2v/reference 估计路径的校准：需要一个可跑的参考图锚（现在是上界 + warning 兜底）。
+5. F44 §2 未做的：视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、终端每帧 fork、4+3 处文档相反。
+   Metal 三条要 M5 GPU 数据（本机 M4 无 TensorOps）。
+6. 逐位锚不变：latent `6e9c2d8786cea097ddf9bdd45e5593bd` / mp4 `ac0d0940434ad216d8131f7469154b70`。
