@@ -146,6 +146,9 @@ h3_memory_plan_inverse_test: tests/test_memory_plan_inverse.o $(LIB_OBJ)
 h3_memory_plan_tiers_test: tests/test_memory_plan_tiers.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_sequence_estimate_layout_test: tests/test_sequence_estimate_layout.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_dit_test: tests/test_real_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -201,7 +204,8 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_convrot_test h3_vdn_tests h3_int8_raw_test h3_ane_staging_test \
 	h3_flash_attn_tests h3_real_dit_schedule_test \
 	h3_adaln_cache_lora_gate_test h3_clipproj_selection_test \
-	h3_memory_plan_inverse_test h3_memory_plan_tiers_test
+	h3_memory_plan_inverse_test h3_memory_plan_tiers_test \
+	h3_sequence_estimate_layout_test
 
 	./h3_tests
 	@if test -f misc/fixtures/h3_dit.safetensors && \
@@ -233,6 +237,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	./h3_clipproj_selection_test
 	./h3_memory_plan_inverse_test
 	./h3_memory_plan_tiers_test
+	./h3_sequence_estimate_layout_test
 	@if test -f misc/fixtures/h3_real_dit_block0_bf16.safetensors && \
 	         test -d $(DIT_MODEL)/FL2VA/transformer; then \
 		./h3_real_dit_schedule_test $(DIT_MODEL) \
@@ -356,6 +361,7 @@ clean:
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_adaln_cache_lora_gate_test h3_clipproj_selection_test \
 		h3_memory_plan_inverse_test h3_memory_plan_tiers_test \
+		h3_sequence_estimate_layout_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 		h3_ane_int8_test h3_ane_staging_test h3_ane_block_test \
 		h3_ane_full_block_test h3_ane_vae_test h3_ane_vae_residency_test \
