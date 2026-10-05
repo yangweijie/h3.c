@@ -1125,7 +1125,10 @@ with no AdaLN factor (the VDN `.default` set, for instance) loads unchanged.
 Which adapters qualify is decided by the `adaln_cache_meta_s<steps>` width key
 the exporter writes when it can read the width from the checkpoint; caches
 exported before that key carry no width, and a cache with no declared width
-refuses every adapter. Block thinning (`--layers`) stays exact, because the gate
+refuses every adapter. Such a cache is repairable without re-running the dumps:
+`fastvideo_qad/scripts/add_h3_adaln_cache_meta.py` appends the width key by
+growing only the header -- every existing tensor keeps its offset and its bytes,
+and the tool refuses to guess the width if no checkpoint still declares it. Block thinning (`--layers`) stays exact, because the gate
 scores it ranks come from the modulation itself, which the cache reproduces bit
 for bit.
 
