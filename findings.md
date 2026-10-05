@@ -4989,7 +4989,8 @@ grep -n "INNER \* 3 \* HIDDEN\|HIDDEN \* INNER\|FFN \* 2 \* HIDDEN\|HIDDEN \* FF
   或者把规划挪到 layout 建好之后。
 - "给定字节能撑多少帧"的反查排在它后面 —— 现在正算的可信度只到 `h3_dit.c` 那一层。
 - `h3_memory_plan.c:80-82` 用未夹的 `rec` 算 `free_after_stream`（F44 §2 #13）仍未动。
-- 五轮改动 + F48/F49 全部未入库。
+- 入库状态（本条写就时更正）：`d51d414` 已收走 F40/F42/F43/F45 与新测试/脚本/README/Makefile；
+  F47+F49 的代码在 `0301614`，F46~F49 的记录在 `dbe42d2`。工作区干净，未 push。
 
 ## 4. 复现
 
