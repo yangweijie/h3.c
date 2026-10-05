@@ -4426,6 +4426,9 @@ trim 会把源目录里未被本次 `--dump` 覆盖的 `adaln_cache_s*.safetenso
   最后比对 52 个键名拼写与 meta 键拼写。
   **外部锚是真的**：探测出的 `dump_bytes_41/17/9` 与三档**真实已安装**缓存的载荷字节完全吻合
   （397,630,628 + 头部 5,200 = 397,635,828 等三行），所以公式不是自证。
+  > F53 补注（2026-10-06）：这三份后来被就地补上了 `adaln_cache_meta_s*` 键，每份 +92 B
+  > （头部 5,192→5,280、载荷尾 +4 B），s20 现在是 397,635,920 B。**这条锚没被推翻**：
+  > `dump_bytes_41` 比的仍是那 52 个张量的字节，meta 的 4 字节在载荷末尾另算。
   Mutation 控制 5 条全红且可归因：A 改 Python 常量、B 改 Python 字段序、C 改 C 侧槽位宏、
   D 改 C 侧键名拼写、E 改 C 侧尺寸式 —— 每条都必须是 FAIL 行而不是崩栈；B/E 一开始是靠
   `Dump` 抛 SystemExit 崩出来的，已把这类拒绝收敛成判定行（`parse_dump()`）。
@@ -5229,4 +5232,77 @@ F44 §2 #13 挂着的一条一行级缺陷，本轮结掉，并给它补上第�
 make h3_memory_plan_tiers_test && ./h3_memory_plan_tiers_test   # EXIT=0，13 条 ok
 grep -n "free_after_stream" h3_memory_plan.c
 grep -Fn "7/8" h3_memory_plan.h    # 计数应为 0（那段注释已删）
+```
+
+---
+
+# F53（2026-10-06）：给装早了的 AdaLN 缓存就地补 meta 键，P1 的收窄第一次在真文件上生效
+
+F43 把 C 侧判据从"有缓存就拒一切适配器"收窄成"只有真打 AdaLN 的适配器才拒"，但收窄靠
+`adaln_cache_meta_s{steps}` 报宽度；`h3c-q4-adalncache` 这三份是分片键存在**之前**装的
+（`weight_time_dim=None`、`source_time_dim=None`，实测），所以实际行为仍是一刀切。
+F52 之后的待办就是补这三个键。
+
+## 1. 改之前的真实行为（不靠推理，直接跑）
+
+用 `tests/gen_adaln_cache_fixture.py` 生成的三个夹具适配器打在**真已装分片**上跑 `./h3 -d ... --lora`：
+
+| 适配器 | 目标 | 补键前 | 补键后 |
+|---|---|---|---|
+| `adapter_attn_only` | `attn.orig.to_q` | 「has no adaln_cache_meta_s4 width key …」一律拒 | `note: none of the 1 LoRA adapter(s) target AdaLN, so the cached AdaLN modulation for 4 steps is used unmodified`，并走到 `precompute AdaLN 50/50` |
+| `adapter_adaln` | `transformer_blocks.0.adaln_proj.linear` | 同上（说不清） | `LoRA adapter 1 of 1 carries an AdaLN factor for a **2688**-wide input …` |
+| `adapter_norm_out` | `norm_out.linear` | 同上 | 同 `2688` 那条 |
+
+补键前三个都是同一句"无宽度键 ⇒ 全拒"，这正是 P1 的失效面；补键后两条路径按预期分叉，
+且拒绝句里的 2688 只能来自我写进去的那个键 —— 也就是说 C 侧真的读到了。
+
+## 2. 宽度不是写死的
+
+2688 由 `weight_time_dim()` 从**这批缓存导出时所用的那棵树**读来
+（`h3c-q4-native` 的 `blocks.0.adaln_proj.linear.weight` shape[1]；`h3c-official` 同值），
+脚本拿不到就 `SystemExit`，不猜。第三处独立吻合：`gen_adaln_cache_fixture.py:32` 早写着
+`TIME_DIM = 2688`，而夹具的 `block_output` 宽 96,768 = 36 × 2688、`final_output` 10,752 = 4 × 2688。
+
+## 3. 磁盘改动只做一件事：头部变长
+
+新张量的 4 字节追加在数据段**末尾**，所以既有 52 个张量的相对偏移一个都不变，载荷字节整段照抄。
+每份净 +92 B（s20 头部 5,192→5,280、载荷尾 +4），三份都自动复核：
+按备份算 SHA-256 区间摘要 ⇒ **载荷逐字节不变**（`51ffd1cfe389..` / `874fb8848a34..` /
+`d24018d8e87e..`），再回读 meta 得 2688。原文件先 `copy2` 到
+`/Volumes/data/tmp/h3scr/f53/backup/`（619 MB）才 `rename`，写的是同目录 `.tmp` 再原子换。
+工具落在 `fastvideo_qad/scripts/add_h3_adaln_cache_meta.py`：留着它的理由是
+"没有它就只能把三个步数各重跑一遍去重新 dump"。
+
+## 4. 端到端与保留意见
+
+- 上表的 `adapter_attn_only` 越闸之后**停在形状不符**：夹具那张 `lora_A` 是 `[16, 2688]`，
+  真 to_q 要 `[16, 5376]` —— 夹具本来就只为 AdaLN 尺寸造的，不是本步引入的问题。
+- 所以另造了一个**形状正确、值为零**的 rank-16 to_q 适配器（`[16,5376]`+`[7168,16]` BF16 全零）
+  打在缓存档上跑完整 256²/22f/steps4/seed42，与同一轮的不带适配器那臂配对：
+
+  | 臂 | 结果 |
+  |---|---|
+  | 无适配器 | EXIT=0，latent `6e9c2d8786cea097ddf9bdd45e5593bd`、mp4 `ac0d0940434ad216d8131f7469154b70` —— **补键之后两串逐字符不变** |
+  | 零值真形状适配器 | 先出 `note: none of the 1 LoRA adapter(s) target AdaLN …`，EXIT=0，**同样两串** |
+
+  也就是说"非 AdaLN 适配器 + 缓存档端到端跑通"这次是真跑通的，而且合并零不移动任何权重
+  这条性质顺带被同一对数字证明（合并路径本身没有把 BF16 权重绕一圈改掉）。
+- 三份之外的缓存没扫（本机 `find` 只命中这三份）；工具**可重入**：再跑一次报
+  `already carries adaln_cache_meta_s4 = 2688; left alone`。
+- 备份留在外置卷 `/Volumes/data/tmp/h3scr/f53/backup/`（619 MB），在仓库外所以不进 `.gitignore`，
+  要清理由你一句话。
+- 新工具**还没有测试**：它改的是用户模型文件，值得一条"改头不动载荷 + 无宽度源就拒"的夹具测试
+  （`gen_adaln_cache_fixture.py` 已经有 `meta: bool` 这一维），本轮没做，记进待办。
+
+## 5. 复现
+
+```bash
+FIX=/Volumes/data/tmp/h3scr/f53/fixtures/adapters     # 由 gen_adaln_cache_fixture.py 生成
+env H3_CLIPPROJ_DIR=... H3_CLIPPROJ_PROJ=... ./h3 -d /Volumes/data/MODELS/h3c-q4-adalncache \
+  --ssd-streaming -p "A red fox walking through snow" --width 256 --height 256 \
+  --frames 22 --steps 4 --seed 42 --lora $FIX/adapter_attn_only.safetensors   # 应见 note 行
+python3 fastvideo_qad/scripts/add_h3_adaln_cache_meta.py \
+  --cache-dir /Volumes/data/MODELS/h3c-q4-adalncache/FL2VA/transformer \
+  --source-model /Volumes/data/MODELS/h3c-q4-native/FL2VA/transformer \
+  --backup-dir /Volumes/data/tmp/h3scr/f53/backup --dry-run                   # 先看字节账
 ```

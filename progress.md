@@ -2644,3 +2644,38 @@ ssd_streaming == 0 && use_int8_row_fc2 == 0`）根本不进规划器，代码路
 
 **顺带记下、没动**：`h3.c:1465-1467` 用 `bytes * 0 + …` 表达"这个分量每次调用后释放"。语义对、
 能编译，但比直接不加大项更绕，`-Wextra` 也不提醒；留作观察项，不单开一步。
+
+## 续 43（2026-10-06）：给装早了的 AdaLN 缓存就地补 meta 键（F53）
+
+F43 把判据收窄成"只有真打 AdaLN 的适配器才拒"，但收窄靠 meta 键报宽度，而
+`h3c-q4-adalncache` 这三份是键存在**之前**装的 —— 实测 `weight_time_dim=None`、
+`source_time_dim=None`，所以纸面收窄在这台机器上从来没生效过。本轮补键并两侧都跑在真文件上。
+
+**先测"改之前"的样子**：三个夹具适配器打在缓存档上，全部得到同一句
+`the AdaLN cache in this checkpoint has no adaln_cache_meta_s4 width key …` —— 这就是 P1 的失效面。
+补键之后 `attn_only` 变 `note: none of the 1 LoRA adapter(s) target AdaLN, so the cached AdaLN
+modulation for 4 steps is used unmodified`，`adaln`/`norm_out` 变成点名 **2688** 的那条拒绝。
+拒绝句里的宽度只能来自我写进去的键，所以"C 侧真读到了"是从系统自己的输出证明的，不是我推的。
+
+**宽度不写死**：2688 由 `weight_time_dim()` 从这批缓存导出时用的 `h3c-q4-native` 读
+（`blocks.0.adaln_proj.linear.weight` 的 shape[1]）；拿不到就 SystemExit 不猜。第三处独立吻合是
+`gen_adaln_cache_fixture.py:32` 早写的 `TIME_DIM = 2688`，以及 96,768 = 36×2688、10,752 = 4×2688。
+
+**磁盘操作只让头部变长**：4 字节的 U32[1] 追加在数据段**末尾**，52 个既有张量的相对偏移一个不动。
+每份都按备份算了区间 SHA-256（`51ffd1cfe389..`/`874fb8848a34..`/`d24018d8e87e..`）证明载荷逐字节不变，
+再回读键值得 2688；原文件先 `copy2` 到仓库外备份目录，写同目录 `.tmp` 后原子 `replace`。
+工具落进 `fastvideo_qad/scripts/add_h3_adaln_cache_meta.py`，README 的缓存小节补了"pre-meta
+缓存可就地修复"一句 —— 留着它的理由很硬：不然只能把三个步数各重跑一遍去重新 dump。
+
+**端到端补齐**：夹具那个 `attn_only` 越闸后停在形状不符（`lora_A=[16,2688]` vs 真 to_q 要
+`[16,5376]`），这是夹具本来就只为 AdaLN 尺寸造的事实，不是本步引入的坑。于是另造一个**形状正确、
+值为零**的 rank-16 to_q 适配器跑完整渲染，与不带适配器那臂配对：两臂 EXIT=0 且 latent
+`6e9c2d8786cea097ddf9bdd45e5593bd`、mp4 `ac0d0940434ad216d8131f7469154b70` **完全相同** ——
+补键没动数值，而"合并零不移动权重"也被同一对数字顺带证明（合并路径自己没把 BF16 绕一圈改掉）。
+
+**没做的**：新工具还没有夹具测试（`gen_adaln_cache_fixture.py` 已经带 `meta: bool` 这一维，
+够造"改头不动载荷 + 无宽度源就拒 + 可重入"三判），记进待办 2；619 MB 原始分片备份留在
+`/Volumes/data/tmp/h3scr/f53/backup/`，要清理由你一句话。
+
+**状态**：本步仓库内只动 4 个文件 —— `5075499` 收了新脚本 + README，记录（含这一行）另计一笔，
+不写它自己的哈希。模型分片在仓库外，不入库；本机三份已带键。

@@ -2687,3 +2687,33 @@ trim 断言；还原后 sha256 与基线一致。
    Metal 三条要 M5 GPU 数据（本机 M4 无 TensorOps）。
 6. 观察项（未改，F52 §4）：`h3.c:1465-1467` 用 `bytes * 0 +` 表达"每次调用后释放"。
 7. 逐位锚：latent `6e9c2d8786cea097ddf9bdd45e5593bd` / mp4 `ac0d0940434ad216d8131f7469154b70`。
+
+
+## 新增（2026-10-06）：pre-meta 缓存就地补键，P1 收窄在真文件上生效（F53 / progress 续 43）
+
+给 `/Volumes/data/MODELS/h3c-q4-adalncache` 的三份 `adaln_cache_s*` 补 `adaln_cache_meta_s{steps}`。
+宽度 2688 由 `weight_time_dim()` 从这批缓存导出时所用的 `h3c-q4-native` 读来（不是写死，也
+不是从另一份缓存抄），工具在 A/B 两侧都跑在**真已装分片**上：
+
+- 补键前：三个夹具适配器（attn_only / adaln / norm_out）**同一句**"无宽度键 ⇒ 全拒"；
+- 补键后：`attn_only` 出 `note: none of … target AdaLN` 并进 `precompute AdaLN 50/50`，
+  `adaln`/`norm_out` 出"carries an AdaLN factor for a **2688**-wide input"。
+- 零值真形状适配器（rank-16 to_q，`[16,5376]`+`[7168,16]`）端到端跑完，与不带适配器那臂
+  **两串 md5 相同**（latent `6e9c2d87…` / mp4 `ac0d0940…`）⇒ 补键没动数值，且"合并零不移动权重"
+  被同一对数字顺带证明。
+
+磁盘改动只做"头部变长"：新张量 4 字节追加在数据段末尾，52 个既有张量偏移与字节全不变
+（每份按备份区间 SHA-256 复核），原文件先 `copy2` 到仓库外备份目录再原子 `rename`；
+工具可重入，再跑报 `already carries …; left alone`。
+
+**重排后的待办**
+1. ~~提交本步~~ 已做（2026-10-06）：`5075499` = 新脚本 + README；记录另计一笔（不记它自己的哈希）。
+   不 push。
+2. 给 `add_h3_adaln_cache_meta.py` 补一条夹具测试：`gen_adaln_cache_fixture.py` 已带 `meta: bool`
+   这一维，可造"改头不动载荷 + 无宽度源就拒 + 可重入"三判。
+3. i2v/reference 估计路径的校准：需要一个可跑的参考图锚（现在是上界 + warning 兜底）。
+4. CLI 的 `Longest clip at WxH` 那行仍未在真机 REPL 眼验（管道喂不动 linenoise）。
+5. F44 §2 未做的：视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、终端每帧 fork、4+3 处文档相反。
+   Metal 三条要 M5 GPU 数据（本机 M4 无 TensorOps）。
+6. 观察项（未改，F52 §4）：`h3.c:1465-1467` 用 `bytes * 0 +` 表达"每次调用后释放"。
+7. 清理待判：`/Volumes/data/tmp/h3scr/f53/backup/`（619 MB 原始分片）与 e2e 产物。
