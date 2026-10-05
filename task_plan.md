@@ -2452,3 +2452,140 @@ ANE 判死线仍在构建（删除需单独批准）。
    未顺手改）；F44 §1.2 的描述"库内机器路径"实际是**两条**且与脚本用的 int8-convrot 目录不一致。
 6. 未入库账不变：F40 + F42/F43 + 本轮 F45 都在工作区；`s4/s8/s20` 的 meta 键仍未写（纯磁盘）。
 7. 已关闭不变：注意力稀疏全线、F26、ANE 线、reuse 阶梯与主因、低预算运行时闸。
+
+
+## 新增（2026-10-05）：splash 对照研究出 3 条可搬 / 3 条不可搬（F46 / progress 续 36）
+
+用户让从 `/Volumes/data/git/c/splash`（Apple silicon 自回归 LLM 引擎）看 MiniMax-H3 的加速路径。
+纯研究，未改码、未跑 GPU。**结构差异是判据**：扩散"每步过整条序列"，LLM"逐 token、KV 随长度增长"。
+
+**可搬（按价值序）**
+1. **内存规划补一道"反查"**：splash 的 `hardBudget = min(--max-memory, recommendedMaxWorkingSet − max(1 GiB,2%))`
+   我读了原文（`MemoryPlan.hpp:63-86`）——它自己也用百分比，差别在**叠在 OS 实测量上** + 可用内存走
+   `host_statistics64` + 回收是带水位与双阈值迟滞的目标式。我们真正缺的是 `contextTokensWithin(bytes)`
+   这种"给定字节能撑多长"的反查：`h3_memory_plan.c:47-53` 只会正算，长片段撞墙与 80%/85% 判错到 panic
+   都源于此。搬法是加反查，不是抄它的数。
+2. **注意力 K/V 走 INT8**：省容量不成立（扩散无跨步 KV），**省带宽成立**（窗内 tile 被各 query 重读）。
+   前置自测两条：splash 自陈 BF16/INT8 之差非通用提速（512-token ±0.8% 内）；我们 head_dim=96 而它 256，
+   且 int8 operand 依赖 M5 TensorOps ⇒ **M4 吃不到**。
+3. **VDN 扫描 kernel**：`h3_shaders.metal:6170 h3_vdn_scan_step` 是"一线程一元素 + 串行 128 次 FMA"，
+   splash GDN 用 lane 连续 4 个 fp32 + `simd_sum` + threadgroup 相位交接。**但跨 lane 归约改求和顺序就改结果**，
+   且 VDN 是质量叠加（Phase 9 慢 3.4~7×）⇒ 这条是"降低 VDN 价格"，不是加速基座。
+
+**不可搬（省下轮次）**：投机解码的无损省步（判据 `u·q < p` + 残差重抽要候选有可算密度，而扩散"拒绝第 t 步
+就得重跑第 t 步"，结构上没有"一次前向验证 k 步保留前缀"）；`F_NOCACHE` 照搬到流式权重（它在 splash 用于
+权重镜像写侧与 state disk tier，都不是"每步重读同一批字节"，抄来即主动放弃页缓存）；token 稀疏注意力
+（只记事实：splash 打包单位是"一个 threadgroup = 一个 KV head × GQA 组若干行"，即 F39 缺的更细单位，
+但不改变判死）。
+
+**方法学抄一条**：设备事实集中在 IORegistry、"只在原生机器实测到增益才采纳规则"（模拟核数曾误判
+−26%~+20%），而 h3c 的 M4/M5 分支现在散在运行时 if 里。
+
+**重排后的待办**（在原有基础上插入，原 1~7 条不废）
+1. 先做 F44 待办 2 的三条（内存估算常量 56/24 与 16/24、`h3_video_vae.c:952-959` 双 blit、
+   `h3_text_encoder.c:623-625` 整块词表上载）——它们与 splash 无关、成本低、已有闸口。
+2. **内存反查**升级为独立一项：把 `h3_memory_plan.c` 从"正算 + 静态比例"改成"实测可用 + 反查可撑帧数"，
+   参考 `MemoryPlan.cpp:259-266` 的接口形状（不是抄它的 margin）。这项直接消掉已知的 panic 风险。
+3. INT8 注意力 K/V 只在 M5 上评估；开工前先测 M4 的 head_dim=96 下 bf16 SDPA 是不是带宽受限。
+4. VDN kernel 改造前先测 `h3_vdn_scan_step` 的受限类型；求和顺序必须保持（splash 自己也守这条）。
+5. 上轮遗留不变：F43 待办 1 的 4 步 md5 复跑仍未跑（F45 已解除堵点）；四轮改动未入库；
+   `s4/s8/s20` 的 meta 键未写。
+
+
+## 新增（2026-10-05）：F44 待办 2 三条落地，三次真机 A/B 证逐位不变（F47 / progress 续 37）
+
+**做了什么**
+1. 内存估算常量：新增 `h3_dit_latent_elements()`（通道常量仍只在 `h3_dit.c` 一处）；
+   `h3_dit.c` 的常驻估算改调 `h3_dit_video_elements/h3_dit_audio_elements`（原来手写
+   `C=16`，真实 `VIDEO_CHANNELS=24`）；`h3.c` 规划项原来把 **56=DiT HEADS** 当通道、还漏了
+   时间压缩，改为 `h3_temporal`+`h3_latent_canvas`+helper，并把 `render_width/height` 的解析
+   提到规划前共用（旧式忽略显式 render 覆盖）；`h3_cli.c` 同口径。
+2. `h3_video_vae.c`：`run_block` 加 `hidden` 形参，流式路径把 `states[state]` 直接当 hidden，
+   删掉每块每 tile 两次全量 `copy_f32`。静态审计确认无读者依赖被删的拷贝
+   （三个调用点之后都走 `finish_chunk_states`，它自己先还原）。
+3. 新增 `h3_weight_gather_bf16_rows()`：按 id 逐行 pread 再上传，两条编码器路径都不再
+   整块上载词表（50 层 1.45 GiB / 4B 778 MiB），并删掉随之失去用途的 `ids` 张量。
+
+**真机验证**（16 GB M4，缓存档，256²/22f/steps4/seed42）
+- 只回退 `h3_text_encoder.c` ⇒ latent 与 mp4 **同一 md5**。
+- 只回退 `h3_video_vae.c` ⇒ **mp4 `cmp -l` 差异 0 字节**（不只靠"上游没变"）。
+- 三处改动全在的二进制 + int8-convrot 4B ⇒ latent `6e9c2d8786cea097ddf9bdd45e5593bd`，
+  **逐字符复现 F40 基线** ⇒ **F43 待办 1 结清**。
+- `make test` exit 0，46 行绿，15 条 skip，三个新闸全绿。
+
+**两条必须记住的结论**
+- F40 的基线用的是 **int8-convrot** 的 4B，不是库那个 BF16 内置默认 —— 反过来印证 F45 删掉
+  那个默认是对的（它和本仓所有脚本实际用的东西都不一致）。已把这两条 env 写进 F40 的复现小节。
+- `h3.c` 那半边是**算对了但少了主导项**：activation 从 124.6 MiB 掉到 10.8 MiB（864×480/360f），
+  方向是把档位推向更激进；而新旧两式都没建模 DiT 逐块激活（长片段 GB 级）。本次渲染还
+  **完全没走到这段**（自动规划门槛是 `ssd_streaming == 0`，我们显式给了 `--ssd-streaming`）。
+  ⇒ 不把它当安全修复交付，并入 F46 待办 2 的"实测可用内存 + 反查可撑帧数"一起做。
+
+**重排后的待办**
+1. `h3.c`/`h3_cli.c` 的 activation 项：补上 DiT 逐块激活这一主导项，并做成"实测 + 反查"
+   （参考 splash `contextTokensWithin` 的接口形状），用 `H3_PROFILE` 的峰值存活字节校准。
+2. F44 §2 剩余可做的：视觉塔每参考图重读 ~1 GB（`h3_vision_encoder.c:557-564`）、
+   ffmpeg 双缓冲、终端每帧 fork、`--pipeline` 等 4+3 处文档与实际相反。
+3. Metal 侧三条仍需先在 M5 取 GPU 时间（本机 M4 无 TensorOps）。
+4. 逐位闸已固化：`6e9c2d87…` + `ac0d0940…`（256²/22f/steps4/seed42 + int8-convrot 4B）；
+   改任何 DiT/VAE/编码器的数值路径都应回到这两串对上。产物在 /tmp 会被回收，别把文件当锚，
+   要锚就抄这串 md5。
+5. 上轮遗留不变：四轮改动（F40/F42/F43/F45）+ 本轮 F47 全部**未入库**；`s4/s8/s20` 的 meta 键未写。
+6. 已关闭不变：注意力稀疏全线、F26、ANE 线、reuse 阶梯与主因、低预算运行时闸。
+
+
+## 新增（2026-10-05）：校准实验否证了 F47 待办 1 的主导项假设，抓到内存墙真主因（F48 / progress 续 38）
+
+**实测**（16 GB M4，同 prompt/seed/steps=4，只变 `--frames`，带 `H3_PROFILE=1`）：
+22f ⇒ 钉 9/50 块、DiT load peak 8.040 GiB、跑完；44f ⇒ 钉 **13/50** 块、peak **10.995 GiB**、
+**去噪中被 SIGKILL（rc=137）**。
+
+**结论：主导项不是 activation，是"每块常驻成本"。**
+- 两点斜率 `(10.995−8.040)/4 = 0.739 GiB/块`，扣掉激活差（356 行 × 118,272 B ≈ 0.04 GiB）
+  ⇒ **≈0.729 GiB/块**。
+- 独立核对（不靠拟合）：`allocate_stream_slot()` 四项 BF16 权重 = 385,874,432 元素 × 2 B
+  = **736 MiB = 0.719 GiB/块**。
+- 而 `h3_dit.c:2779` 写死 `per_block = 0.5 GiB`，注释理由是"int8 权重占主导 ≈0.39 GiB"
+  —— **只对 `--int8` 成立**；M4 上 `--ssd-streaming` 不带 `--int8` 的默认路径是 BF16 槽
+  ⇒ 低估 1.44× ⇒ 多钉 44% 的块 ⇒ 13 块 ≈9.3 GiB 槽位 + 11 GiB 峰值，16 GiB 机器被杀。
+- activation 在 44f 只有 ~0.09 GiB；每块成本这一项的误差是 13×0.22 ≈ **2.9 GiB**。
+- 附带量到：同画幅同二进制两次得到 available **2.6 vs 5.6 GiB**、常驻 **3 vs 9 块**
+  ⇒ 只看这一个读数做常驻决策，等于抽奖。
+
+**重排后的待办（替代 F47 待办 1 的做法）**
+1. `per_block` 改成按实际槽位算（BF16 = 那四项 ×2 B；int8 = int8 字节 + scale 缓冲），
+   尺寸代码里已有，无新数学。预期把 44f 的过钉从 13 降到 ≈9。
+2. 常驻上限除 `available` 外再夹一道**物理内存 − 当前峰值**（GPU 固定分配不可换出，
+   `h3_memory_plan.c:43-46` 自己承认过）。
+3. activation 项照补（118,272 B/行的默认活集合，别名/融合关闭时的差额另加）；它让预留**变大**，
+   正好抵掉 F47 那条"修正后预留变小"的告警。
+4. "给定字节能撑多少帧"的反查排在 1~3 之后——输入本身不可信时反查没有意义。
+5. 逐位锚已固化（`6e9c2d87…` / `ac0d0940…`，256²/22f/steps4/seed42 + **int8-convrot** 4B）；
+   1~3 改的是常驻决策与预留，不动数值路径，改完仍须对上这两串。
+6. 未入库账继续累积：F40/F42/F43/F45/F47 五轮 + 本轮 F48。
+
+
+## 新增（2026-10-05）：F48 的三条修正落地，44f 从被杀变跑完（F49 / progress 续 39）
+
+`h3_dit.c` 的自适应常驻决策：① `per_block` 由 `stream_slot_bytes()` 按实际形态算（不再是 0.5 GiB
+字面量；BF16 槽 = 0.719 GiB，与我独立算的 736 MiB 和两点拟合的 0.729 GiB 一致）；
+② `usable` 除 `available` 外再夹一道 `physical − footprint − headroom`（为此公开
+`h3_host_physical_memory()`，规则与 runtime guard 同一套）；③ 新增 `h3_dit_activation_bytes()`
+（118,272 B/行，默认配置）按真实 `dit->sequence` 计入预留。
+
+**验收（F48 定的可证伪判据，两条都过）**：256²/44f 从"钉 13 块、DiT load peak 10.995 GiB、
+去噪中 SIGKILL(137)"变成"钉 4 块、peak 4.535 GiB、**EXIT=0 写出 mp4**"；
+256²/22f 的 latent `6e9c2d87…` 与 mp4 `ac0d0940…` **两串逐字符不变**（顺带实测证明
+"常驻块数不影响数值"，此前只是假设）。`make test` exit 0（48 行绿、15 skip），无新告警。
+
+**重排后的待办**（F49 §3 为准，覆盖 F48 的编号）
+1. `h3.c`/`h3_cli.c` 的 activation 仍缺 DiT 激活项：要么给可信的 sequence 估计
+   （`latent_t × (latent_h/2) × (latent_w/2)` + audio + 文本行数，文本要 tokenize），
+   要么把规划挪到 layout 建好之后。做完才能谈 2。
+2. "给定字节能撑多少帧"的反查（splash `contextTokensWithin` 的接口形状）。
+3. `h3_memory_plan.c:80-82` 用未夹的 `rec` 算 `free_after_stream`（F44 §2 #13）。
+4. F44 §2 未做的：视觉塔每参考图重读 ~1 GB、ffmpeg 双缓冲、终端每帧 fork、
+   4+3 处文档与实际相反（`--pipeline` 等）。Metal 三条要 M5 数据。
+5. 逐位锚：latent `6e9c2d8786cea097ddf9bdd45e5593bd` / mp4 `ac0d0940434ad216d8131f7469154b70`
+   （256²/22f/steps4/seed42 + **int8-convrot** 4B + 缓存档）。改常驻/内存决策类代码都应回对这两串。
+6. 六轮改动未入库（F40/F42/F43/F45/F47/F48-F49）。
